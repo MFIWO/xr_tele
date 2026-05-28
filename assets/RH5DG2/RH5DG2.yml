@@ -1,0 +1,64 @@
+left:
+  type: DexPilot # or vector
+  urdf_path: RH5DG2/RH5DG2_L.urdf
+
+  # Target refers to the retargeting target, which is the robot hand
+  target_joint_names: 
+    ['left_thumb_yaw_joint', 'left_thumb_mcp_joint',
+      'left_thumb_dip_joint',
+      'left_index_yaw_joint', 'left_index_mcp_joint',
+       'left_index_pip_joint', 
+       'left_middle_yaw_joint', 'left_middle_mcp_joint',
+        'left_middle_pip_joint',
+         'left_ring_mcp_joint', 'left_ring_pip_joint',
+          'left_pinky_mcp_joint',
+           'left_pinky_pip_joint', ]
+
+  # for DexPilot type
+  wrist_link_name: "left_hand_base"
+  finger_tip_link_names: [ "left_thumb_dip", "left_index_dip", "left_middle_dip", "left_ring_dip", "left_pinky_dip" ]
+  # If you do not know exactly how it is used, please leave it to None for default.
+  target_link_human_indices_dexpilot: [[ 9, 14, 19, 24, 14, 19, 24, 19, 24, 24,  0,  0,  0,  0,  0], [ 4,  4,  4,  4,  9, 9,  9, 14, 14, 19,  4,  9, 14, 19, 24]]
+
+  # for vector type
+  target_origin_link_names: [ "left_hand_base", "left_hand_base", "left_hand_base", "left_hand_base", "left_hand_base"]
+  target_task_link_names: [ "left_thumb_dip", "left_index_dip", "left_middle_dip", "left_ring_dip", "left_pinky_dip" ]
+  target_link_human_indices_vector: [ [ 0, 0, 0, 0, 0 ], [ 4, 9, 14, 19, 24 ] ]
+
+  # Scaling factor for vector retargeting only
+  # For example, Allegro is 1.6 times larger than normal human hand, then this scaling factor should be 1.6
+  scaling_factor: 1.20
+  # A smaller alpha means stronger filtering, i.e. more smooth but also larger latency
+  low_pass_alpha: 0.2
+
+right:
+  type: DexPilot # or vector
+  urdf_path: RH5DG2/RH5DG2_R.urdf
+
+  # Target refers to the retargeting target, which is the robot hand
+  target_joint_names: 
+    ['right_thumb_yaw_joint', 'right_thumb_mcp_joint',
+     'right_thumb_dip_joint',
+      'right_index_yaw_joint', 'right_index_mcp_joint',
+       'right_index_pip_joint',
+        'right_middle_yaw_joint', 'right_middle_mcp_joint',
+         'right_middle_pip_joint',
+          'right_ring_mcp_joint', 'right_ring_pip_joint',
+           'right_pinky_mcp_joint',
+            'right_pinky_pip_joint', ]
+
+  # for DexPilot type
+  wrist_link_name: "right_hand_base"
+  finger_tip_link_names: [ "right_thumb_dip", "right_index_dip", "right_middle_dip", "right_ring_dip", "right_pinky_dip" ]
+  # If you do not know exactly how it is used, please leave it to None for
+  target_link_human_indices_dexpilot: [[ 9, 14, 19, 24, 14, 19, 24, 19, 24, 24,  0,  0,  0,  0,  0], [ 4,  4,  4,  4,  9, 9,  9, 14, 14, 19,  4,  9, 14, 19, 24]]
+
+  target_origin_link_names: [ "right_hand_base", "right_hand_base", "right_hand_base", "right_hand_base", "right_hand_base"]
+  target_task_link_names: [ "right_thumb_dip", "right_index_dip", "right_middle_dip", "right_ring_dip", "right_pinky_dip" ]
+  target_link_human_indices_vector: [ [ 0, 0, 0, 0, 0 ], [ 4, 9, 14, 19, 24 ] ]
+  
+  # Scaling factor for vector retargeting only
+  # For example, Allegro is 1.6 times larger than normal human hand, then this scaling factor should be 1.6
+  scaling_factor: 1.20
+  # A smaller alpha means stronger filtering, i.e. more smooth but also larger latency
+  low_pass_alpha: 0.2

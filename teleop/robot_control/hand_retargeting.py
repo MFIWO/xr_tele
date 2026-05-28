@@ -6,7 +6,7 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 class HandType(Enum):
-    INSPIRE_HAND = "../assets/inspire_hand/inspire_hand.yml"
+    INSPIRE_HAND = "../assets/inspire_hand/RH5DG2 document/RH5DG2.yml"
     INSPIRE_HAND_Unit_Test = "../../assets/inspire_hand/inspire_hand.yml"
     UNITREE_DEX3 = "../assets/unitree_hand/unitree_dex3.yml"
     UNITREE_DEX3_Unit_Test = "../../assets/unitree_hand/unitree_dex3.yml"

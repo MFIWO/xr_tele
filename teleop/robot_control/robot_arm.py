@@ -205,7 +205,10 @@ class G1_29_ArmController:
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
-        return self.lowstate_subscriber.Read().mode_machine
+        msg = self.lowstate_subscriber.Read()
+        if msg is None:
+            return 0
+        return msg.mode_machine
     
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
@@ -658,20 +661,31 @@ class H1_2_ArmController:
         self.subscribe_thread.daemon = True
         self.subscribe_thread.start()
 
+        wait_limit = 50 if self.simulation_mode else None
         while not self.lowstate_buffer.GetData():
             time.sleep(0.1)
             logger_mp.warning("[H1_2_ArmController] Waiting to subscribe dds...")
+            if wait_limit is not None:
+                wait_limit -= 1
+                if wait_limit <= 0:
+                    logger_mp.warning("[H1_2_ArmController] DDS wait timeout in simulation mode; proceeding with zeroed state.")
+                    break
         logger_mp.info("[H1_2_ArmController] Subscribe dds ok.")
 
         # initialize hg's lowcmd msg
         self.crc = CRC()
         self.msg = unitree_hg_msg_dds__LowCmd_()
         self.msg.mode_pr = 0
-        self.msg.mode_machine = self.get_mode_machine()
-
-        self.all_motor_q = self.get_current_motor_q()
-        logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
-        logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is not None:
+            self.msg.mode_machine = self.get_mode_machine()
+            self.all_motor_q = self.get_current_motor_q()
+            logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
+            logger_mp.info(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
+        else:
+            self.msg.mode_machine = 0
+            self.all_motor_q = np.zeros(H1_2_Num_Motors)
+            logger_mp.warning("[H1_2_ArmController] No DDS lowstate available; initializing with zeros.")
         logger_mp.info("Lock all joints except two arms...")
 
         arm_indices = set(member.value for member in H1_2_JointArmIndex)
@@ -767,15 +781,24 @@ class H1_2_ArmController:
     
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
-        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in H1_2_JointIndex])
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is None:
+            return np.zeros(len(H1_2_JointIndex))
+        return np.array([lowstate.motor_state[id].q for id in H1_2_JointIndex])
     
     def get_current_dual_arm_q(self):
         '''Return current state q of the left and right arm motors.'''
-        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in H1_2_JointArmIndex])
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is None:
+            return np.zeros(len(H1_2_JointArmIndex))
+        return np.array([lowstate.motor_state[id].q for id in H1_2_JointArmIndex])
     
     def get_current_dual_arm_dq(self):
         '''Return current state dq of the left and right arm motors.'''
-        return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in H1_2_JointArmIndex])
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is None:
+            return np.zeros(len(H1_2_JointArmIndex))
+        return np.array([lowstate.motor_state[id].dq for id in H1_2_JointArmIndex])
     
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
@@ -788,6 +811,9 @@ class H1_2_ArmController:
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
+            if current_q is None:
+                logger_mp.warning("[H1_2_ArmController] No lowstate available during go-home; skipping wait.")
+                break
             if np.all(np.abs(current_q) < tolerance):
                 if self.motion_mode:
                     for weight in np.linspace(1, 0, num=101):

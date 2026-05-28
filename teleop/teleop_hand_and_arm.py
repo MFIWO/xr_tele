@@ -5,6 +5,7 @@ import threading
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
+import numpy as np
 
 import os 
 import sys
@@ -77,7 +78,7 @@ if __name__ == '__main__':
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='G1_29', help='Select arm controller')
-    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
+    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'rh5dg2_ftp', 'rh5dg2_dfx', 'brainco'], help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
@@ -180,30 +181,48 @@ if __name__ == '__main__':
             gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
                                                      dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim)
         elif args.ee == "inspire_dfx":
-            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX
+            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX, Inspire_Num_Motors
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
             dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
+            dual_hand_state_array = Array('d', Inspire_Num_Motors * 2, lock = False)   # [output] current left, right hand state data.
+            dual_hand_action_array = Array('d', Inspire_Num_Motors * 2, lock = False)  # [output] current left, right hand action data.
             hand_ctrl = Inspire_Controller_DFX(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
         elif args.ee == "inspire_ftp":
-            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_FTP
+            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_FTP, Inspire_Num_Motors
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
             dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
+            dual_hand_state_array = Array('d', Inspire_Num_Motors * 2, lock = False)   # [output] current left, right hand state data.
+            dual_hand_action_array = Array('d', Inspire_Num_Motors * 2, lock = False)  # [output] current left, right hand action data.
             hand_ctrl = Inspire_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
         elif args.ee == "brainco":
-            from teleop.robot_control.robot_hand_brainco import Brainco_Controller
+            from teleop.robot_control.robot_hand_brainco import Brainco_Controller, brainco_Num_Motors
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
             dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
+            dual_hand_state_array = Array('d', brainco_Num_Motors * 2, lock = False)   # [output] current left, right hand state data.
+            dual_hand_action_array = Array('d', brainco_Num_Motors * 2, lock = False)  # [output] current left, right hand action data.
             hand_ctrl = Brainco_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
                                            dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+        elif args.ee == "rh5dg2_dfx":
+            from teleop.robot_control.robot_hand_RH5DG2 import RH5DG2_Controller_DFX, RH5DG2_Num_Motors
+            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
+            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
+            dual_hand_data_lock = Lock()
+            dual_hand_state_array = Array('d', RH5DG2_Num_Motors * 2, lock = False)
+            dual_hand_action_array = Array('d', RH5DG2_Num_Motors * 2, lock = False)
+            hand_ctrl = RH5DG2_Controller_DFX(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock,
+                                              dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+        elif args.ee == "rh5dg2_ftp":
+            from teleop.robot_control.robot_hand_RH5DG2 import RH5DG2_Controller_FTP, RH5DG2_Num_Motors
+            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
+            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
+            dual_hand_data_lock = Lock()
+            dual_hand_state_array = Array('d', RH5DG2_Num_Motors * 2, lock = False)
+            dual_hand_action_array = Array('d', RH5DG2_Num_Motors * 2, lock = False)
+            hand_ctrl = RH5DG2_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock,
+                                              dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
         else:
             pass
         
@@ -277,9 +296,16 @@ if __name__ == '__main__':
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
+                    if left_wrist_img is not None and left_wrist_img.bgr is not None:
+                        # 화면 누움 방향에 따라 ROTATE_90_CLOCKWISE 또는 ROTATE_90_COUNTERCLOCKWISE 선택
+                        left_wrist_img.bgr = cv2.rotate(left_wrist_img.bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            
+            # ---- [수정 부분: 오른쪽 손목 카메라 회전] ----
             if camera_config['right_wrist_camera']['enable_zmq']:
                 if args.record:
                     right_wrist_img = img_client.get_right_wrist_frame()
+                    if right_wrist_img is not None and right_wrist_img.bgr is not None:
+                        right_wrist_img.bgr = cv2.rotate(right_wrist_img.bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
             # record mode
             if args.record and RECORD_TOGGLE:
@@ -297,7 +323,7 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
+            if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "rh5dg2_dfx" or args.ee == "rh5dg2_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
@@ -338,6 +364,30 @@ if __name__ == '__main__':
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+            # ---- [추가 부분: 안전 장치 (Safety Mechanism)] ----
+            # 로봇 스펙에 맞게 최대/최소 라디안 및 급격한 움직임 허용치 설정
+            #MAX_RAD = 2.5    # 예: 절대적인 최대 관절 각도
+            #MIN_RAD = -2.5   # 예: 절대적인 최소 관절 각도
+            #MAX_DELTA = 0.5  # 예: 한 프레임(약 0.03초) 내 허용되는 최대 각도 변화량
+
+            #q_delta_abs = np.abs(sol_q - current_lr_arm_q)
+            
+            #if np.any(sol_q > MAX_RAD) or np.any(sol_q < MIN_RAD) or np.any(q_delta_abs > MAX_DELTA):
+            #    logger_mp.error("🚨 Safety Triggered: Abnormal joint movement detected!")
+                
+                # High-level controller가 있을 경우 Damping 모드 실행
+            #    if args.motion and args.input_mode == "controller":
+            #        try:
+            #            loco_wrapper.Damp()
+            #            logger_mp.info("Entered Damping Mode successfully.")
+            #        except NameError:
+            #            pass
+                
+                # 텔레오퍼레이션 즉시 정지 상태로 전환 (로봇에 비정상 sol_q 전달 방지)
+            #    START = False
+            #    STOP = True
+            #    continue 
+            # ---------------------------------------------------
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
             # record data
@@ -376,6 +426,15 @@ if __name__ == '__main__':
                         right_ee_state = dual_hand_state_array[-6:]
                         left_hand_action = dual_hand_action_array[:6]
                         right_hand_action = dual_hand_action_array[-6:]
+                        current_body_state = []
+                        current_body_action = []
+
+                elif (args.ee == "rh5dg2_dfx" or args.ee == "rh5dg2_ftp") and args.input_mode == "hand":
+                    with dual_hand_data_lock:
+                        left_ee_state = dual_hand_state_array[:13]
+                        right_ee_state = dual_hand_state_array[-13:]
+                        left_hand_action = dual_hand_action_array[:13]
+                        right_hand_action = dual_hand_action_array[-13:]
                         current_body_state = []
                         current_body_action = []
                 else:
