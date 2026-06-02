@@ -23,16 +23,37 @@ if str(ROOT) not in sys.path:
 
 from robot_control.robot_hand_RH5DG2 import (  # noqa: E402
     _RH5DG2Retargeting,
+    _apply_finger_open_calibration,
+    _apply_safe_close_floor,
+    _apply_teleop_close_gain,
+    _fmt_finger_scores,
     _normalize_to_unit_interval,
+    _prepare_position_reference,
+    _prepare_vector_reference,
 )
 
 
-def _load_hand(path: str | None, side: str) -> np.ndarray:
+def _synthetic_hand(side: str, pose: str) -> np.ndarray:
+    sign = 1.0 if side == "left" else -1.0
+    data = np.zeros((25, 3), dtype=np.float64)
+    finger_bases = {
+        "thumb": (1, np.array([0.020, -0.025, sign * 0.025]), np.array([0.018, -0.025, sign * 0.030])),
+        "index": (5, np.array([0.020, -0.045, sign * 0.012]), np.array([0.006, -0.035, sign * 0.004])),
+        "middle": (10, np.array([0.000, -0.050, 0.000]), np.array([0.000, -0.040, 0.000])),
+        "ring": (15, np.array([-0.018, -0.045, -sign * 0.012]), np.array([-0.005, -0.035, -sign * 0.004])),
+        "little": (20, np.array([-0.034, -0.035, -sign * 0.025]), np.array([-0.010, -0.030, -sign * 0.006])),
+    }
+    for _, (start, open_step, close_step) in finger_bases.items():
+        step = open_step if pose == "open" else close_step
+        base = step * 0.6
+        for offset in range(4):
+            data[start + offset] = base + step * (offset + 1)
+    return data
+
+
+def _load_hand(path: str | None, side: str, synthetic: str) -> np.ndarray:
     if path is None:
-        base = np.zeros((25, 3), dtype=np.float64)
-        for idx in range(25):
-            base[idx] = (idx * 0.015, (0.02 if side == "left" else -0.02) + idx * 0.002, 0.01 * (idx % 5))
-        return base
+        return _synthetic_hand(side, synthetic)
 
     p = Path(path)
     if not p.exists():
@@ -67,6 +88,7 @@ def main() -> int:
     parser.add_argument("--right-hand-npy", type=str, default=None)
     parser.add_argument("--left-hand-json", type=str, default=None)
     parser.add_argument("--right-hand-json", type=str, default=None)
+    parser.add_argument("--synthetic", choices=("open", "close"), default="open")
     parser.add_argument("--dump-limits", action="store_true")
     args = parser.parse_args()
 
@@ -94,22 +116,42 @@ def main() -> int:
 
     left_path = args.left_hand_npy or args.left_hand_json
     right_path = args.right_hand_npy or args.right_hand_json
-    left = _load_hand(left_path, "left")
-    right = _load_hand(right_path, "right")
+    left = _load_hand(left_path, "left", args.synthetic)
+    right = _load_hand(right_path, "right", args.synthetic)
 
-    left_ref = left[retarget.left_indices[1, :]] - left[retarget.left_indices[0, :]]
-    right_ref = right[retarget.right_indices[1, :]] - right[retarget.right_indices[0, :]]
+    left_indices = np.asarray(retarget.left_indices)
+    right_indices = np.asarray(retarget.right_indices)
+    if left_indices.ndim == 2:
+        left_ref, *_ = _prepare_vector_reference(left, left_indices)
+        right_ref, *_ = _prepare_vector_reference(right, right_indices)
+    else:
+        left_ref, *_ = _prepare_position_reference(left, left_indices)
+        right_ref, *_ = _prepare_position_reference(right, right_indices)
 
     left_q = retarget.left_retargeting.retarget(left_ref)[retarget.left_retargeting_to_hardware]
     right_q = retarget.right_retargeting.retarget(right_ref)[retarget.right_retargeting_to_hardware]
     left_norm = _normalize_to_unit_interval(left_q, retarget.left_joint_limits)
     right_norm = _normalize_to_unit_interval(right_q, retarget.right_joint_limits)
+    left_gain = _apply_teleop_close_gain(left_norm)
+    right_gain = _apply_teleop_close_gain(right_norm)
+    left_calibrated, left_scores = _apply_finger_open_calibration(left_gain, left)
+    right_calibrated, right_scores = _apply_finger_open_calibration(right_gain, right)
+    left_safe = _apply_safe_close_floor(left_calibrated)
+    right_safe = _apply_safe_close_floor(right_calibrated)
 
     print("\nSynthetic / input hand data retarget result:")
     print(" left raw:", np.array2string(left_q, precision=4, suppress_small=True))
     print(" right raw:", np.array2string(right_q, precision=4, suppress_small=True))
     print(" left normalized:", np.array2string(left_norm, precision=4, suppress_small=True))
     print(" right normalized:", np.array2string(right_norm, precision=4, suppress_small=True))
+    print(" left gain:", np.array2string(left_gain, precision=4, suppress_small=True))
+    print(" right gain:", np.array2string(right_gain, precision=4, suppress_small=True))
+    print(" left finger scores:", _fmt_finger_scores(left_scores))
+    print(" right finger scores:", _fmt_finger_scores(right_scores))
+    print(" left calibrated:", np.array2string(left_calibrated, precision=4, suppress_small=True))
+    print(" right calibrated:", np.array2string(right_calibrated, precision=4, suppress_small=True))
+    print(" left safe:", np.array2string(left_safe, precision=4, suppress_small=True))
+    print(" right safe:", np.array2string(right_safe, precision=4, suppress_small=True))
 
     if np.allclose(left_norm, 0.5) and np.allclose(right_norm, 0.5):
         print("\nWARNING: retarget output is still neutral (0.5). Check the hand landmark input or YAML mapping.")

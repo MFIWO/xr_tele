@@ -85,6 +85,10 @@ class G1_29_ArmController:
         self._speed_gradual_max = False
         self._gradual_start_time = None
         self._gradual_time = None
+        self._publish_debug_count = 0
+        self._publish_rate_start_ts = time.time()
+        self._last_publish_debug_ts = 0.0
+        self._last_write_ok = None
 
         if self.motion_mode:
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Motion, hg_LowCmd)
@@ -645,6 +649,10 @@ class H1_2_ArmController:
         self._speed_gradual_max = False
         self._gradual_start_time = None
         self._gradual_time = None
+        self._publish_debug_count = 0
+        self._publish_rate_start_ts = time.time()
+        self._last_publish_debug_ts = 0.0
+        self._last_write_ok = None
 
 
         if self.motion_mode:
@@ -756,7 +764,18 @@ class H1_2_ArmController:
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            write_start = time.time()
+            self._last_write_ok = self.lowcmd_publisher.Write(self.msg)
+            self._publish_debug_count += 1
+            if self._publish_debug_count <= 5 or write_start - self._last_publish_debug_ts >= 1.0:
+                logger_mp.info(
+                    f"[teleop arm publish dds] topic={kTopicLowCommand_Debug if not self.motion_mode else kTopicLowCommand_Motion} "
+                    f"domain={'1(sim)' if self.simulation_mode else '0(real)'} write_ok={self._last_write_ok} "
+                    f"hz={self._publish_debug_count / max(write_start - self._publish_rate_start_ts, 1e-6):.2f} "
+                    f"write_latency_ms={(time.time() - write_start) * 1000.0:.3f} "
+                    f"target_min={float(np.min(cliped_arm_q_target)):.4f} target_max={float(np.max(cliped_arm_q_target)):.4f}"
+                )
+                self._last_publish_debug_ts = write_start
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -774,6 +793,9 @@ class H1_2_ArmController:
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
+
+    def get_last_write_ok(self):
+        return self._last_write_ok
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''

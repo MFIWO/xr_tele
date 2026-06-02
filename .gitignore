@@ -38,3 +38,5 @@ episode_0*
 
 __pycache__/
 *.pyc
+teleop/*.log
+teleop/*.log
