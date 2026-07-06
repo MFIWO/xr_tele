@@ -48,12 +48,6 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 TACTILE_VR_OVERLAY_VISIBLE = True  # Toggle RH5DG2 tactile overlay visibility in the XR viewer
-# waist keyboard control (H1_2 only): [j]/[k] nudge the waist yaw left/right during teleop
-WAIST_YAW_REL     = 0.0     # current relative waist-yaw target (rad, relative to startup home)
-WAIST_KEY_STEP    = 0.05    # rad added/removed per [j]/[k] press; overwritten from args in main
-WAIST_KEY_LIMIT   = 0.1745  # +/- clamp for the accumulator (rad); overwritten from args in main
-WAIST_KEY_ENABLED = False   # set True when --enable-waist-keyboard is passed
-WAIST_KEY_INVERT  = False   # swap [j]/[k] direction; overwritten from args in main
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -67,7 +61,7 @@ WAIST_KEY_INVERT  = False   # swap [j]/[k] direction; overwritten from args in m
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, READY, RECORD_RUNNING, RECORD_TOGGLE, TACTILE_VR_OVERLAY_VISIBLE, WAIST_YAW_REL
+    global STOP, START, READY, RECORD_RUNNING, RECORD_TOGGLE, TACTILE_VR_OVERLAY_VISIBLE
     if key == 'r':
         START = True
     elif key == 'q':
@@ -86,23 +80,6 @@ def on_press(key):
             "[RH5DG2 tactile VR overlay] keyboard toggle visible=%s",
             TACTILE_VR_OVERLAY_VISIBLE,
         )
-    elif key == 'j' or key == 'k':
-        if not WAIST_KEY_ENABLED:
-            logger_mp.warning("[teleop waist keyboard] ignored [%s]: pass --enable-waist-keyboard to use it.", key)
-        else:
-            direction = 1.0 if key == 'j' else -1.0
-            if WAIST_KEY_INVERT:
-                direction = -direction
-            WAIST_YAW_REL = float(np.clip(WAIST_YAW_REL + direction * WAIST_KEY_STEP,
-                                          -WAIST_KEY_LIMIT, WAIST_KEY_LIMIT))
-            logger_mp.info("[teleop waist keyboard] [%s] waist_yaw_rel=%.4f rad (%.1f deg)",
-                           key, WAIST_YAW_REL, np.degrees(WAIST_YAW_REL))
-    elif key == 'i':
-        if not WAIST_KEY_ENABLED:
-            logger_mp.warning("[teleop waist keyboard] ignored [i]: pass --enable-waist-keyboard to use it.")
-        else:
-            WAIST_YAW_REL = 0.0
-            logger_mp.info("[teleop waist keyboard] [i] waist reset to home (0.0 deg)")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -1024,11 +1001,8 @@ if __name__ == '__main__':
     parser.add_argument('--enable-waist-follow-neck', action='store_true', help='Make the H1_2 waist yaw slowly follow the neck yaw command, including in --motion mode.')
     parser.add_argument('--waist-follow-neck-invert', action=argparse.BooleanOptionalAction, default=True, help='Rotate the H1_2 waist OPPOSITE to the head/neck yaw direction. Use --no-waist-follow-neck-invert to make the waist turn the same way as the head.')
     parser.add_argument('--waist-yaw-gain', type=float, default=0.5, help='H1_2 waist-yaw gain applied to the neck yaw command.')
-    parser.add_argument('--waist-yaw-limit', type=float, default=0.2618, help='H1_2 relative waist-yaw limit in radians; default is about 15 degrees.')
+    parser.add_argument('--waist-yaw-limit', type=float, default=0.1745, help='H1_2 relative waist-yaw limit in radians; default is about 10 degrees.')
     parser.add_argument('--waist-yaw-velocity', type=float, default=0.25, help='H1_2 waist-yaw velocity limit in radians per second.')
-    parser.add_argument('--enable-waist-keyboard', action='store_true', help='Rotate the H1_2 waist yaw with the [j]/[k] keys during teleop (sshkeyboard mode). Reuses --waist-yaw-limit and --waist-yaw-velocity; mutually exclusive with --enable-waist-follow-neck.')
-    parser.add_argument('--waist-keyboard-step', type=float, default=0.05, help='Radians the H1_2 waist yaw moves per [j]/[k] key press (default ~2.9 deg).')
-    parser.add_argument('--waist-keyboard-invert', action='store_true', help='Swap the [j]/[k] waist rotation direction.')
     parser.add_argument('--skip-arm-go-home-on-exit', action='store_true', help='Do not command arm zero/home pose during shutdown.')
     parser.add_argument('--arm-shutdown-duration', type=float, default=3.0, help='Seconds to smoothly lower both arms (and H1_2 waist) from the current pose back to home on exit. 0 uses the legacy fast go-home.')
     parser.add_argument('--arm-shutdown-velocity', type=float, default=3.0, help='Arm velocity limit in rad/s applied as a safety cap during the smooth shutdown descent.')
@@ -1149,25 +1123,6 @@ if __name__ == '__main__':
             )
     if args.waist_yaw_limit <= 0.0 or args.waist_yaw_velocity <= 0.0:
         raise ValueError("--waist-yaw-limit and --waist-yaw-velocity must be greater than zero.")
-    if args.enable_waist_keyboard:
-        if args.enable_waist_follow_neck:
-            raise ValueError("--enable-waist-keyboard and --enable-waist-follow-neck cannot be used together.")
-        if args.arm != "H1_2" or args.disable_arm:
-            raise ValueError("--enable-waist-keyboard requires --arm H1_2 with arm control enabled.")
-        if args.waist_keyboard_step <= 0.0:
-            raise ValueError("--waist-keyboard-step must be greater than zero.")
-        if args.ipc:
-            raise ValueError("--enable-waist-keyboard needs sshkeyboard input; do not combine it with --ipc.")
-        WAIST_KEY_ENABLED = True
-        WAIST_KEY_STEP = float(args.waist_keyboard_step)
-        WAIST_KEY_LIMIT = float(abs(args.waist_yaw_limit))
-        WAIST_KEY_INVERT = bool(args.waist_keyboard_invert)
-        logger_mp.info(
-            "[teleop waist keyboard] enabled: [j]/[k] step=%.4f rad (%.1f deg), limit=+/-%.4f rad (%.1f deg), velocity=%.3f rad/s, invert=%s",
-            WAIST_KEY_STEP, np.degrees(WAIST_KEY_STEP),
-            WAIST_KEY_LIMIT, np.degrees(WAIST_KEY_LIMIT),
-            args.waist_yaw_velocity, WAIST_KEY_INVERT,
-        )
     if args.record and args.screen_record:
         raise ValueError("--record and --screen-record cannot be enabled together.")
     if args.ee == "rh56f1" and args.arm != "H1_2":
@@ -1935,7 +1890,7 @@ if __name__ == '__main__':
         # Loop is unreachable, connect() raises here, before robot tracking starts.
         if args.loop:
             from teleop.utils.loop_streamer import LoopRobotStreamer, LoopCameraStreamer
-            loop_robot = LoopRobotStreamer(args.loop_addr, args.ee, args.frequency, arm=args.arm)
+            loop_robot = LoopRobotStreamer(args.loop_addr, args.ee, args.frequency)
             loop_robot.connect()
             loop_camera = LoopCameraStreamer(args.loop_addr, camera_config)
             loop_camera.connect()
@@ -1981,15 +1936,6 @@ if __name__ == '__main__':
             logger_mp.warning("[teleop arm disabled reason] --disable-arm set; IK/control publish will be skipped.")
         else:
             arm_ctrl.speed_gradual_max()
-            # Seed the arm target with the current (ready) pose so START eases up from
-            # where the arms already are, instead of the arms first snapping toward the
-            # zeros/home target and dropping "as if torque off" before rising to the IK pose.
-            try:
-                _seed_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
-                if _seed_q.size and np.isfinite(_seed_q).all():
-                    arm_ctrl.ctrl_dual_arm(_seed_q, np.zeros_like(_seed_q))
-            except Exception as _seed_exc:
-                logger_mp.debug("[teleop arm startup] q_target seed skipped: %s", _seed_exc)
             logger_mp.info(
                 f"[teleop arm startup safety] reset wrist base at START; "
                 f"startup_duration={args.arm_startup_duration:.3f}s "
@@ -2305,28 +2251,6 @@ if __name__ == '__main__':
                 except (ValueError, OSError) as e:
                     if loop_count % 30 == 0:
                         logger_mp.warning(f"[teleop neck] command skipped: {e}")
-
-            # keyboard-driven H1_2 waist yaw ([j]/[k]); independent of neck tracking
-            if WAIST_KEY_ENABLED and arm_ctrl is not None and hasattr(arm_ctrl, "ctrl_waist_yaw"):
-                try:
-                    arm_ctrl.ctrl_waist_yaw(
-                        WAIST_YAW_REL,
-                        limit=args.waist_yaw_limit,
-                        velocity_limit=args.waist_yaw_velocity,
-                    )
-                except Exception as exc:
-                    if loop_count % 30 == 0:
-                        logger_mp.warning("[teleop waist keyboard] command skipped: %s", exc)
-
-            # periodic current-waist-angle log
-            if loop_count % 50 == 0 and arm_ctrl is not None \
-               and hasattr(arm_ctrl, "get_waist_yaw_relative_position") \
-               and (WAIST_KEY_ENABLED or args.enable_waist_follow_neck):
-                try:
-                    waist_deg = float(np.degrees(arm_ctrl.get_waist_yaw_relative_position()))
-                    logger_mp.info("현재 허리 각도 : %.1f 도", waist_deg)
-                except Exception:
-                    pass
 
             # [수정 부분: 강제 Swap 로직 제거하고 있는 그대로(Left->Left, Right->Right) 할당]
             left_hand_pos = tele_data.left_hand_pos
@@ -2793,13 +2717,6 @@ if __name__ == '__main__':
                             "target_yaw_pitch": neck_record["target_yaw_pitch"],
                             "command_yaw_pitch": neck_record["command_yaw_pitch"],
                         }
-                    if WAIST_KEY_ENABLED and arm_ctrl is not None and hasattr(arm_ctrl, "get_waist_yaw_relative_position"):
-                        try:
-                            waist_actual_rel = float(arm_ctrl.get_waist_yaw_relative_position())
-                        except Exception:
-                            waist_actual_rel = None
-                        states["waist"] = {"yaw_relative": waist_actual_rel}
-                        actions["waist"] = {"yaw_relative_target": WAIST_YAW_REL}
                     tactiles = None
                     if latest_tactiles:
                         tactiles = latest_tactiles

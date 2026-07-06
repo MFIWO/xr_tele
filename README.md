@@ -216,7 +216,7 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |    `--input-mode`     |       Choose XR input mode (how to control the robot)        |   `hand` (hand tracking)`controller` (controller tracking)   |      `hand`       |
 |   `--display-mode`    |  Choose XR display mode (how to view the robot perspective)  | `immersive` (immersive)`ego` (pass-through + small first-person window)`pass-through` (pass-through only) |    `immersive`    |
 |        `--arm`        |      Select the robot arm type (see 0. 📖 Introduction)       |                 `G1_29` `G1_23` `H1_2` `H1`                  |      `G1_29`      |
-|        `--ee`         | Select the end-effector type of the arm (see 0. 📖 Introduction) |     `dex1` `dex3` `inspire_ftp` `inspire_dfx` `brainco`      |       None        |
+|        `--ee`         | Select the end-effector type of the arm (see 0. 📖 Introduction) | `dex1` `dex3` `inspire_ftp` `inspire_dfx` `rh5dg2_ftp` `rh5dg2_dfx` `rh56f1` `brainco` |       None        |
 |   `--img-server-ip`   | Set the image server IP address for receiving image streams and configuring WebRTC signaling |                        `IPv4` address                        | `192.168.123.164` |
 | `--network-interface` |    Set the network interface for CycloneDDS communication    |                    Network Interface Name                    |      `None`       |
 
@@ -277,6 +277,18 @@ Assuming hand tracking with G1(29 DoF) + Dex3 in simulation with recording:
 # Simplified (defaults apply):
 (tv) unitree@Host:~/xr_teleoperate/teleop/$ python teleop_hand_and_arm.py --ee=dex3 --sim --record
 ```
+
+For H1_2 (H12) + RH56F1 hand tracking validation:
+
+```bash
+(tv) unitree@Host:~/xr_teleoperate/teleop/$ python teleop_hand_and_arm.py --arm H1_2 --ee rh56f1 --sim --no-record
+```
+
+The RH56F1 SIM interface uses `rt/rh56f1/cmd` and `rt/rh56f1/state` with
+`MotorCmds_`/`MotorStates_`. Each message contains 24 joints in
+`right[0:12] + left[12:24]` order. Position commands are normalized to
+`0.0=open` and `1.0=closed`; the simulator should convert them with the joint
+limits in `assets/RH56F1/RH56F1_L.urdf` and `RH56F1_R.urdf`.
 
 After the program starts, the terminal shows:
 

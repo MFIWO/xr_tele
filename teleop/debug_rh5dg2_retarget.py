@@ -27,9 +27,11 @@ from robot_control.robot_hand_RH5DG2 import (  # noqa: E402
     _apply_safe_close_floor,
     _apply_teleop_close_gain,
     _fmt_finger_scores,
+    _fmt_curl_scores,
     _normalize_to_unit_interval,
     _prepare_position_reference,
     _prepare_vector_reference,
+    _postprocess_sim_command,
 )
 
 
@@ -89,6 +91,7 @@ def main() -> int:
     parser.add_argument("--left-hand-json", type=str, default=None)
     parser.add_argument("--right-hand-json", type=str, default=None)
     parser.add_argument("--synthetic", choices=("open", "close"), default="open")
+    parser.add_argument("--retarget-mode", choices=("config", "vector", "dexpilot"), default="config")
     parser.add_argument("--dump-limits", action="store_true")
     args = parser.parse_args()
 
@@ -97,10 +100,13 @@ def main() -> int:
     print(" left:", yaml_joint_names["left"])
     print(" right:", yaml_joint_names["right"])
 
-    retarget = _RH5DG2Retargeting()
+    retarget = _RH5DG2Retargeting(retarget_mode=args.retarget_mode)
     print("\nRetargeting joint names:")
     print(" left:", retarget.left_joint_names)
     print(" right:", retarget.right_joint_names)
+    print("\nRetargeting mode:")
+    print(" left:", retarget.left_retargeting_type)
+    print(" right:", retarget.right_retargeting_type)
     print("\nHardware remap indices:")
     print(" left:", retarget.left_retargeting_to_hardware)
     print(" right:", retarget.right_retargeting_to_hardware)
@@ -138,6 +144,12 @@ def main() -> int:
     right_calibrated, right_scores = _apply_finger_open_calibration(right_gain, right)
     left_safe = _apply_safe_close_floor(left_calibrated)
     right_safe = _apply_safe_close_floor(right_calibrated)
+    left_post, left_debug = _postprocess_sim_command(
+        left_q, retarget.left_joint_limits, retarget.left_joint_names, left
+    )
+    right_post, right_debug = _postprocess_sim_command(
+        right_q, retarget.right_joint_limits, retarget.right_joint_names, right
+    )
 
     print("\nSynthetic / input hand data retarget result:")
     print(" left raw:", np.array2string(left_q, precision=4, suppress_small=True))
@@ -152,6 +164,18 @@ def main() -> int:
     print(" right calibrated:", np.array2string(right_calibrated, precision=4, suppress_small=True))
     print(" left safe:", np.array2string(left_safe, precision=4, suppress_small=True))
     print(" right safe:", np.array2string(right_safe, precision=4, suppress_small=True))
+    print(" left postprocess:", np.array2string(left_post, precision=4, suppress_small=True))
+    print(" right postprocess:", np.array2string(right_post, precision=4, suppress_small=True))
+    print(" left shape scores:", left_debug["prior_debug"]["scores"])
+    print(" right shape scores:", right_debug["prior_debug"]["scores"])
+    print(" left curl scores:", _fmt_curl_scores(left_debug["curl_debug"]["scores"]))
+    print(" right curl scores:", _fmt_curl_scores(right_debug["curl_debug"]["scores"]))
+    print(" left finger command delta:", left_debug["finger_command_delta"])
+    print(" right finger command delta:", right_debug["finger_command_delta"])
+    print(" left saturation:", left_debug["saturation"])
+    print(" right saturation:", right_debug["saturation"])
+    print(" left denorm rad:", np.array2string(left_debug["denorm_rad"], precision=4, suppress_small=True))
+    print(" right denorm rad:", np.array2string(right_debug["denorm_rad"], precision=4, suppress_small=True))
 
     if np.allclose(left_norm, 0.5) and np.allclose(right_norm, 0.5):
         print("\nWARNING: retarget output is still neutral (0.5). Check the hand landmark input or YAML mapping.")

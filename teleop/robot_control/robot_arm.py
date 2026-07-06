@@ -168,7 +168,7 @@ class G1_29_ArmController:
 
     def _ctrl_motor_state(self):
         if self.motion_mode:
-            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0;
+            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1;
 
         while True:
             start_time = time.time()
@@ -495,7 +495,10 @@ class G1_23_ArmController:
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
-        return self.lowstate_subscriber.Read().mode_machine
+        msg = self.lowstate_subscriber.Read()
+        if msg is None:
+            return 0
+        return msg.mode_machine
     
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
@@ -634,6 +637,10 @@ class H1_2_ArmController:
         logger_mp.info("Initialize H1_2_ArmController...")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
+        self.waist_yaw_home = 0.0
+        self.waist_yaw_target = 0.0
+        self.waist_yaw_limit = 0.0
+        self.waist_yaw_velocity_limit = 0.0
 
         self.kp_high = 300.0
         self.kd_high = 5.0
@@ -694,6 +701,13 @@ class H1_2_ArmController:
             self.msg.mode_machine = 0
             self.all_motor_q = np.zeros(H1_2_Num_Motors)
             logger_mp.warning("[H1_2_ArmController] No DDS lowstate available; initializing with zeros.")
+        self.waist_yaw_home = float(self.all_motor_q[H1_2_JointIndex.kWaistYaw])
+        self.waist_yaw_target = self.waist_yaw_home
+        # Hold the current arm pose at startup instead of the zeros default (arms down).
+        # Otherwise the 250Hz publish thread commands zeros until the main loop's first
+        # ctrl_dual_arm(), which yanks the arms downward ("as if torque off") the instant
+        # teleop control becomes active on [r], right before they rise to the IK pose.
+        self.q_target = self.get_current_dual_arm_q()
         logger_mp.info("Lock all joints except two arms...")
 
         arm_indices = set(member.value for member in H1_2_JointArmIndex)
@@ -752,6 +766,8 @@ class H1_2_ArmController:
             with self.ctrl_lock:
                 arm_q_target     = self.q_target
                 arm_tauff_target = self.tauff_target
+                waist_yaw_target = self.waist_yaw_target
+                waist_yaw_velocity_limit = self.waist_yaw_velocity_limit
 
             if self.simulation_mode:
                 cliped_arm_q_target = arm_q_target
@@ -763,19 +779,15 @@ class H1_2_ArmController:
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
 
+            if waist_yaw_velocity_limit > 0.0:
+                waist_cmd = self.msg.motor_cmd[H1_2_JointIndex.kWaistYaw]
+                max_step = waist_yaw_velocity_limit * self.control_dt
+                waist_cmd.q += float(np.clip(waist_yaw_target - waist_cmd.q, -max_step, max_step))
+                waist_cmd.dq = 0
+                waist_cmd.tau = 0
+
             self.msg.crc = self.crc.Crc(self.msg)
-            write_start = time.time()
             self._last_write_ok = self.lowcmd_publisher.Write(self.msg)
-            self._publish_debug_count += 1
-            if self._publish_debug_count <= 5 or write_start - self._last_publish_debug_ts >= 1.0:
-                logger_mp.info(
-                    f"[teleop arm publish dds] topic={kTopicLowCommand_Debug if not self.motion_mode else kTopicLowCommand_Motion} "
-                    f"domain={'1(sim)' if self.simulation_mode else '0(real)'} write_ok={self._last_write_ok} "
-                    f"hz={self._publish_debug_count / max(write_start - self._publish_rate_start_ts, 1e-6):.2f} "
-                    f"write_latency_ms={(time.time() - write_start) * 1000.0:.3f} "
-                    f"target_min={float(np.min(cliped_arm_q_target)):.4f} target_max={float(np.max(cliped_arm_q_target)):.4f}"
-                )
-                self._last_publish_debug_ts = write_start
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -794,12 +806,33 @@ class H1_2_ArmController:
             self.q_target = q_target
             self.tauff_target = tauff_target
 
+    def ctrl_waist_yaw(self, relative_target, limit=0.1745, velocity_limit=0.25):
+        """Set a bounded waist-yaw target relative to the startup position."""
+        limit = abs(float(limit))
+        with self.ctrl_lock:
+            self.waist_yaw_limit = limit
+            self.waist_yaw_velocity_limit = max(0.0, float(velocity_limit))
+            relative_target = float(np.clip(relative_target, -limit, limit))
+            self.waist_yaw_target = self.waist_yaw_home + relative_target
+            return relative_target
+
+    def get_waist_yaw_relative_target(self):
+        with self.ctrl_lock:
+            return self.waist_yaw_target - self.waist_yaw_home
+
+    def get_waist_yaw_relative_position(self):
+        current_q = self.get_current_motor_q()
+        return float(current_q[H1_2_JointIndex.kWaistYaw] - self.waist_yaw_home)
+
     def get_last_write_ok(self):
         return self._last_write_ok
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
-        return self.lowstate_subscriber.Read().mode_machine
+        msg = self.lowstate_subscriber.Read()
+        if msg is None:
+            return 0
+        return msg.mode_machine
     
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
@@ -829,6 +862,7 @@ class H1_2_ArmController:
         current_attempts = 0
         with self.ctrl_lock:
             self.q_target = np.zeros(14)
+            self.waist_yaw_target = self.waist_yaw_home
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
@@ -836,7 +870,11 @@ class H1_2_ArmController:
             if current_q is None:
                 logger_mp.warning("[H1_2_ArmController] No lowstate available during go-home; skipping wait.")
                 break
-            if np.all(np.abs(current_q) < tolerance):
+            current_motor_q = self.get_current_motor_q()
+            waist_yaw_error = abs(
+                current_motor_q[H1_2_JointIndex.kWaistYaw] - self.waist_yaw_home
+            )
+            if np.all(np.abs(current_q) < tolerance) and waist_yaw_error < tolerance:
                 if self.motion_mode:
                     for weight in np.linspace(1, 0, num=101):
                         self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = weight;
@@ -1311,7 +1349,10 @@ class H2_ArmController:
 
     def get_mode_machine(self):
         """Return current dds mode machine."""
-        return self.lowstate_subscriber.Read().mode_machine
+        msg = self.lowstate_subscriber.Read()
+        if msg is None:
+            return 0
+        return msg.mode_machine
 
     def get_current_motor_q(self):
         """Return current state q of all body motors."""

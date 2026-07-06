@@ -1,0 +1,204 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="RH56F1_L_kinematic">
+  <link name="left_hand_base" />
+  <link name="left_thumb_1" />
+  <link name="left_thumb_2" />
+  <link name="left_thumb_3" />
+  <link name="left_thumb_4" />
+  <link name="left_thumb_force_sensor" />
+  <link name="left_thumb_tip" />
+  <link name="left_index_1" />
+  <link name="left_index_2" />
+  <link name="left_index_force_sensor" />
+  <link name="left_index_tip" />
+  <link name="left_middle_1" />
+  <link name="left_middle_2" />
+  <link name="left_middle_force_sensor" />
+  <link name="left_middle_tip" />
+  <link name="left_ring_1" />
+  <link name="left_ring_2" />
+  <link name="left_ring_force_sensor" />
+  <link name="left_ring_tip" />
+  <link name="left_little_1" />
+  <link name="left_little_2" />
+  <link name="left_little_force_sensor" />
+  <link name="left_little_tip" />
+  <link name="left_plam_1" />
+  <link name="left_plam_2" />
+  <link name="left_plam_3" />
+  <link name="left_plam_force_sensor" />
+  <joint name="left_thumb_1_joint" type="revolute">
+    <origin xyz="0.01836 -0.027241 0.070511" rpy="0 0 0" />
+    <parent link="left_hand_base" />
+    <child link="left_thumb_1" />
+    <axis xyz="8.7274E-05 0 1" />
+    <limit lower="0" upper="2.0943951023931953" effort="1" velocity="2" />
+  </joint>
+  <joint name="left_thumb_2_joint" type="revolute">
+    <origin xyz="0.005034 -0.01349 -0.0049121" rpy="1.5707 0 -1.5708" />
+    <parent link="left_thumb_1" />
+    <child link="left_thumb_2" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="0.4745550236172582" effort="1" velocity="2" />
+  </joint>
+  <joint name="left_thumb_3_joint" type="revolute">
+    <origin xyz="0.033907 0.034601 -0.0029656" rpy="0 0 0" />
+    <parent link="left_thumb_2" />
+    <child link="left_thumb_3" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="3.14" effort="1" velocity="2" />
+    <mimic joint="left_thumb_2_joint" multiplier="1.2953" offset="0" />
+  </joint>
+  <joint name="left_thumb_4_joint" type="revolute">
+    <origin xyz="0.01441 0.014648 0.0013" rpy="0 0 0" />
+    <parent link="left_thumb_3" />
+    <child link="left_thumb_4" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="3.14" effort="1" velocity="2" />
+    <mimic joint="left_thumb_3_joint" multiplier="0.8962" offset="0" />
+  </joint>
+  <joint name="left_thumb_force_sensor_joint" type="fixed">
+    <origin xyz="0.0082761 0.019128 0.0068" rpy="1.5194 0.0515 -2.3562" />
+    <parent link="left_thumb_4" />
+    <child link="left_thumb_force_sensor" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_thumb_tip_joint" type="fixed">
+    <origin xyz="0.016676 0.025314 0.0067577" rpy="1.8172 -1.5641 -3.1286" />
+    <parent link="left_thumb_4" />
+    <child link="left_thumb_tip" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_index_1_joint" type="revolute">
+    <origin xyz="0.00070753 -0.034377 0.13554" rpy="1.6319 0 0" />
+    <parent link="left_hand_base" />
+    <child link="left_index_1" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="1.5285593588966337" effort="1" velocity="2" />
+  </joint>
+  <joint name="left_index_2_joint" type="revolute">
+    <origin xyz="0.0031056 0.032854 -0.001" rpy="0 0 0" />
+    <parent link="left_index_1" />
+    <child link="left_index_2" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="3.14" effort="1" velocity="2" />
+    <mimic joint="left_index_1_joint" multiplier="1.1545" offset="0" />
+  </joint>
+  <joint name="left_index_force_sensor_joint" type="fixed">
+    <origin xyz="0.005139 0.028671 -0.0059996" rpy="-2.1954 1.4829 -2.3749" />
+    <parent link="left_index_2" />
+    <child link="left_index_force_sensor" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_index_tip_joint" type="fixed">
+    <origin xyz="0.0049188 0.039631 -0.006" rpy="-2.1925 1.5073 -1.8461" />
+    <parent link="left_index_2" />
+    <child link="left_index_tip" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_middle_1_joint" type="revolute">
+    <origin xyz="0.00070746 -0.015767 0.13648" rpy="1.5708 0 0" />
+    <parent link="left_hand_base" />
+    <child link="left_middle_1" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="1.5285593588966337" effort="1" velocity="2" />
+  </joint>
+  <joint name="left_middle_2_joint" type="revolute">
+    <origin xyz="0.0031056 0.032854 -0.001" rpy="0 0 0" />
+    <parent link="left_middle_1" />
+    <child link="left_middle_2" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="3.14" effort="1" velocity="2" />
+    <mimic joint="left_middle_1_joint" multiplier="1.1545" offset="0" />
+  </joint>
+  <joint name="left_middle_force_sensor_joint" type="fixed">
+    <origin xyz="0.0059655 0.031551 -0.0060998" rpy="-2.9405 1.5184 3.1416" />
+    <parent link="left_middle_2" />
+    <child link="left_middle_force_sensor" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_middle_tip_joint" type="fixed">
+    <origin xyz="0.0059647 0.042512 -0.0060998" rpy="-0.3273 1.5691 0" />
+    <parent link="left_middle_2" />
+    <child link="left_middle_tip" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_ring_1_joint" type="revolute">
+    <origin xyz="0.00070746 0.0030876 0.13643" rpy="1.5184 0 0" />
+    <parent link="left_hand_base" />
+    <child link="left_ring_1" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="1.5285593588966337" effort="1" velocity="2" />
+  </joint>
+  <joint name="left_ring_2_joint" type="revolute">
+    <origin xyz="0.0031056 0.032854 -0.001" rpy="0 0 0" />
+    <parent link="left_ring_1" />
+    <child link="left_ring_2" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="3.14" effort="1" velocity="2" />
+    <mimic joint="left_ring_1_joint" multiplier="1.1545" offset="0" />
+  </joint>
+  <joint name="left_ring_force_sensor_joint" type="fixed">
+    <origin xyz="0.005139 0.028671 -0.0059996" rpy="2.4366 1.5033 2.2541" />
+    <parent link="left_ring_2" />
+    <child link="left_ring_force_sensor" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_ring_tip_joint" type="fixed">
+    <origin xyz="0.0049188 0.039631 -0.006" rpy="1.5417 1.5157 1.889" />
+    <parent link="left_ring_2" />
+    <child link="left_ring_tip" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_little_1_joint" type="revolute">
+    <origin xyz="0.00070753 0.021094 0.13531" rpy="1.4661 0 0" />
+    <parent link="left_hand_base" />
+    <child link="left_little_1" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="1.5285593588966337" effort="1" velocity="2" />
+  </joint>
+  <joint name="left_little_2_joint" type="revolute">
+    <origin xyz="0.0031057 0.032854 -0.001" rpy="0 0 0" />
+    <parent link="left_little_1" />
+    <child link="left_little_2" />
+    <axis xyz="0 0 -1" />
+    <limit lower="0" upper="3.14" effort="1" velocity="2" />
+    <mimic joint="left_little_1_joint" multiplier="1.1545" offset="0" />
+  </joint>
+  <joint name="left_little_force_sensor_joint" type="fixed">
+    <origin xyz="0.0051314 0.021582 -0.0063543" rpy="2.0609 1.4616 1.858" />
+    <parent link="left_little_2" />
+    <child link="left_little_force_sensor" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_little_tip_joint" type="fixed">
+    <origin xyz="0.0051203 0.032544 -0.0063511" rpy="1.554 1.4608 1.8824" />
+    <parent link="left_little_2" />
+    <child link="left_little_tip" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_plam_1_joint" type="fixed">
+    <origin xyz="0 0 0.0305" rpy="0 0 0" />
+    <parent link="left_hand_base" />
+    <child link="left_plam_1" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_plam_2_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="left_plam_1" />
+    <child link="left_plam_2" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_plam_3_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="left_plam_2" />
+    <child link="left_plam_3" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="left_plam_force_sensor_joint" type="fixed">
+    <origin xyz="0.01594 -0.0013505 0.073746" rpy="1.5708 0 1.5708" />
+    <parent link="left_plam_2" />
+    <child link="left_plam_force_sensor" />
+    <axis xyz="0 0 0" />
+  </joint>
+</robot>

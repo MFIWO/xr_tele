@@ -1,9 +1,9 @@
 left:
-  type: Vector
+  type: DexPilot
   urdf_path: RH5DG2/RH5DG2_L.urdf
   wrist_link_name: "left_hand_base"
-  
-  target_joint_names: 
+
+  target_joint_names:
     - left_thumb_yaw_joint
     - left_thumb_mcp_joint
     - left_thumb_dip_joint
@@ -18,30 +18,136 @@ left:
     - left_pinky_mcp_joint
     - left_pinky_pip_joint
 
+  # for DexPilot type
+  finger_tip_link_names:
+    - left_thumb_force_sensor
+    - left_index_force_sensor
+    - left_middle_force_sensor
+    - left_ring_force_sensor
+    - left_pinky_force_sensor
+  target_link_human_indices_dexpilot:
+    - [9, 14, 19, 24, 14, 19, 24, 19, 24, 24, 0, 0, 0, 0, 0]
+    - [4, 4, 4, 4, 9, 9, 9, 14, 14, 19, 4, 9, 14, 19, 24]
+
   target_origin_link_names:
     - left_hand_base
     - left_hand_base
     - left_hand_base
     - left_hand_base
     - left_hand_base
+    - left_thumb_yaw
+    - left_thumb_mcp
+    - left_thumb_pip
+    - left_thumb_dip
+    - left_thumb_yaw
+    - left_index_yaw
+    - left_index_mcp
+    - left_index_pip
+    - left_index_dip
+    - left_index_yaw
+    - left_middle_yaw
+    - left_middle_mcp
+    - left_middle_pip
+    - left_middle_dip
+    - left_middle_yaw
+    - left_ring_mcp
+    - left_ring_pip
+    - left_ring_dip
+    - left_ring_dip
+    - left_ring_mcp
+    - left_pinky_mcp
+    - left_pinky_pip
+    - left_pinky_dip
+    - left_pinky_dip
+    - left_pinky_mcp
+    - left_index_force_sensor
+    - left_index_force_sensor
+    - left_index_force_sensor
 
   target_task_link_names:
+    - left_thumb_force_sensor
+    - left_index_force_sensor
+    - left_middle_force_sensor
+    - left_ring_force_sensor
+    - left_pinky_force_sensor
+    - left_thumb_mcp
+    - left_thumb_pip
     - left_thumb_dip
+    - left_thumb_force_sensor
+    - left_thumb_force_sensor
+    - left_index_mcp
+    - left_index_pip
     - left_index_dip
+    - left_index_force_sensor
+    - left_index_force_sensor
+    - left_middle_mcp
+    - left_middle_pip
     - left_middle_dip
+    - left_middle_force_sensor
+    - left_middle_force_sensor
+    - left_ring_pip
     - left_ring_dip
+    - left_ring_force_sensor
+    - left_ring_force_sensor
+    - left_ring_force_sensor
+    - left_pinky_pip
     - left_pinky_dip
+    - left_pinky_force_sensor
+    - left_pinky_force_sensor
+    - left_pinky_force_sensor
+    - left_middle_force_sensor
+    - left_middle_force_sensor
+    - left_middle_force_sensor
 
-  target_link_human_indices_vector: [[0, 0, 0, 0, 0], [4, 9, 14, 19, 24]]
-  scaling_factor: 1.0
+  target_link_human_indices_vector:
+    - [0, 0, 0, 0, 0, 1, 2, 3, 3, 1, 5, 6, 7, 8, 5, 10, 11, 12, 13, 10, 15, 16, 17, 18, 15, 20, 21, 22, 23, 20, 9, 9, 9]
+    - [4, 9, 14, 19, 24, 2, 3, 4, 4, 4, 6, 7, 8, 9, 9, 11, 12, 13, 14, 14, 16, 17, 18, 19, 19, 21, 22, 23, 24, 24, 14, 14, 14]
+
+  target_link_weights_vector:
+    - 1.0
+    - 1.0
+    - 1.0
+    - 2.0
+    - 2.0
+    - 1.2
+    - 1.2
+    - 1.2
+    - 1.2
+    - 1.2
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 0.2
+    - 0.2
+    - 0.2
+
+  scaling_factor: 1.6
   low_pass_alpha: 1.0
+  normal_delta: 0.02
 
 right:
-  type: Vector
+  type: DexPilot
   urdf_path: RH5DG2/RH56DG2_R.urdf
   wrist_link_name: "right_hand_base"
-  
-  target_joint_names: 
+
+  target_joint_names:
     - right_thumb_yaw_joint
     - right_thumb_mcp_joint
     - right_thumb_dip_joint
@@ -56,20 +162,126 @@ right:
     - right_pinky_mcp_joint
     - right_pinky_pip_joint
 
+  # for DexPilot type
+  finger_tip_link_names:
+    - right_thumb_force_sensor
+    - right_index_force_sensor
+    - right_middle_force_sensor
+    - right_ring_force_sensor
+    - right_pinky_force_sensor
+  target_link_human_indices_dexpilot:
+    - [9, 14, 19, 24, 14, 19, 24, 19, 24, 24, 0, 0, 0, 0, 0]
+    - [4, 4, 4, 4, 9, 9, 9, 14, 14, 19, 4, 9, 14, 19, 24]
+
   target_origin_link_names:
     - right_hand_base
     - right_hand_base
     - right_hand_base
     - right_hand_base
     - right_hand_base
+    - right_thumb_yaw
+    - right_thumb_mcp
+    - right_thumb_pip
+    - right_thumb_dip
+    - right_thumb_yaw
+    - right_index_yaw
+    - right_index_mcp
+    - right_index_pip
+    - right_index_dip
+    - right_index_yaw
+    - right_middle_yaw
+    - right_middle_mcp
+    - right_middle_pip
+    - right_middle_dip
+    - right_middle_yaw
+    - right_ring_mcp
+    - right_ring_pip
+    - right_ring_dip
+    - right_ring_dip
+    - right_ring_mcp
+    - right_pinky_mcp
+    - right_pinky_pip
+    - right_pinky_dip
+    - right_pinky_dip
+    - right_pinky_mcp
+    - right_index_force_sensor
+    - right_index_force_sensor
+    - right_index_force_sensor
 
   target_task_link_names:
+    - right_thumb_force_sensor
+    - right_index_force_sensor
+    - right_middle_force_sensor
+    - right_ring_force_sensor
+    - right_pinky_force_sensor
+    - right_thumb_mcp
+    - right_thumb_pip
     - right_thumb_dip
+    - right_thumb_force_sensor
+    - right_thumb_force_sensor
+    - right_index_mcp
+    - right_index_pip
     - right_index_dip
+    - right_index_force_sensor
+    - right_index_force_sensor
+    - right_middle_mcp
+    - right_middle_pip
     - right_middle_dip
+    - right_middle_force_sensor
+    - right_middle_force_sensor
+    - right_ring_pip
     - right_ring_dip
+    - right_ring_force_sensor
+    - right_ring_force_sensor
+    - right_ring_force_sensor
+    - right_pinky_pip
     - right_pinky_dip
+    - right_pinky_force_sensor
+    - right_pinky_force_sensor
+    - right_pinky_force_sensor
+    - right_middle_force_sensor
+    - right_middle_force_sensor
+    - right_middle_force_sensor
 
-  target_link_human_indices_vector: [[0, 0, 0, 0, 0], [4, 9, 14, 19, 24]]
-  scaling_factor: 1.0
+  target_link_human_indices_vector:
+    - [0, 0, 0, 0, 0, 1, 2, 3, 3, 1, 5, 6, 7, 8, 5, 10, 11, 12, 13, 10, 15, 16, 17, 18, 15, 20, 21, 22, 23, 20, 9, 9, 9]
+    - [4, 9, 14, 19, 24, 2, 3, 4, 4, 4, 6, 7, 8, 9, 9, 11, 12, 13, 14, 14, 16, 17, 18, 19, 19, 21, 22, 23, 24, 24, 14, 14, 14]
+
+  target_link_weights_vector:
+    - 1.0
+    - 1.0
+    - 1.0
+    - 2.0
+    - 2.0
+    - 1.2
+    - 1.2
+    - 1.2
+    - 1.2
+    - 1.2
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 1.5
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 4.0
+    - 0.2
+    - 0.2
+    - 0.2
+
+  scaling_factor: 1.6
   low_pass_alpha: 1.0
+  normal_delta: 0.02
