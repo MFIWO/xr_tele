@@ -3,4 +3,6 @@ rerun-sdk==0.20.1
 meshcat==0.3.2
 sshkeyboard==2.3.1
 pyserial==3.5
+# vuer 0.0.60 imports Flag/Proto APIs removed by params-proto 3.x.
+params-proto==2.13.2
 loop-sdk    # optional, only needed for --loop streaming to Config Loop

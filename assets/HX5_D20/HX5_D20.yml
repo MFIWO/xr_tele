@@ -1,0 +1,81 @@
+left:
+  type: DexPilot
+  # Replaced at runtime with the sibling ai_worker checkout's standalone URDF.
+  urdf_path: HX5_D20/hx5_d20_left.urdf
+  wrist_link_name: hx5_d20_left_base
+  target_joint_names:
+    - finger_l_joint_a
+    - finger_l_joint_b
+    - finger_l_joint_c
+    - finger_l_joint_d
+    - finger_l_joint_e
+    - finger_l_joint_f
+    - finger_l_joint_g
+    - finger_l_joint_h
+    - finger_l_joint_i
+    - finger_l_joint_j
+    - finger_l_joint_k
+    - finger_l_joint_l
+    - finger_l_joint_m
+    - finger_l_joint_n
+    - finger_l_joint_o
+    - finger_l_joint_p
+    - finger_l_joint_q
+    - finger_l_joint_r
+    - finger_l_joint_s
+    - finger_l_joint_t
+  finger_tip_link_names:
+    - finger_end_l_link1
+    - finger_end_l_link2
+    - finger_end_l_link3
+    - finger_end_l_link4
+    - finger_end_l_link5
+  target_link_human_indices_dexpilot:
+    - [9, 14, 19, 24, 14, 19, 24, 19, 24, 24, 0, 0, 0, 0, 0]
+    - [4, 4, 4, 4, 9, 9, 9, 14, 14, 19, 4, 9, 14, 19, 24]
+  scaling_factor: 1.6
+  low_pass_alpha: 1.0
+  normal_delta: 0.02
+  project_dist: 0.03
+  escape_dist: 0.05
+
+right:
+  type: DexPilot
+  # Replaced at runtime with the sibling ai_worker checkout's standalone URDF.
+  urdf_path: HX5_D20/hx5_d20_right.urdf
+  wrist_link_name: hx5_d20_right_base
+  target_joint_names:
+    - finger_r_joint_a
+    - finger_r_joint_b
+    - finger_r_joint_c
+    - finger_r_joint_d
+    - finger_r_joint_e
+    - finger_r_joint_f
+    - finger_r_joint_g
+    - finger_r_joint_h
+    - finger_r_joint_i
+    - finger_r_joint_j
+    - finger_r_joint_k
+    - finger_r_joint_l
+    - finger_r_joint_m
+    - finger_r_joint_n
+    - finger_r_joint_o
+    - finger_r_joint_p
+    - finger_r_joint_q
+    - finger_r_joint_r
+    - finger_r_joint_s
+    - finger_r_joint_t
+  finger_tip_link_names:
+    - finger_end_r_link1
+    - finger_end_r_link2
+    - finger_end_r_link3
+    - finger_end_r_link4
+    - finger_end_r_link5
+  target_link_human_indices_dexpilot:
+    - [9, 14, 19, 24, 14, 19, 24, 19, 24, 24, 0, 0, 0, 0, 0]
+    - [4, 4, 4, 4, 9, 9, 9, 14, 14, 19, 4, 9, 14, 19, 24]
+  scaling_factor: 1.6
+  low_pass_alpha: 1.0
+  normal_delta: 0.02
+  project_dist: 0.03
+  escape_dist: 0.05
