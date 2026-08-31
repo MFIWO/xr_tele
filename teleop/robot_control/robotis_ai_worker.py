@@ -28,6 +28,32 @@ AI_WORKER_ARM_UPPER = np.array(
     [3.14, 3.14, 3.14, 1.0786, 3.14, 1.57, 1.5804,
      3.14, 0.0, 3.14, 1.0786, 3.14, 1.57, 1.8201]
 )
+AI_WORKER_SH5_HOME_Q = np.array(
+    [0.0, 0.0, 0.0, -1.57, 0.0, 0.0, 0.0] * 2,
+    dtype=np.float64,
+)
+AI_WORKER_SG2_HOME_Q = np.zeros(14, dtype=np.float64)
+AI_WORKER_SH5_READY_Q = AI_WORKER_SH5_HOME_Q.copy()
+AI_WORKER_SG2_READY_Q = np.array(
+    [0.0, 0.0, 0.0, -1.57, 0.0, 0.0, 0.0] * 2,
+    dtype=np.float64,
+)
+
+
+def ai_worker_home_q_for_urdf(urdf_path):
+    """Return the official arm initial pose for the selected AI Worker model."""
+    normalized_path = str(Path(urdf_path).expanduser()).lower()
+    if "ffw_sg2" in normalized_path:
+        return AI_WORKER_SG2_HOME_Q.copy()
+    return AI_WORKER_SH5_HOME_Q.copy()
+
+
+def ai_worker_ready_q_for_urdf(urdf_path):
+    """Return the bent-elbow pose used while waiting to start teleoperation."""
+    normalized_path = str(Path(urdf_path).expanduser()).lower()
+    if "ffw_sg2" in normalized_path:
+        return AI_WORKER_SG2_READY_Q.copy()
+    return AI_WORKER_SH5_READY_Q.copy()
 
 
 def default_ai_worker_urdf() -> Path:
@@ -120,18 +146,19 @@ class AIWorkerArmIK:
 
         self.lower = np.asarray(self.model.lowerPositionLimit, dtype=np.float64)
         self.upper = np.asarray(self.model.upperPositionLimit, dtype=np.float64)
-        self.home_q = np.array([0.0, 0.0, 0.0, -1.57, 0.0, 0.0, 0.0] * 2)
-        home_frames = self._forward(self.home_q)
+        self.home_q = ai_worker_home_q_for_urdf(self.urdf_path)
+        self.ready_q = ai_worker_ready_q_for_urdf(self.urdf_path)
+        ready_frames = self._forward(self.ready_q)
         self._corrected_home_rotations = (
-            home_frames[0].rotation @ self._wrist_roll_corrections[0],
-            home_frames[1].rotation @ self._wrist_roll_corrections[1],
+            ready_frames[0].rotation @ self._wrist_roll_corrections[0],
+            ready_frames[1].rotation @ self._wrist_roll_corrections[1],
         )
         self.translation_scale = float(translation_scale)
         self.max_iterations = int(max_iterations)
         self._input_anchor = None
         self._robot_anchor = None
         self._robot_orientation_anchor = None
-        self._last_q = self.home_q.copy()
+        self._last_q = self.ready_q.copy()
 
     @staticmethod
     def _pose(matrix):
@@ -254,7 +281,7 @@ class AIWorkerArmIK:
             dq = jacobian.T @ np.linalg.solve(
                 jacobian @ jacobian.T + damping * np.eye(12), error
             )
-            dq += 0.003 * (self.home_q - q)
+            dq += 0.003 * (self.ready_q - q)
             max_step = 0.12
             step_norm = np.max(np.abs(dq))
             if step_norm > max_step:
@@ -270,12 +297,27 @@ class AIWorkerArmController:
 
     command_topic_description = "ROBOTIS DDS JointTrajectory (AI Worker left/right arms)"
 
-    def __init__(self, command_duration=0.08, node_name="xr_tele_ai_worker_arms"):
+    def __init__(
+        self,
+        command_duration=0.08,
+        node_name="xr_tele_ai_worker_arms",
+        home_q=None,
+        ready_q=None,
+    ):
         del node_name
         from teleop.robot_control.robotis_dds import RobotisJointTrajectoryTransport
 
         self.command_duration = max(0.02, float(command_duration))
-        self.home_q = np.array([0.0, 0.0, 0.0, -1.57, 0.0, 0.0, 0.0] * 2)
+        self.home_q = (
+            AI_WORKER_SH5_HOME_Q.copy()
+            if home_q is None
+            else np.asarray(home_q, dtype=np.float64).reshape(14).copy()
+        )
+        self.ready_q = (
+            self.home_q.copy()
+            if ready_q is None
+            else np.asarray(ready_q, dtype=np.float64).reshape(14).copy()
+        )
         self.arm_velocity_limit = 3.0
         self._q = self.home_q.copy()
         self._dq = np.zeros(14)
@@ -346,6 +388,13 @@ class AIWorkerArmController:
         self._publish_side("left", AI_WORKER_LEFT_ARM_JOINTS, self.home_q[:7])
         self._publish_side("right", AI_WORKER_RIGHT_ARM_JOINTS, self.home_q[7:])
         self._last_command = self.home_q.copy()
+        self._last_write_ok = True
+
+    def ctrl_dual_arm_go_ready(self):
+        self._publish_side("left", AI_WORKER_LEFT_ARM_JOINTS, self.ready_q[:7])
+        self._publish_side("right", AI_WORKER_RIGHT_ARM_JOINTS, self.ready_q[7:])
+        self._last_command = self.ready_q.copy()
+        self._last_command_time = time.monotonic()
         self._last_write_ok = True
 
     def get_last_write_ok(self):

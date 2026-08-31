@@ -855,24 +855,31 @@ def _make_arm_ready_q(current_q):
         q[half + 3] = -0.3
     return q
 
-def _smooth_arm_go_home(arm_ctrl, duration=3.0, frequency=100.0, velocity_cap=3.0):
-    """Gradually lower both arms (and the H1_2 waist) from the current pose to the
-    zero/home pose using a cosine ease, so they descend smoothly on exit instead of
-    dropping. Returns True when the smooth descent ran."""
+def _smooth_arm_go_home(
+    arm_ctrl,
+    duration=3.0,
+    frequency=100.0,
+    velocity_cap=3.0,
+    phase="shutdown",
+    target_q=None,
+):
+    """Move both arms smoothly to an explicit target or the controller home pose."""
     if arm_ctrl is None or not hasattr(arm_ctrl, "get_current_dual_arm_q") or not hasattr(arm_ctrl, "ctrl_dual_arm"):
         return False
     try:
         start_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
     except Exception as exc:
-        logger_mp.warning("[teleop arm shutdown] smooth go-home skipped: cannot read arm q (%s)", exc)
+        logger_mp.warning("[teleop arm %s] smooth go-home skipped: cannot read arm q (%s)", phase, exc)
         return False
     if start_q.size == 0 or not np.isfinite(start_q).all():
-        logger_mp.warning("[teleop arm shutdown] smooth go-home skipped: invalid arm q.")
+        logger_mp.warning("[teleop arm %s] smooth go-home skipped: invalid arm q.", phase)
         return False
 
-    controller_home = getattr(arm_ctrl, "home_q", None)
-    target_q = np.asarray(controller_home, dtype=np.float64).reshape(-1) if controller_home is not None else np.zeros_like(start_q)
-    if target_q.size != start_q.size:
+    if target_q is None:
+        target_q = getattr(arm_ctrl, "home_q", None)
+    target_q = np.asarray(target_q, dtype=np.float64).reshape(-1) if target_q is not None else np.zeros_like(start_q)
+    if target_q.size != start_q.size or not np.isfinite(target_q).all():
+        logger_mp.warning("[teleop arm %s] invalid target q; using zeros.", phase)
         target_q = np.zeros_like(start_q)
     tauff = np.zeros_like(start_q)
 
@@ -896,9 +903,9 @@ def _smooth_arm_go_home(arm_ctrl, duration=3.0, frequency=100.0, velocity_cap=3.
     n_steps = max(int(duration * frequency), 1)
     dt = duration / n_steps
     logger_mp.info(
-        "[teleop arm shutdown] smooth go-home: lowering arms to home over %.2fs at %.0f Hz "
+        "[teleop arm %s] smooth go-home over %.2fs at %.0f Hz "
         "(waist_start=%.3f rad).",
-        duration, frequency, start_waist,
+        phase, duration, frequency, start_waist,
     )
     for i in range(1, n_steps + 1):
         # cosine ease-in-out from 0 -> 1
@@ -976,6 +983,8 @@ if __name__ == '__main__':
     parser.add_argument('--ai-worker-ros-domain-id', type=int, default=None, help='DDS domain ID used by AI Worker arm/hand trajectory topics (robotis_lab commonly uses 30).')
     parser.add_argument('--ai-worker-command-duration', type=float, default=0.08, help='AI Worker DDS JointTrajectory point duration in seconds.')
     parser.add_argument('--ai-worker-arm-scale', type=float, default=1.0, help='Scale Vision Pro wrist translation deltas for AI Worker IK.')
+    parser.add_argument('--ai-worker-home-on-start', action=argparse.BooleanOptionalAction, default=True, help='Move AI Worker arms smoothly to the model-specific initial pose before teleoperation starts.')
+    parser.add_argument('--ai-worker-home-duration', type=float, default=5.0, help='Seconds used to move AI Worker arms to the initial pose at startup.')
     parser.add_argument('--enable-lift', action=argparse.BooleanOptionalAction, default=False, help='Track relative XR head height with the AI Worker lift joint.')
     parser.add_argument('--lift-gain', type=float, default=1.0, help='AI Worker lift motion per meter of relative XR head-height motion.')
     parser.add_argument('--lift-deadband', type=float, default=0.015, help='Ignore relative XR head-height motion smaller than this many meters.')
@@ -1207,6 +1216,8 @@ if __name__ == '__main__':
         raise ValueError("--ai-worker-command-duration must be greater than zero.")
     if args.ai_worker_arm_scale <= 0.0:
         raise ValueError("--ai-worker-arm-scale must be greater than zero.")
+    if args.ai_worker_home_duration <= 0.0:
+        raise ValueError("--ai-worker-home-duration must be greater than zero.")
     if args.enable_lift and args.arm != "AI_WORKER":
         raise ValueError("--enable-lift currently supports --arm AI_WORKER only.")
     if args.lift_gain < 0.0:
@@ -1745,12 +1756,33 @@ if __name__ == '__main__':
                 left_wrist_roll_offset_deg=args.ai_worker_left_wrist_roll_offset_deg,
                 right_wrist_roll_offset_deg=args.ai_worker_right_wrist_roll_offset_deg,
             )
-            arm_ctrl = AIWorkerArmController(command_duration=args.ai_worker_command_duration)
+            arm_ctrl = AIWorkerArmController(
+                command_duration=args.ai_worker_command_duration,
+                home_q=arm_ik.home_q,
+                ready_q=arm_ik.ready_q,
+            )
             if not arm_ctrl.wait_for_joint_state(timeout=5.0):
                 raise RuntimeError(
                     "AI Worker did not receive all 14 arm joints on /joint_states within 5 seconds; "
-                    "refusing to anchor IK from guessed home positions. Check the DDS domain and SH5 bringup."
+                    "refusing to anchor IK from guessed home positions. Check the DDS domain and AI Worker bringup."
                 )
+            logger_mp.info(
+                "[teleop arm home] model=%s home_q=%s ready_q=%s home_on_start=%s duration=%.2fs",
+                "SG2" if "ffw_sg2" in str(arm_ik.urdf_path).lower() else "SH5",
+                np.round(arm_ctrl.home_q, 4).tolist(),
+                np.round(arm_ctrl.ready_q, 4).tolist(),
+                args.ai_worker_home_on_start,
+                args.ai_worker_home_duration,
+            )
+            if args.ai_worker_home_on_start:
+                if _smooth_arm_go_home(
+                    arm_ctrl,
+                    duration=args.ai_worker_home_duration,
+                    velocity_cap=args.arm_shutdown_velocity,
+                    phase="startup",
+                    target_q=arm_ctrl.ready_q,
+                ):
+                    arm_ctrl.ctrl_dual_arm_go_ready()
 
         # end-effector
         if args.ee == "dex3":
