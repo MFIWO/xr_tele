@@ -55,7 +55,6 @@ class RobotisJointTrajectoryTransport:
                 time.sleep(0.001)
 
     def publish(self, key, joint_names, positions, duration):
-        now_ns = time.time_ns()
         seconds = int(duration)
         nanoseconds = int((duration - seconds) * 1e9)
         point = self.JointTrajectoryPoint(
@@ -67,7 +66,12 @@ class RobotisJointTrajectoryTransport:
         )
         message = self.JointTrajectory(
             header=self.Header(
-                stamp=self.Time(sec=now_ns // 1_000_000_000, nanosec=now_ns % 1_000_000_000),
+                # A zero ROS timestamp means "start immediately".  Do not put
+                # the publisher's wall clock here: xr_tele commonly runs on a
+                # different computer from ros2_control, and even modest clock
+                # skew makes the controller reject every point as being in the
+                # past.
+                stamp=self.Time(sec=0, nanosec=0),
                 frame_id="",
             ),
             joint_names=list(joint_names),
