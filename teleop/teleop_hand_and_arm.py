@@ -20,23 +20,17 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
-from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController
-from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.audio_recorder import BackgroundAudioRecorder, AudioRecorderError
 from teleop.utils.ipc import IPC_Server
-from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from teleop.utils.rh5dg2_tactile import RH5DG2TactileHeatMapper
-from teleop.neck_control import VisionProNeckController
+from teleop.neck_control import AIWorkerNeckController, VisionProNeckController
 from sshkeyboard import listen_keyboard, stop_listening
 
-# for simulation
-from unitree_sdk2py.core.channel import ChannelPublisher
-from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
 def publish_reset_category(category: int, publisher): # Scene Reset signal
+    from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
     msg = String_(data=str(category))
     publisher.Write(msg)
     logger_mp.info(f"published reset category: {category}")
@@ -861,62 +855,125 @@ def _make_arm_ready_q(current_q):
         q[half + 3] = -0.3
     return q
 
-def _smooth_arm_go_home(arm_ctrl, duration=3.0, frequency=100.0, velocity_cap=3.0):
-    """Gradually lower both arms (and the H1_2 waist) from the current pose to the
-    zero/home pose using a cosine ease, so they descend smoothly on exit instead of
-    dropping. Returns True when the smooth descent ran."""
+def _smooth_arm_go_home(
+    arm_ctrl,
+    duration=3.0,
+    frequency=100.0,
+    velocity_cap=3.0,
+    phase="shutdown",
+    target_q=None,
+):
+    """Move both arms smoothly to an explicit target or the controller home pose."""
     if arm_ctrl is None or not hasattr(arm_ctrl, "get_current_dual_arm_q") or not hasattr(arm_ctrl, "ctrl_dual_arm"):
         return False
     try:
         start_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
     except Exception as exc:
-        logger_mp.warning("[teleop arm shutdown] smooth go-home skipped: cannot read arm q (%s)", exc)
+        logger_mp.warning("[teleop arm %s] smooth go-home skipped: cannot read arm q (%s)", phase, exc)
         return False
     if start_q.size == 0 or not np.isfinite(start_q).all():
-        logger_mp.warning("[teleop arm shutdown] smooth go-home skipped: invalid arm q.")
+        logger_mp.warning("[teleop arm %s] smooth go-home skipped: invalid arm q.", phase)
         return False
 
-    target_q = np.zeros_like(start_q)
+    if target_q is None:
+        target_q = getattr(arm_ctrl, "home_q", None)
+    target_q = np.asarray(target_q, dtype=np.float64).reshape(-1) if target_q is not None else np.zeros_like(start_q)
+    if target_q.size != start_q.size or not np.isfinite(target_q).all():
+        logger_mp.warning("[teleop arm %s] invalid target q; using zeros.", phase)
+        target_q = np.zeros_like(start_q)
     tauff = np.zeros_like(start_q)
 
     # Cap the controller's own velocity clip so it cannot add a jump on top of the interpolation.
     prev_velocity_limit = getattr(arm_ctrl, "arm_velocity_limit", None)
     if prev_velocity_limit is not None and velocity_cap > 0.0:
         arm_ctrl.arm_velocity_limit = min(prev_velocity_limit, float(velocity_cap))
+    try:
+        duration = max(float(duration), 0.1)
+        smooth_to = getattr(arm_ctrl, "ctrl_dual_arm_smooth_to", None)
+        if callable(smooth_to):
+            actual_duration = float(smooth_to(target_q, duration=duration, num_points=100))
+            logger_mp.info(
+                "[teleop arm %s] AI Worker quintic trajectory over %.2fs "
+                "(100 points, zero endpoint velocity/acceleration).",
+                phase,
+                actual_duration,
+            )
+            time.sleep(actual_duration)
 
-    # H1_2 waist: ramp back to home over the same window if the arm is already turned.
-    has_waist = hasattr(arm_ctrl, "ctrl_waist_yaw") and hasattr(arm_ctrl, "get_waist_yaw_relative_position")
-    start_waist = 0.0
-    if has_waist:
-        try:
-            start_waist = float(arm_ctrl.get_waist_yaw_relative_position())
-        except Exception:
-            has_waist = False
-    waist_velocity = max(abs(start_waist) * 2.0, 1.0)
+            # Give joint-state feedback a short passive settle window.  Never
+            # replace a residual with a short direct command: that was the
+            # source of the visible endpoint catch-up on the physical robot.
+            position_error = float("inf")
+            max_speed = float("inf")
+            settle_deadline = time.monotonic() + 1.0
+            while True:
+                measured_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
+                position_error = (
+                    float(np.max(np.abs(measured_q - target_q)))
+                    if measured_q.size == target_q.size and np.isfinite(measured_q).all()
+                    else float("inf")
+                )
+                try:
+                    measured_dq = np.asarray(arm_ctrl.get_current_dual_arm_dq(), dtype=np.float64).reshape(-1)
+                    max_speed = (
+                        float(np.max(np.abs(measured_dq)))
+                        if measured_dq.size == target_q.size and np.isfinite(measured_dq).all()
+                        else float("inf")
+                    )
+                except Exception:
+                    max_speed = 0.0
+                if position_error <= 0.05 and max_speed <= 0.10:
+                    break
+                if time.monotonic() >= settle_deadline:
+                    logger_mp.warning(
+                        "[teleop arm %s] quintic trajectory ended with measured residual "
+                        "position=%.4f rad speed=%.4f rad/s; holding without a direct catch-up command.",
+                        phase,
+                        position_error,
+                        max_speed,
+                    )
+                    break
+                time.sleep(0.02)
+            sync_to_measured = getattr(arm_ctrl, "sync_arm_command_to_measured", None)
+            if callable(sync_to_measured):
+                sync_to_measured()
+            return True
 
-    duration = max(float(duration), 0.1)
-    frequency = max(float(frequency), 1.0)
-    n_steps = max(int(duration * frequency), 1)
-    dt = duration / n_steps
-    logger_mp.info(
-        "[teleop arm shutdown] smooth go-home: lowering arms to home over %.2fs at %.0f Hz "
-        "(waist_start=%.3f rad).",
-        duration, frequency, start_waist,
-    )
-    for i in range(1, n_steps + 1):
-        # cosine ease-in-out from 0 -> 1
-        s = 0.5 - 0.5 * np.cos(np.pi * i / n_steps)
-        q = start_q + (target_q - start_q) * s
-        arm_ctrl.ctrl_dual_arm(q, tauff)
-        if has_waist and abs(start_waist) > 1e-4:
-            waist_rel = start_waist * (1.0 - s)
+        # H1_2 waist: ramp back to home over the same window if the arm is already turned.
+        has_waist = hasattr(arm_ctrl, "ctrl_waist_yaw") and hasattr(arm_ctrl, "get_waist_yaw_relative_position")
+        start_waist = 0.0
+        if has_waist:
             try:
-                arm_ctrl.ctrl_waist_yaw(waist_rel, limit=abs(start_waist) + 1e-3, velocity_limit=waist_velocity)
-            except Exception as exc:
-                logger_mp.debug("[teleop arm shutdown] waist ramp step failed: %s", exc)
+                start_waist = float(arm_ctrl.get_waist_yaw_relative_position())
+            except Exception:
                 has_waist = False
-        time.sleep(dt)
-    return True
+        waist_velocity = max(abs(start_waist) * 2.0, 1.0)
+
+        frequency = max(float(frequency), 1.0)
+        n_steps = max(int(duration * frequency), 1)
+        dt = duration / n_steps
+        logger_mp.info(
+            "[teleop arm %s] smooth go-home over %.2fs at %.0f Hz "
+            "(waist_start=%.3f rad).",
+            phase, duration, frequency, start_waist,
+        )
+        for i in range(1, n_steps + 1):
+            # cosine ease-in-out from 0 -> 1
+            s = 0.5 - 0.5 * np.cos(np.pi * i / n_steps)
+            q = start_q + (target_q - start_q) * s
+            arm_ctrl.ctrl_dual_arm(q, tauff)
+            if has_waist and abs(start_waist) > 1e-4:
+                waist_rel = start_waist * (1.0 - s)
+                try:
+                    arm_ctrl.ctrl_waist_yaw(waist_rel, limit=abs(start_waist) + 1e-3, velocity_limit=waist_velocity)
+                except Exception as exc:
+                    logger_mp.debug("[teleop arm shutdown] waist ramp step failed: %s", exc)
+                    has_waist = False
+            time.sleep(dt)
+        return True
+    finally:
+        if prev_velocity_limit is not None:
+            arm_ctrl.arm_velocity_limit = prev_velocity_limit
 
 def _safe_enter_hand_standby_open(hand_ctrl):
     if hand_ctrl is not None and hasattr(hand_ctrl, "enter_standby_open"):
@@ -962,9 +1019,10 @@ if __name__ == '__main__':
     parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
-    parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='H1_2', help='Select arm controller')
-    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco'], default='rh5dg2_dfx', help='Select end effector controller')
+    parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'AI_WORKER'], default='H1_2', help='Select arm controller')
+    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco', 'hx5_d20'], default='rh5dg2_dfx', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
+    parser.add_argument('--image-source', choices=['auto', 'teleimager', 'robotis_dds'], default='auto', help='Camera transport. auto uses ROBOTIS DDS for AI_WORKER and TeleImager otherwise.')
     parser.add_argument('--viewer-host-ip', type=str, default=None, help='Host IP advertised to the XR browser for the HTTPS/WSS viewer. If omitted, infer it from the route to --img-server-ip.')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     parser.add_argument('--camera', '--viewer-camera', dest='camera', type=str, choices=['head', 'left_wrist', 'right_wrist', 'both', 'both_wrist', 'head_and_wrist', 'head_wrist', 'all'], default='head', help='Camera stream shown in the 8012 XR viewer. Use head_and_wrist to show the head view with both wrist cameras below it.')
@@ -974,6 +1032,29 @@ if __name__ == '__main__':
     parser.add_argument('--no-left-wrist-camera-vflip', dest='left_wrist_camera_vflip', action='store_false', help='Disable vertical flip correction for the left wrist camera.')
     parser.add_argument('--right-wrist-camera-vflip', action='store_true', help='Enable vertical flip correction for the right wrist camera.')
     parser.add_argument('--hand-control-hz', type=float, default=50.0, help='RH5DG2 hand retarget/publish loop frequency.')
+    parser.add_argument('--ai-worker-urdf', type=str, default=None, help='Expanded AI Worker SH5 URDF. Defaults to the sibling external_repos/ai_worker checkout.')
+    parser.add_argument('--ai-worker-ros-domain-id', type=int, default=None, help='DDS domain ID used by AI Worker arm/hand trajectory topics (robotis_lab commonly uses 30).')
+    parser.add_argument('--ai-worker-command-duration', type=float, default=0.08, help='AI Worker DDS JointTrajectory point duration in seconds.')
+    parser.add_argument('--ai-worker-arm-scale', type=float, default=1.0, help='Scale Vision Pro wrist translation deltas for AI Worker IK.')
+    parser.add_argument('--ai-worker-ik-mode', choices=['legacy', 'virtual-leader'], default='legacy', help='AI Worker arm IK. legacy preserves the current solver; virtual-leader adds reach-aware SG2 elbow posture and joint-space continuity.')
+    parser.add_argument('--ai-worker-home-on-start', action=argparse.BooleanOptionalAction, default=True, help='Move AI Worker arms smoothly to the model-specific initial pose before teleoperation starts.')
+    parser.add_argument('--ai-worker-home-duration', type=float, default=5.0, help='Seconds used to move AI Worker arms to the initial pose at startup.')
+    parser.add_argument('--enable-lift', action=argparse.BooleanOptionalAction, default=False, help='Track relative XR head height with the AI Worker lift joint.')
+    parser.add_argument('--lift-gain', type=float, default=1.0, help='AI Worker lift motion per meter of relative XR head-height motion.')
+    parser.add_argument('--lift-deadband', type=float, default=0.015, help='Ignore relative XR head-height motion smaller than this many meters.')
+    parser.add_argument('--lift-smoothing-alpha', type=float, default=0.2, help='Lift target low-pass alpha from 0 to 1.')
+    parser.add_argument('--lift-max-step', type=float, default=0.01, help='Maximum lift command change per control frame in meters.')
+    parser.add_argument('--lift-log-rate', type=float, default=0.0, help='Lift debug log rate in Hz. Set 0 to disable periodic logs.')
+    parser.add_argument('--ai-worker-wrist-orientation-mode', choices=['relative', 'absolute'], default='relative', help='AI Worker wrist orientation mapping. relative aligns the Vision Pro and SH5 wrist frames at startup before applying rotation; absolute is an experimental H1_2-frame mapping.')
+    parser.add_argument('--ai-worker-left-wrist-roll-offset-deg', type=float, default=0.0, help='Static HX5 left-hand roll correction in degrees about the hand longitudinal axis.')
+    parser.add_argument('--ai-worker-right-wrist-roll-offset-deg', type=float, default=0.0, help='Static HX5 right-hand roll correction in degrees about the hand longitudinal axis.')
+    parser.add_argument('--hx5-d20-retarget-mode', choices=['dexpilot', 'geometric'], default='dexpilot', help='HX5-D20 hand retargeter. dexpilot jointly optimizes all fingertips; geometric keeps the legacy per-joint mapping.')
+    parser.add_argument('--hx5-d20-smoothing-alpha', type=float, default=1.0, help='HX5-D20 retarget low-pass alpha from 0 to 1; 1.0 matches RH5DG2 DexPilot.')
+    parser.add_argument('--hx5-d20-left-hand-scale', type=float, default=1.0, help='Multiplier on the left HX5 DexPilot YAML scaling factor.')
+    parser.add_argument('--hx5-d20-right-hand-scale', type=float, default=1.0, help='Multiplier on the right HX5 DexPilot YAML scaling factor.')
+    parser.add_argument('--hx5-d20-thumb-yaw-gain', '--hx5-d20-thumb-opposition-gain', dest='hx5_d20_thumb_yaw_gain', type=float, default=1.0, help='Legacy geometric mode only: gain applied to calibrated HX5 thumb joint2 in-palm yaw motion.')
+    parser.add_argument('--hx5-d20-thumb-yaw-max', '--hx5-d20-thumb-opposition-max', dest='hx5_d20_thumb_yaw_max', type=float, default=1.2, help='Legacy geometric mode only: maximum HX5 thumb joint2 yaw command in radians.')
+    parser.add_argument('--hx5-d20-thumb-pitch-max', type=float, default=0.7, help='Legacy geometric mode only: maximum HX5 thumb-root joint1 pitch command in radians.')
     parser.add_argument('--hand-debug-rate', type=float, default=0.0, help='Teleop hand input debug log rate in Hz. Set 0 to disable periodic hand input logs.')
     parser.add_argument('--inspire-dg2-port', type=str, default='/dev/ttyUSB0', help='Shortcut serial port for both Inspire RH5DG2 hands when side-specific ports are omitted.')
     parser.add_argument('--inspire-dg2-left-port', type=str, default=None, help='Inspire RH5DG2 left hand RS485 serial port.')
@@ -1010,6 +1091,7 @@ if __name__ == '__main__':
     parser.add_argument('--headless', action=argparse.BooleanOptionalAction, default=True, help='Enable headless mode and disable Rerun recording visualization by default. Use --no-headless to enable Rerun.')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--disable-arm', action='store_true', help='Disable arm IK/control while keeping XR and hand paths alive.')
+    parser.add_argument('--disable-hand', action='store_true', help='Disable end-effector initialization and command publishing while keeping XR arm control active.')
     parser.add_argument('--disable-body', action=argparse.BooleanOptionalAction, default=True, help='Disable high-level body/loco command publishing.')
     parser.add_argument('--hand-only', action='store_true', help='Run XR input and end-effector hand control only; arm and body control stay off.')
     parser.add_argument('--enable-neck', action=argparse.BooleanOptionalAction, default=True, help='Send Vision Pro head yaw/pitch to the external UDP neck controller.')
@@ -1017,6 +1099,8 @@ if __name__ == '__main__':
     parser.add_argument('--neck-port', type=int, default=9091, help='External neck controller UDP command port.')
     parser.add_argument('--neck-yaw-limit', type=float, default=1.2, help='Absolute relative neck yaw command limit in radians.')
     parser.add_argument('--neck-pitch-limit', type=float, default=0.8, help='Absolute relative neck pitch command limit in radians.')
+    parser.add_argument('--neck-pitch-gain', type=float, default=1.0, help='Gain applied to relative Vision Pro pitch before limiting.')
+    parser.add_argument('--ai-worker-neck-pitch-invert', action=argparse.BooleanOptionalAction, default=True, help='Invert Vision Pro pitch for the AI Worker head joint convention.')
     parser.add_argument('--neck-smoothing-alpha', type=float, default=0.25, help='Neck command low-pass alpha from 0 to 1.')
     parser.add_argument('--neck-max-step', type=float, default=0.08, help='Maximum neck command change per control frame in radians.')
     parser.add_argument('--neck-feedback-port', type=int, default=9093, help='UDP port that receives actual neck yaw,pitch feedback from the pan/tilt process.')
@@ -1107,6 +1191,8 @@ if __name__ == '__main__':
         raise ValueError("--neck-smoothing-alpha must be between 0 and 1.")
     if args.neck_yaw_limit <= 0.0 or args.neck_pitch_limit <= 0.0:
         raise ValueError("--neck-yaw-limit and --neck-pitch-limit must be greater than zero.")
+    if args.neck_pitch_gain < 0.0:
+        raise ValueError("--neck-pitch-gain must be zero or greater.")
     if args.neck_max_step < 0.0:
         raise ValueError("--neck-max-step must be zero or greater.")
     if args.neck_log_rate < 0.0:
@@ -1172,6 +1258,50 @@ if __name__ == '__main__':
         raise ValueError("--record and --screen-record cannot be enabled together.")
     if args.ee == "rh56f1" and args.arm != "H1_2":
         raise ValueError("--ee rh56f1 currently supports the H1_2 arm path only; use --arm H1_2.")
+    if args.ee == "hx5_d20" and args.arm != "AI_WORKER":
+        raise ValueError("--ee hx5_d20 currently supports the AI_WORKER arm path only; use --arm AI_WORKER.")
+    if args.arm == "AI_WORKER" and args.ee != "hx5_d20" and not args.disable_hand:
+        raise ValueError("--arm AI_WORKER currently requires --ee hx5_d20.")
+    if args.arm == "AI_WORKER" and args.input_mode != "hand":
+        raise ValueError("--arm AI_WORKER currently supports Apple Vision Pro hand tracking only; use --input-mode hand.")
+    if args.arm == "AI_WORKER" and not args.disable_body:
+        raise ValueError("AI Worker base teleoperation is not implemented; keep --disable-body enabled.")
+    if args.ai_worker_command_duration <= 0.0:
+        raise ValueError("--ai-worker-command-duration must be greater than zero.")
+    if args.ai_worker_arm_scale <= 0.0:
+        raise ValueError("--ai-worker-arm-scale must be greater than zero.")
+    if args.ai_worker_home_duration <= 0.0:
+        raise ValueError("--ai-worker-home-duration must be greater than zero.")
+    if args.enable_lift and args.arm != "AI_WORKER":
+        raise ValueError("--enable-lift currently supports --arm AI_WORKER only.")
+    if args.lift_gain < 0.0:
+        raise ValueError("--lift-gain must be zero or greater.")
+    if args.lift_deadband < 0.0 or args.lift_max_step < 0.0 or args.lift_log_rate < 0.0:
+        raise ValueError("--lift-deadband, --lift-max-step, and --lift-log-rate must be zero or greater.")
+    if not 0.0 <= args.lift_smoothing_alpha <= 1.0:
+        raise ValueError("--lift-smoothing-alpha must be between 0 and 1.")
+    if not 0.0 <= args.hx5_d20_smoothing_alpha <= 1.0:
+        raise ValueError("--hx5-d20-smoothing-alpha must be between 0 and 1.")
+    if args.hx5_d20_left_hand_scale <= 0.0 or args.hx5_d20_right_hand_scale <= 0.0:
+        raise ValueError("--hx5-d20-left-hand-scale and --hx5-d20-right-hand-scale must be greater than zero.")
+    if args.hx5_d20_thumb_yaw_gain < 0.0:
+        raise ValueError("--hx5-d20-thumb-yaw-gain must be zero or greater.")
+    if not 0.0 <= args.hx5_d20_thumb_yaw_max <= 3.14:
+        raise ValueError("--hx5-d20-thumb-yaw-max must be between 0 and 3.14 radians.")
+    if not 0.0 <= args.hx5_d20_thumb_pitch_max <= 1.57:
+        raise ValueError("--hx5-d20-thumb-pitch-max must be between 0 and 1.57 radians.")
+    if args.ai_worker_ros_domain_id is not None:
+        if args.ai_worker_ros_domain_id < 0:
+            raise ValueError("--ai-worker-ros-domain-id must be zero or greater.")
+        os.environ["ROS_DOMAIN_ID"] = str(args.ai_worker_ros_domain_id)
+    if args.disable_hand:
+        logger_mp.warning(
+            "[teleop hand control] OFF: end-effector initialization and command publishing are disabled."
+        )
+        # Existing end-effector paths are selected exclusively by args.ee.
+        # Clearing it keeps the arm-tracking input active while bypassing all
+        # hand controller setup, updates, recording fields, and shutdown work.
+        args.ee = None
     rh5dg2_safe_baseline = _resolve_rh5dg2_safe_baseline(args.rh5dg2_safe_baseline)
     if args.hand_only:
         args.disable_arm = True
@@ -1254,6 +1384,7 @@ if __name__ == '__main__':
     sim_state_subscriber = None
     neck_ctrl = None
     neck_feedback = None
+    lift_ctrl = None
     rh56f1_tactile_reader = None
     rh5dg2_tactile_udp = None
     rh5dg2_tactile_heat_mappers = {}
@@ -1264,32 +1395,75 @@ if __name__ == '__main__':
 
     try:
         # setup dds communication domains id
-        if args.sim:
-            ChannelFactoryInitialize(1, networkInterface=args.network_interface)
-        else:
-            ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+        if args.arm != "AI_WORKER":
+            from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+            if args.sim:
+                ChannelFactoryInitialize(1, networkInterface=args.network_interface)
+            else:
+                ChannelFactoryInitialize(0, networkInterface=args.network_interface)
         if args.enable_neck:
-            neck_ctrl = VisionProNeckController(
-                host=args.neck_host or args.img_server_ip,
-                port=args.neck_port,
-                yaw_limit=args.neck_yaw_limit,
-                pitch_limit=args.neck_pitch_limit,
-                smoothing_alpha=args.neck_smoothing_alpha,
-                max_step=args.neck_max_step,
-            )
-            logger_mp.info(
-                f"[teleop neck] enabled target={args.neck_host or args.img_server_ip}:{args.neck_port} "
-                f"yaw_limit={args.neck_yaw_limit:.3f} pitch_limit={args.neck_pitch_limit:.3f} "
-                f"alpha={args.neck_smoothing_alpha:.3f} max_step={args.neck_max_step:.3f}"
-            )
-            try:
-                neck_feedback = NeckFeedbackReceiver(args.neck_feedback_port)
-                logger_mp.info(
-                    f"[teleop neck feedback] listening udp=0.0.0.0:{args.neck_feedback_port}"
+            if args.arm == "AI_WORKER":
+                neck_ctrl = AIWorkerNeckController(
+                    yaw_limit=args.neck_yaw_limit,
+                    pitch_limit=args.neck_pitch_limit,
+                    smoothing_alpha=args.neck_smoothing_alpha,
+                    max_step=args.neck_max_step,
+                    command_duration=args.ai_worker_command_duration,
+                    pitch_gain=args.neck_pitch_gain,
+                    pitch_invert=args.ai_worker_neck_pitch_invert,
                 )
-            except OSError as e:
-                neck_feedback = None
-                logger_mp.warning(f"[teleop neck feedback] disabled: {e}")
+                logger_mp.info(
+                    "[teleop neck] AI Worker DDS enabled topic=%s joints=%s",
+                    "/leader/joystick_controller_left/joint_trajectory",
+                    ["head_joint1", "head_joint2"],
+                )
+            else:
+                neck_ctrl = VisionProNeckController(
+                    host=args.neck_host or args.img_server_ip,
+                    port=args.neck_port,
+                    yaw_limit=args.neck_yaw_limit,
+                    pitch_limit=args.neck_pitch_limit,
+                    smoothing_alpha=args.neck_smoothing_alpha,
+                    max_step=args.neck_max_step,
+                )
+                logger_mp.info(
+                    f"[teleop neck] enabled target={args.neck_host or args.img_server_ip}:{args.neck_port} "
+                    f"yaw_limit={args.neck_yaw_limit:.3f} pitch_limit={args.neck_pitch_limit:.3f} "
+                    f"alpha={args.neck_smoothing_alpha:.3f} max_step={args.neck_max_step:.3f}"
+                )
+            if args.arm != "AI_WORKER":
+                try:
+                    neck_feedback = NeckFeedbackReceiver(args.neck_feedback_port)
+                    logger_mp.info(
+                        f"[teleop neck feedback] listening udp=0.0.0.0:{args.neck_feedback_port}"
+                    )
+                except OSError as e:
+                    neck_feedback = None
+                    logger_mp.warning(f"[teleop neck feedback] disabled: {e}")
+
+        if args.enable_lift:
+            from teleop.robot_control.robotis_ai_worker_lift import AIWorkerLiftController
+
+            lift_ctrl = AIWorkerLiftController(
+                gain=args.lift_gain,
+                deadband=args.lift_deadband,
+                smoothing_alpha=args.lift_smoothing_alpha,
+                max_step=args.lift_max_step,
+                command_duration=args.ai_worker_command_duration,
+            )
+            if not lift_ctrl.wait_for_joint_state(timeout=5.0):
+                raise RuntimeError(
+                    "AI Worker did not receive lift_joint on /joint_states within 5 seconds; "
+                    "refusing to move the lift without its measured startup position."
+                )
+            logger_mp.info(
+                "[teleop lift] enabled topic=%s gain=%.3f deadband=%.3fm alpha=%.3f max_step=%.3fm",
+                lift_ctrl.TOPIC,
+                args.lift_gain,
+                args.lift_deadband,
+                args.lift_smoothing_alpha,
+                args.lift_max_step,
+            )
 
         if args.rh5dg2_tactile_udp_port > 0:
             try:
@@ -1359,7 +1533,17 @@ if __name__ == '__main__':
             listen_keyboard_thread.start()
 
         # image client
-        img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        image_source = "robotis_dds" if args.image_source == "auto" and args.arm == "AI_WORKER" else args.image_source
+        if image_source == "auto":
+            image_source = "teleimager"
+        if image_source == "robotis_dds":
+            from teleop.robot_control.robotis_image_client import (
+                AI_WORKER_CAMERA_TOPICS,
+                RobotisDDSImageClient,
+            )
+            img_client = RobotisDDSImageClient(domain_id=args.ai_worker_ros_domain_id)
+        else:
+            img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
         selected_camera_name = "head" if args.camera == "all" else args.camera
         if selected_camera_name == "both":
@@ -1416,7 +1600,14 @@ if __name__ == '__main__':
             f"left_wrist={camera_config['left_wrist_camera']} "
             f"right_wrist={camera_config['right_wrist_camera']}"
         )
-        _log_camera_reachability(args.img_server_ip, camera_config)
+        if image_source == "teleimager":
+            _log_camera_reachability(args.img_server_ip, camera_config)
+        else:
+            logger_mp.info(
+                "[teleop camera server check] source=robotis_dds domain=%s topics=%s",
+                args.ai_worker_ros_domain_id,
+                AI_WORKER_CAMERA_TOPICS,
+            )
         viewer_webrtc, viewer_zmq, viewer_route = _select_viewer_camera_route(
             args.display_mode,
             args.viewer_camera_mode,
@@ -1533,30 +1724,51 @@ if __name__ == '__main__':
             )
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the selected camera image to the XR device.
-        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
-                                     binocular=selected_camera_config['binocular'],
-                                     img_shape=selected_img_shape,
-                                     display_fps=args.viewer_display_fps,
-                                     jpeg_quality=args.viewer_jpeg_quality,
-                                     display_mode=args.display_mode,
-                                     zmq=viewer_zmq,
-                                     webrtc=viewer_webrtc,
-                                     webrtc_url=webrtc_offer_url,
-                                     arm_reference_mode="head_yaw",
-                                     tracking_timeout=args.arm_lost_timeout,
-                                     session_timeout=max(2.0, args.arm_lost_timeout * 4.0),
-                                     )
+        # TeleVuer submodule releases do not all expose the same optional
+        # tuning arguments. Pass the common API plus only options supported by
+        # the installed wrapper, so the pinned v4.0 submodule and newer local
+        # wrappers both work.
+        import inspect
+        tv_wrapper_kwargs = {
+            "use_hand_tracking": args.input_mode == "hand",
+            "binocular": selected_camera_config['binocular'],
+            "img_shape": selected_img_shape,
+            "display_fps": args.viewer_display_fps,
+            "jpeg_quality": args.viewer_jpeg_quality,
+            "display_mode": args.display_mode,
+            "zmq": viewer_zmq,
+            "webrtc": viewer_webrtc,
+            "webrtc_url": webrtc_offer_url,
+            "arm_reference_mode": "head_yaw",
+            "tracking_timeout": args.arm_lost_timeout,
+            "session_timeout": max(2.0, args.arm_lost_timeout * 4.0),
+        }
+        supported_tv_args = set(inspect.signature(TeleVuerWrapper.__init__).parameters) - {"self"}
+        ignored_tv_args = sorted(set(tv_wrapper_kwargs) - supported_tv_args)
+        if ignored_tv_args:
+            logger_mp.warning(
+                "[teleop TeleVuer compatibility] installed wrapper does not support optional args=%s; ignoring them",
+                ignored_tv_args,
+            )
+        tv_wrapper = TeleVuerWrapper(
+            **{key: value for key, value in tv_wrapper_kwargs.items() if key in supported_tv_args}
+        )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
-        if preserve_zero_ready_mode:
+        if args.arm == "AI_WORKER":
+            motion_switcher = None
+            logger_mp.info("[teleop body control] AI Worker uses ROBOTIS DDS trajectory controllers; Unitree MotionSwitcher is skipped.")
+        elif preserve_zero_ready_mode:
             motion_switcher = None
             logger_mp.warning(
                 "[teleop body control] OFF: skip MotionSwitcher.Enter_Debug_Mode because arm control is disabled."
             )
         elif args.motion:
+            from teleop.utils.motion_switcher import LocoClientWrapper
             if args.input_mode == "controller":
                 loco_wrapper = LocoClientWrapper()
         else:
+            from teleop.utils.motion_switcher import MotionSwitcher
             motion_switcher = MotionSwitcher()
             status, result = motion_switcher.Enter_Debug_Mode()
             logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
@@ -1565,20 +1777,83 @@ if __name__ == '__main__':
         if args.disable_arm:
             logger_mp.warning("[teleop arm control] OFF: arm controller and IK are not initialized.")
         elif args.arm == "G1_29":
+            from teleop.robot_control.robot_arm import G1_29_ArmController
+            from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
             arm_ik = G1_29_ArmIK()
             arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "G1_23":
+            from teleop.robot_control.robot_arm import G1_23_ArmController
+            from teleop.robot_control.robot_arm_ik import G1_23_ArmIK
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "H1_2":
+            from teleop.robot_control.robot_arm import H1_2_ArmController
+            from teleop.robot_control.robot_arm_ik import H1_2_ArmIK
             arm_ik = H1_2_ArmIK()
             arm_ctrl = H1_2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "H1":
+            from teleop.robot_control.robot_arm import H1_ArmController
+            from teleop.robot_control.robot_arm_ik import H1_ArmIK
             arm_ik = H1_ArmIK()
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
         elif args.arm == "H2":
+            from teleop.robot_control.robot_arm import H2_ArmController
+            from teleop.robot_control.robot_arm_ik import H2_ArmIK
             arm_ik = H2_ArmIK()
             arm_ctrl = H2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+        elif args.arm == "AI_WORKER":
+            from teleop.robot_control.robotis_ai_worker import (
+                AIWorkerArmController,
+                AIWorkerArmIK,
+                AIWorkerVirtualLeaderIK,
+            )
+            arm_ik_class = (
+                AIWorkerVirtualLeaderIK
+                if args.ai_worker_ik_mode == "virtual-leader"
+                else AIWorkerArmIK
+            )
+            arm_ik = arm_ik_class(
+                urdf_path=args.ai_worker_urdf,
+                translation_scale=args.ai_worker_arm_scale,
+                wrist_orientation_mode=args.ai_worker_wrist_orientation_mode,
+                left_wrist_roll_offset_deg=args.ai_worker_left_wrist_roll_offset_deg,
+                right_wrist_roll_offset_deg=args.ai_worker_right_wrist_roll_offset_deg,
+            )
+            logger_mp.info(
+                "[teleop arm IK] AI Worker mode=%s solver=%s",
+                args.ai_worker_ik_mode,
+                arm_ik_class.__name__,
+            )
+            arm_ctrl = AIWorkerArmController(
+                command_duration=args.ai_worker_command_duration,
+                home_q=arm_ik.home_q,
+                ready_q=arm_ik.ready_q,
+            )
+            if not arm_ctrl.wait_for_joint_state(timeout=5.0):
+                raise RuntimeError(
+                    "AI Worker did not receive all 14 arm joints on /joint_states within 5 seconds; "
+                    "refusing to anchor IK from guessed home positions. Check the DDS domain and AI Worker bringup."
+                )
+            logger_mp.info(
+                "[teleop arm home] model=%s home_q=%s ready_q=%s home_on_start=%s duration=%.2fs",
+                "SG2" if "ffw_sg2" in str(arm_ik.urdf_path).lower() else "SH5",
+                np.round(arm_ctrl.home_q, 4).tolist(),
+                np.round(arm_ctrl.ready_q, 4).tolist(),
+                args.ai_worker_home_on_start,
+                args.ai_worker_home_duration,
+            )
+            if args.ai_worker_home_on_start:
+                if not _smooth_arm_go_home(
+                    arm_ctrl,
+                    duration=args.ai_worker_home_duration,
+                    velocity_cap=args.arm_shutdown_velocity,
+                    phase="startup",
+                    target_q=arm_ctrl.ready_q,
+                ):
+                    logger_mp.warning(
+                        "[teleop arm startup] smooth ready move was not sent; "
+                        "holding the measured pose without a direct catch-up command."
+                    )
 
         # end-effector
         if args.ee == "dex3":
@@ -1740,6 +2015,29 @@ if __name__ == '__main__':
                     args.rh56f1_tactile_right_port,
                     args.rh56f1_tactile_hz,
                 )
+        elif args.ee == "hx5_d20":
+            from teleop.robot_control.robot_hand_hx5_d20 import HX5D20Controller, HX5_D20_NUM_JOINTS
+            left_hand_pos_array = Array('d', 75, lock=True)
+            right_hand_pos_array = Array('d', 75, lock=True)
+            dual_hand_data_lock = Lock()
+            dual_hand_state_array = Array('d', HX5_D20_NUM_JOINTS * 2, lock=False)
+            dual_hand_action_array = Array('d', HX5_D20_NUM_JOINTS * 2, lock=False)
+            hand_ctrl = HX5D20Controller(
+                left_hand_pos_array,
+                right_hand_pos_array,
+                dual_hand_data_lock,
+                dual_hand_state_array,
+                dual_hand_action_array,
+                fps=args.hand_control_hz,
+                smoothing_alpha=args.hx5_d20_smoothing_alpha,
+                command_duration=args.ai_worker_command_duration,
+                thumb_yaw_gain=args.hx5_d20_thumb_yaw_gain,
+                thumb_yaw_max=args.hx5_d20_thumb_yaw_max,
+                thumb_pitch_max=args.hx5_d20_thumb_pitch_max,
+                retarget_mode=args.hx5_d20_retarget_mode,
+                left_hand_scale=args.hx5_d20_left_hand_scale,
+                right_hand_scale=args.hx5_d20_right_hand_scale,
+            )
         else:
             pass
 
@@ -1765,7 +2063,7 @@ if __name__ == '__main__':
                 args.rh56f1_tactile_hz,
             )
 
-        if args.ee in ["dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2", "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco"]:
+        if args.ee in ["dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2", "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco", "hx5_d20"]:
             logger_mp.info(f"[teleop ee] ee={args.ee} hand_controller={hand_ctrl.__class__.__name__}")
         if args.ee in ("rh5dg2_dfx", "rh5dg2_ftp"):
             logger_mp.info(
@@ -1789,6 +2087,21 @@ if __name__ == '__main__':
                 f"rh56f1_retarget_mode={args.rh56f1_retarget_mode} "
                 "scope=hand_landmarks_only arm_wrist_pose_uses_arm_sensitivity=True"
             )
+        if args.ee == "hx5_d20":
+            logger_mp.info(
+                f"[teleop HX5-D20] ros_domain={os.environ.get('ROS_DOMAIN_ID', 'default')} "
+                f"urdf={args.ai_worker_urdf or 'external_repos/ai_worker (auto)'} "
+                f"retarget_mode={args.hx5_d20_retarget_mode} "
+                f"hand_scale=({args.hx5_d20_left_hand_scale:.3f},"
+                f"{args.hx5_d20_right_hand_scale:.3f}) "
+                f"wrist_orientation={args.ai_worker_wrist_orientation_mode} "
+                f"wrist_roll_deg=({args.ai_worker_left_wrist_roll_offset_deg:.1f},"
+                f"{args.ai_worker_right_wrist_roll_offset_deg:.1f}) "
+                f"geometric_thumb=(pitch_max={args.hx5_d20_thumb_pitch_max:.2f}rad,"
+                f"yaw_gain={args.hx5_d20_thumb_yaw_gain:.2f},"
+                f"yaw_max={args.hx5_d20_thumb_yaw_max:.2f}rad,calibrated) "
+                f"smoothing_alpha={args.hx5_d20_smoothing_alpha:.3f}"
+            )
 
         # Unified EE handles for Config Loop streaming: point at whichever
         # state/action arrays this --ee selection created (left+right concatenated),
@@ -1801,7 +2114,7 @@ if __name__ == '__main__':
             loop_ee_action_array = dual_gripper_action_array
             loop_ee_lock = dual_gripper_data_lock
         elif args.ee in ("dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2",
-                         "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco"):
+                         "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco", "hx5_d20"):
             loop_ee_state_array = dual_hand_state_array
             loop_ee_action_array = dual_hand_action_array
             loop_ee_lock = dual_hand_data_lock
@@ -1826,7 +2139,9 @@ if __name__ == '__main__':
                     pass
 
         # simulation mode
-        if args.sim:
+        if args.sim and args.arm != "AI_WORKER":
+            from unitree_sdk2py.core.channel import ChannelPublisher
+            from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
             reset_pose_publisher = ChannelPublisher("rt/reset_pose/cmd", String_)
             reset_pose_publisher.Init()
             from teleop.utils.sim_state_topic import start_sim_state_subscribe
@@ -2033,6 +2348,8 @@ if __name__ == '__main__':
         loop_count = 0
         neck_log_last_ts = 0.0
         neck_log_interval = 1.0 / args.neck_log_rate if args.neck_log_rate > 0 else None
+        lift_log_last_ts = 0.0
+        lift_log_interval = 1.0 / args.lift_log_rate if args.lift_log_rate > 0 else None
         while not STOP:
             loop_count += 1
             start_time = time.time()
@@ -2150,7 +2467,7 @@ if __name__ == '__main__':
                         f"[teleop record] STOP requested data_json={recorder.json_path} "
                         f"queued_frames={recorder.item_id + 1}"
                     )
-                    if args.sim:
+                    if args.sim and args.arm != "AI_WORKER":
                         publish_reset_category(1, reset_pose_publisher)
             elif args.screen_record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
@@ -2208,6 +2525,10 @@ if __name__ == '__main__':
                 and getattr(tele_data, "right_arm_is_valid", True)
             )
             raw_arm_tracking_ready = arm_tracking_ready
+            lift_tracking_ready = bool(
+                getattr(tele_data, "tracking_active", True)
+                and getattr(tele_data, "head_pose_is_valid", True)
+            )
             now = time.time()
             if args.arm_standby_on_tracking_loss and not args.disable_arm and arm_ctrl is not None:
                 if raw_arm_tracking_ready:
@@ -2221,6 +2542,8 @@ if __name__ == '__main__':
                             arm_last_good_left_pose = None
                             arm_last_good_right_pose = None
                             arm_sensitivity_state.clear()
+                            if arm_ik is not None and hasattr(arm_ik, "reset_anchor"):
+                                arm_ik.reset_anchor()
                             tracking_start_time = now
                             arm_standby_logged = False
                             arm_ctrl.speed_gradual_max()
@@ -2246,6 +2569,23 @@ if __name__ == '__main__':
                             getattr(tele_data, "right_arm_is_valid", None),
                         )
                 arm_tracking_ready = raw_arm_tracking_ready and arm_fsm == "ACTIVE"
+            if lift_ctrl is not None and lift_tracking_ready:
+                try:
+                    lift_command, lift_target, head_z, lift_delta_z = lift_ctrl.update(
+                        tele_data.head_pose
+                    )
+                    if lift_log_interval is not None and now - lift_log_last_ts >= lift_log_interval:
+                        lift_log_last_ts = now
+                        logger_mp.info(
+                            "[teleop lift] head_z=%.4f delta_z=%.4f target=%.4f command=%.4f",
+                            head_z,
+                            lift_delta_z,
+                            lift_target,
+                            lift_command,
+                        )
+                except Exception as e:
+                    if loop_count % 30 == 0:
+                        logger_mp.warning("[teleop lift] command skipped: %s", e)
             latest_tactiles = None
             if rh5dg2_tactile_udp is not None:
                 latest_tactiles = rh5dg2_tactile_udp.read_latest()
@@ -2302,7 +2642,7 @@ if __name__ == '__main__':
                             f"waist_actual={None if waist_actual is None else round(waist_actual, 4)} "
                             f"waist_error={None if waist_error is None else round(waist_error, 4)}"
                         )
-                except (ValueError, OSError) as e:
+                except Exception as e:
                     if loop_count % 30 == 0:
                         logger_mp.warning(f"[teleop neck] command skipped: {e}")
 
@@ -2409,7 +2749,7 @@ if __name__ == '__main__':
             left_hand_squeezeValue = tele_data.left_hand_squeezeValue
             right_hand_squeezeValue = tele_data.right_hand_squeezeValue
 
-            if args.ee in ("dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2", "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco") and args.input_mode == "hand":
+            if args.ee in ("dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2", "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco", "hx5_d20") and args.input_mode == "hand":
                 hand_input_count += 1
                 now = time.time()
                 should_hand_debug = hand_debug_interval is not None and now - hand_debug_last_ts >= hand_debug_interval
@@ -2508,7 +2848,11 @@ if __name__ == '__main__':
                     )
             elif arm_fsm == "STANDBY":
                 if args.arm_standby_action == "ready":
-                    sol_q = _make_arm_ready_q(current_lr_arm_q)
+                    controller_home = getattr(arm_ctrl, "home_q", None)
+                    if controller_home is not None and np.asarray(controller_home).size == np.asarray(current_lr_arm_q).size:
+                        sol_q = np.asarray(controller_home, dtype=np.float64).copy()
+                    else:
+                        sol_q = _make_arm_ready_q(current_lr_arm_q)
                 else:
                     sol_q = np.asarray(current_lr_arm_q, dtype=np.float64).copy()
                 sol_tauff = np.zeros_like(sol_q)
@@ -2595,7 +2939,7 @@ if __name__ == '__main__':
                     arm_write_ok = arm_ctrl.get_last_write_ok() if hasattr(arm_ctrl, "get_last_write_ok") else None
                     logger_mp.debug(
                         f"[teleop arm publish] controller={arm_ctrl.__class__.__name__} "
-                        f"sim={args.sim} write_ok={arm_write_ok} topic=rt/lowcmd domain={1 if args.sim else 0} "
+                        f"sim={args.sim} write_ok={arm_write_ok} topic={getattr(arm_ctrl, 'command_topic_description', 'rt/lowcmd')} "
                         f"target={_fmt_vec_debug(sol_q)} tauff={_fmt_vec_debug(sol_tauff)}"
                     )
 
@@ -2679,6 +3023,14 @@ if __name__ == '__main__':
                         right_ee_state = dual_hand_state_array[-rh56f1_count:]
                         left_hand_action = dual_hand_action_array[:rh56f1_count]
                         right_hand_action = dual_hand_action_array[-rh56f1_count:]
+                        current_body_state = []
+                        current_body_action = []
+                elif args.ee == "hx5_d20" and args.input_mode == "hand":
+                    with dual_hand_data_lock:
+                        left_ee_state = dual_hand_state_array[:20]
+                        right_ee_state = dual_hand_state_array[-20:]
+                        left_hand_action = dual_hand_action_array[:20]
+                        right_hand_action = dual_hand_action_array[-20:]
                         current_body_state = []
                         current_body_action = []
                 else:
@@ -2808,7 +3160,7 @@ if __name__ == '__main__':
                     audios = None
                     if audio_udp_receiver is not None:
                         audios = audio_udp_receiver.read_latest()
-                    if args.sim:
+                    if args.sim and sim_state_subscriber is not None:
                         sim_state = sim_state_subscriber.read_data()            
                         recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, tactiles=tactiles, audios=audios, sim_state=sim_state)
                     else:
@@ -2854,6 +3206,12 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close neck feedback receiver: {e}")
 
         try:
+            if lift_ctrl is not None:
+                lift_ctrl.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close lift controller: {e}")
+
+        try:
             if rh56f1_tactile_reader is not None:
                 rh56f1_tactile_reader.stop()
         except Exception as e:
@@ -2887,16 +3245,32 @@ if __name__ == '__main__':
             if args.skip_arm_go_home_on_exit:
                 logger_mp.warning("[teleop arm shutdown] skip ctrl_dual_arm_go_home because --skip-arm-go-home-on-exit is set.")
             elif arm_ctrl is not None:
-                if args.arm_shutdown_duration > 0.0:
-                    _smooth_arm_go_home(
+                smooth_requested = args.arm_shutdown_duration > 0.0
+                smoothed = False
+                if smooth_requested:
+                    smoothed = _smooth_arm_go_home(
                         arm_ctrl,
                         duration=args.arm_shutdown_duration,
                         velocity_cap=args.arm_shutdown_velocity,
                     )
-                # Final settle: confirm home and, in motion mode, ramp down the arm_sdk weight.
-                arm_ctrl.ctrl_dual_arm_go_home()
+                if args.arm == "AI_WORKER" and smooth_requested:
+                    if not smoothed:
+                        logger_mp.warning(
+                            "[teleop arm shutdown] AI Worker smooth home was not sent; "
+                            "holding without a direct catch-up command."
+                        )
+                else:
+                    # Unitree controllers use this finalizer to confirm home and,
+                    # in motion mode, ramp down the arm_sdk weight.
+                    arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+
+        try:
+            if arm_ctrl is not None and hasattr(arm_ctrl, "close"):
+                arm_ctrl.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close arm controller: {e}")
         
         try:
             if args.ipc:

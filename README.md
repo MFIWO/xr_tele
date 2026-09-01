@@ -215,8 +215,8 @@ build  cert.pem  key.pem  LICENSE  pyproject.toml  README.md  rootCA.key  rootCA
 |     `--frequency`     |            Set the FPS for recording and control             |                  Any reasonable float value                  |       30.0        |
 |    `--input-mode`     |       Choose XR input mode (how to control the robot)        |   `hand` (hand tracking)`controller` (controller tracking)   |      `hand`       |
 |   `--display-mode`    |  Choose XR display mode (how to view the robot perspective)  | `immersive` (immersive)`ego` (pass-through + small first-person window)`pass-through` (pass-through only) |    `immersive`    |
-|        `--arm`        |      Select the robot arm type (see 0. 📖 Introduction)       |                 `G1_29` `G1_23` `H1_2` `H1`                  |      `G1_29`      |
-|        `--ee`         | Select the end-effector type of the arm (see 0. 📖 Introduction) | `dex1` `dex3` `inspire_ftp` `inspire_dfx` `rh5dg2_ftp` `rh5dg2_dfx` `rh56f1` `brainco` |       None        |
+|        `--arm`        |      Select the robot arm type (see 0. 📖 Introduction)       |          `G1_29` `G1_23` `H1_2` `H1` `H2` `AI_WORKER`       |      `H1_2`       |
+|        `--ee`         | Select the end-effector type of the arm (see 0. 📖 Introduction) | `dex1` `dex3` `inspire_ftp` `inspire_dfx` `inspire_dg2` `rh5dg2_ftp` `rh5dg2_dfx` `rh56f1` `brainco` `hx5_d20` | `rh5dg2_dfx` |
 |   `--img-server-ip`   | Set the image server IP address for receiving image streams and configuring WebRTC signaling |                        `IPv4` address                        | `192.168.123.164` |
 | `--network-interface` |    Set the network interface for CycloneDDS communication    |                    Network Interface Name                    |      `None`       |
 
@@ -283,6 +283,62 @@ For H1_2 (H12) + RH56F1 hand tracking validation:
 ```bash
 (tv) unitree@Host:~/xr_teleoperate/teleop/$ python teleop_hand_and_arm.py --arm H1_2 --ee rh56f1 --sim --no-record
 ```
+
+For ROBOTIS AI Worker (FFW SH5) + HX5-D20-MLT with Apple Vision Pro, first
+start the SH5 bridge in the sibling `cyclo_lab` checkout (the repository was
+formerly named `robotis_lab`):
+
+```bash
+(isaaclab) $ cd ../cyclo_lab
+(isaaclab) $ python scripts/sim2real/bringup/sh5_dds_bringup.py --domain_id 30
+```
+
+Then start xr_tele from its teleop directory with the same DDS domain. Install
+the sibling Cyclo Lab `robotis_dds_python` package into the xr_tele environment;
+ROS 2 and `rclpy` are not required for this path:
+
+```bash
+(tv) $ cd ../xr_tele/teleop
+(tv) $ export CYCLONEDDS_HOME="$PWD/../../cyclo_lab/.local/cyclonedds"
+(tv) $ export LD_LIBRARY_PATH="$CYCLONEDDS_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+(tv) $ python -m pip install -e ../../cyclo_lab/third_party/robotis_dds_python
+(tv) $ python teleop_hand_and_arm.py --arm AI_WORKER --ee hx5_d20 --sim \
+  --ai-worker-ros-domain-id 30 --no-record --no-enable-neck
+```
+
+HX5-D20 uses the same `dex_retargeting.RetargetingConfig` and DexPilot optimizer
+path as RH5DG2. Its YAML contains the standard 15 thumb/fingertip/wrist vector
+pairs, and the optimizer output is reordered into the HX5 DDS 1..20 joint
+order. The old thumb-yaw gain flags affect only
+`--hx5-d20-retarget-mode geometric`. If one side still needs a personal hand
+proportion correction, tune it independently, for example:
+
+```bash
+(tv) $ python teleop_hand_and_arm.py --arm AI_WORKER --ee hx5_d20 --sim \
+  --ai-worker-ros-domain-id 30 --hx5-d20-retarget-mode dexpilot \
+  --hx5-d20-left-hand-scale 1.0 --hx5-d20-right-hand-scale 1.08 \
+  --no-record --no-enable-neck
+```
+
+Increase a side's hand scale when the simulated fingertips close too early;
+decrease it when they cannot meet. Each value is a multiplier on the YAML
+DexPilot scaling factor (`1.6`). The optimizer reads the standalone HX5 URDF
+from the sibling `ai_worker` checkout. As with RH5DG2, initialize and install
+the retargeting package before going onto the offline AVP network:
+
+```bash
+$ cd external_repos/xr_tele
+$ git submodule update --init teleop/robot_control/dex-retargeting
+$ cd teleop
+(tv) $ python -m pip install -e robot_control/dex-retargeting
+```
+
+The AI Worker path loads the expanded SH5 URDF from the sibling
+`external_repos/ai_worker` checkout. Use `--ai-worker-urdf /path/to/ffw_sh5_follower.urdf`
+when the repositories are laid out differently. Arm and hand commands use the
+standard ROBOTIS DDS left/right `JointTrajectory` topics; `/joint_states` supplies
+feedback. The first valid Vision Pro wrist pair becomes the relative arm-motion
+anchor, preventing a jump caused by different XR and simulator world frames.
 
 The RH56F1 SIM interface uses `rt/rh56f1/cmd` and `rt/rh56f1/state` with
 `MotorCmds_`/`MotorStates_`. Each message contains 24 joints in
