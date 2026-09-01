@@ -887,40 +887,93 @@ def _smooth_arm_go_home(
     prev_velocity_limit = getattr(arm_ctrl, "arm_velocity_limit", None)
     if prev_velocity_limit is not None and velocity_cap > 0.0:
         arm_ctrl.arm_velocity_limit = min(prev_velocity_limit, float(velocity_cap))
+    try:
+        duration = max(float(duration), 0.1)
+        smooth_to = getattr(arm_ctrl, "ctrl_dual_arm_smooth_to", None)
+        if callable(smooth_to):
+            actual_duration = float(smooth_to(target_q, duration=duration, num_points=100))
+            logger_mp.info(
+                "[teleop arm %s] AI Worker quintic trajectory over %.2fs "
+                "(100 points, zero endpoint velocity/acceleration).",
+                phase,
+                actual_duration,
+            )
+            time.sleep(actual_duration)
 
-    # H1_2 waist: ramp back to home over the same window if the arm is already turned.
-    has_waist = hasattr(arm_ctrl, "ctrl_waist_yaw") and hasattr(arm_ctrl, "get_waist_yaw_relative_position")
-    start_waist = 0.0
-    if has_waist:
-        try:
-            start_waist = float(arm_ctrl.get_waist_yaw_relative_position())
-        except Exception:
-            has_waist = False
-    waist_velocity = max(abs(start_waist) * 2.0, 1.0)
+            # Give joint-state feedback a short passive settle window.  Never
+            # replace a residual with a short direct command: that was the
+            # source of the visible endpoint catch-up on the physical robot.
+            position_error = float("inf")
+            max_speed = float("inf")
+            settle_deadline = time.monotonic() + 1.0
+            while True:
+                measured_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
+                position_error = (
+                    float(np.max(np.abs(measured_q - target_q)))
+                    if measured_q.size == target_q.size and np.isfinite(measured_q).all()
+                    else float("inf")
+                )
+                try:
+                    measured_dq = np.asarray(arm_ctrl.get_current_dual_arm_dq(), dtype=np.float64).reshape(-1)
+                    max_speed = (
+                        float(np.max(np.abs(measured_dq)))
+                        if measured_dq.size == target_q.size and np.isfinite(measured_dq).all()
+                        else float("inf")
+                    )
+                except Exception:
+                    max_speed = 0.0
+                if position_error <= 0.05 and max_speed <= 0.10:
+                    break
+                if time.monotonic() >= settle_deadline:
+                    logger_mp.warning(
+                        "[teleop arm %s] quintic trajectory ended with measured residual "
+                        "position=%.4f rad speed=%.4f rad/s; holding without a direct catch-up command.",
+                        phase,
+                        position_error,
+                        max_speed,
+                    )
+                    break
+                time.sleep(0.02)
+            sync_to_measured = getattr(arm_ctrl, "sync_arm_command_to_measured", None)
+            if callable(sync_to_measured):
+                sync_to_measured()
+            return True
 
-    duration = max(float(duration), 0.1)
-    frequency = max(float(frequency), 1.0)
-    n_steps = max(int(duration * frequency), 1)
-    dt = duration / n_steps
-    logger_mp.info(
-        "[teleop arm %s] smooth go-home over %.2fs at %.0f Hz "
-        "(waist_start=%.3f rad).",
-        phase, duration, frequency, start_waist,
-    )
-    for i in range(1, n_steps + 1):
-        # cosine ease-in-out from 0 -> 1
-        s = 0.5 - 0.5 * np.cos(np.pi * i / n_steps)
-        q = start_q + (target_q - start_q) * s
-        arm_ctrl.ctrl_dual_arm(q, tauff)
-        if has_waist and abs(start_waist) > 1e-4:
-            waist_rel = start_waist * (1.0 - s)
+        # H1_2 waist: ramp back to home over the same window if the arm is already turned.
+        has_waist = hasattr(arm_ctrl, "ctrl_waist_yaw") and hasattr(arm_ctrl, "get_waist_yaw_relative_position")
+        start_waist = 0.0
+        if has_waist:
             try:
-                arm_ctrl.ctrl_waist_yaw(waist_rel, limit=abs(start_waist) + 1e-3, velocity_limit=waist_velocity)
-            except Exception as exc:
-                logger_mp.debug("[teleop arm shutdown] waist ramp step failed: %s", exc)
+                start_waist = float(arm_ctrl.get_waist_yaw_relative_position())
+            except Exception:
                 has_waist = False
-        time.sleep(dt)
-    return True
+        waist_velocity = max(abs(start_waist) * 2.0, 1.0)
+
+        frequency = max(float(frequency), 1.0)
+        n_steps = max(int(duration * frequency), 1)
+        dt = duration / n_steps
+        logger_mp.info(
+            "[teleop arm %s] smooth go-home over %.2fs at %.0f Hz "
+            "(waist_start=%.3f rad).",
+            phase, duration, frequency, start_waist,
+        )
+        for i in range(1, n_steps + 1):
+            # cosine ease-in-out from 0 -> 1
+            s = 0.5 - 0.5 * np.cos(np.pi * i / n_steps)
+            q = start_q + (target_q - start_q) * s
+            arm_ctrl.ctrl_dual_arm(q, tauff)
+            if has_waist and abs(start_waist) > 1e-4:
+                waist_rel = start_waist * (1.0 - s)
+                try:
+                    arm_ctrl.ctrl_waist_yaw(waist_rel, limit=abs(start_waist) + 1e-3, velocity_limit=waist_velocity)
+                except Exception as exc:
+                    logger_mp.debug("[teleop arm shutdown] waist ramp step failed: %s", exc)
+                    has_waist = False
+            time.sleep(dt)
+        return True
+    finally:
+        if prev_velocity_limit is not None:
+            arm_ctrl.arm_velocity_limit = prev_velocity_limit
 
 def _safe_enter_hand_standby_open(hand_ctrl):
     if hand_ctrl is not None and hasattr(hand_ctrl, "enter_standby_open"):
@@ -983,6 +1036,7 @@ if __name__ == '__main__':
     parser.add_argument('--ai-worker-ros-domain-id', type=int, default=None, help='DDS domain ID used by AI Worker arm/hand trajectory topics (robotis_lab commonly uses 30).')
     parser.add_argument('--ai-worker-command-duration', type=float, default=0.08, help='AI Worker DDS JointTrajectory point duration in seconds.')
     parser.add_argument('--ai-worker-arm-scale', type=float, default=1.0, help='Scale Vision Pro wrist translation deltas for AI Worker IK.')
+    parser.add_argument('--ai-worker-ik-mode', choices=['legacy', 'virtual-leader'], default='legacy', help='AI Worker arm IK. legacy preserves the current solver; virtual-leader adds reach-aware SG2 elbow posture and joint-space continuity.')
     parser.add_argument('--ai-worker-home-on-start', action=argparse.BooleanOptionalAction, default=True, help='Move AI Worker arms smoothly to the model-specific initial pose before teleoperation starts.')
     parser.add_argument('--ai-worker-home-duration', type=float, default=5.0, help='Seconds used to move AI Worker arms to the initial pose at startup.')
     parser.add_argument('--enable-lift', action=argparse.BooleanOptionalAction, default=False, help='Track relative XR head height with the AI Worker lift joint.')
@@ -1748,13 +1802,27 @@ if __name__ == '__main__':
             arm_ik = H2_ArmIK()
             arm_ctrl = H2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "AI_WORKER":
-            from teleop.robot_control.robotis_ai_worker import AIWorkerArmController, AIWorkerArmIK
-            arm_ik = AIWorkerArmIK(
+            from teleop.robot_control.robotis_ai_worker import (
+                AIWorkerArmController,
+                AIWorkerArmIK,
+                AIWorkerVirtualLeaderIK,
+            )
+            arm_ik_class = (
+                AIWorkerVirtualLeaderIK
+                if args.ai_worker_ik_mode == "virtual-leader"
+                else AIWorkerArmIK
+            )
+            arm_ik = arm_ik_class(
                 urdf_path=args.ai_worker_urdf,
                 translation_scale=args.ai_worker_arm_scale,
                 wrist_orientation_mode=args.ai_worker_wrist_orientation_mode,
                 left_wrist_roll_offset_deg=args.ai_worker_left_wrist_roll_offset_deg,
                 right_wrist_roll_offset_deg=args.ai_worker_right_wrist_roll_offset_deg,
+            )
+            logger_mp.info(
+                "[teleop arm IK] AI Worker mode=%s solver=%s",
+                args.ai_worker_ik_mode,
+                arm_ik_class.__name__,
             )
             arm_ctrl = AIWorkerArmController(
                 command_duration=args.ai_worker_command_duration,
@@ -1775,14 +1843,17 @@ if __name__ == '__main__':
                 args.ai_worker_home_duration,
             )
             if args.ai_worker_home_on_start:
-                if _smooth_arm_go_home(
+                if not _smooth_arm_go_home(
                     arm_ctrl,
                     duration=args.ai_worker_home_duration,
                     velocity_cap=args.arm_shutdown_velocity,
                     phase="startup",
                     target_q=arm_ctrl.ready_q,
                 ):
-                    arm_ctrl.ctrl_dual_arm_go_ready()
+                    logger_mp.warning(
+                        "[teleop arm startup] smooth ready move was not sent; "
+                        "holding the measured pose without a direct catch-up command."
+                    )
 
         # end-effector
         if args.ee == "dex3":
@@ -3174,14 +3245,24 @@ if __name__ == '__main__':
             if args.skip_arm_go_home_on_exit:
                 logger_mp.warning("[teleop arm shutdown] skip ctrl_dual_arm_go_home because --skip-arm-go-home-on-exit is set.")
             elif arm_ctrl is not None:
-                if args.arm_shutdown_duration > 0.0:
-                    _smooth_arm_go_home(
+                smooth_requested = args.arm_shutdown_duration > 0.0
+                smoothed = False
+                if smooth_requested:
+                    smoothed = _smooth_arm_go_home(
                         arm_ctrl,
                         duration=args.arm_shutdown_duration,
                         velocity_cap=args.arm_shutdown_velocity,
                     )
-                # Final settle: confirm home and, in motion mode, ramp down the arm_sdk weight.
-                arm_ctrl.ctrl_dual_arm_go_home()
+                if args.arm == "AI_WORKER" and smooth_requested:
+                    if not smoothed:
+                        logger_mp.warning(
+                            "[teleop arm shutdown] AI Worker smooth home was not sent; "
+                            "holding without a direct catch-up command."
+                        )
+                else:
+                    # Unitree controllers use this finalizer to confirm home and,
+                    # in motion mode, ramp down the arm_sdk weight.
+                    arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
 

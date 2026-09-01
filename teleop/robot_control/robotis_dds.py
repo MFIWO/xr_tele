@@ -79,6 +79,73 @@ class RobotisJointTrajectoryTransport:
         )
         self.writers[key].write(message)
 
+    def publish_trajectory(
+        self,
+        key,
+        joint_names,
+        positions,
+        times_from_start,
+        velocities=None,
+        accelerations=None,
+    ):
+        """Publish one complete, time-parameterized joint trajectory."""
+        joint_names = list(joint_names)
+        positions = list(positions)
+        times_from_start = list(times_from_start)
+        if not positions or len(positions) != len(times_from_start):
+            raise ValueError("positions and times_from_start must have the same non-zero length.")
+
+        velocities = [None] * len(positions) if velocities is None else list(velocities)
+        accelerations = [None] * len(positions) if accelerations is None else list(accelerations)
+        if len(velocities) != len(positions) or len(accelerations) != len(positions):
+            raise ValueError("velocity and acceleration rows must match the trajectory length.")
+
+        points = []
+        previous_time = -1.0
+        for position, velocity, acceleration, point_time in zip(
+            positions,
+            velocities,
+            accelerations,
+            times_from_start,
+        ):
+            if len(position) != len(joint_names):
+                raise ValueError("each trajectory position row must match joint_names.")
+            if velocity is not None and len(velocity) != len(joint_names):
+                raise ValueError("each trajectory velocity row must match joint_names.")
+            if acceleration is not None and len(acceleration) != len(joint_names):
+                raise ValueError("each trajectory acceleration row must match joint_names.")
+
+            point_time = float(point_time)
+            if point_time < 0.0 or point_time <= previous_time:
+                raise ValueError("trajectory times must be non-negative and strictly increasing.")
+            previous_time = point_time
+            total_nanoseconds = int(round(point_time * 1e9))
+            seconds, nanoseconds = divmod(total_nanoseconds, 1_000_000_000)
+            points.append(
+                self.JointTrajectoryPoint(
+                    positions=[float(value) for value in position],
+                    velocities=[] if velocity is None else [float(value) for value in velocity],
+                    accelerations=[] if acceleration is None else [float(value) for value in acceleration],
+                    effort=[],
+                    time_from_start=self.Duration(sec=seconds, nanosec=nanoseconds),
+                )
+            )
+
+        message = self.JointTrajectory(
+            header=self.Header(
+                # A zero ROS timestamp means "start immediately".  Do not put
+                # the publisher's wall clock here: xr_tele commonly runs on a
+                # different computer from ros2_control, and even modest clock
+                # skew makes the controller reject every point as being in the
+                # past.
+                stamp=self.Time(sec=0, nanosec=0),
+                frame_id="",
+            ),
+            joint_names=joint_names,
+            points=points,
+        )
+        self.writers[key].write(message)
+
     def close(self):
         if not self.running:
             return

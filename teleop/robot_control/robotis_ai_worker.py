@@ -292,6 +292,180 @@ class AIWorkerArmIK:
         return q, np.zeros(14, dtype=np.float64)
 
 
+class AIWorkerVirtualLeaderIK(AIWorkerArmIK):
+    """Reach-aware SG2 IK that behaves like a continuous virtual 7-axis leader.
+
+    The legacy solver intentionally remains unchanged.  This opt-in solver uses
+    the previous virtual joint command as its seed and selects the elbow bend
+    from hand reach.  The posture correction is applied through a
+    damped task-space projector so it stays subordinate to the wrist EE target.
+    """
+
+    _ELBOW_INDICES = (3, 10)
+    _SHOULDER_JOINT_NAMES = ("arm_l_joint1", "arm_r_joint1")
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("max_iterations", 32)
+        super().__init__(*args, **kwargs)
+        if "ffw_sg2" not in str(self.urdf_path).lower():
+            raise ValueError(
+                "AI Worker virtual-leader IK currently supports the SG2 follower URDF only."
+            )
+
+        self._virtual_damping = 1e-3
+        self._virtual_posture_gain = 0.10
+        self._virtual_max_step = 0.12
+        self._shoulder_joint_ids = tuple(
+            self.model.getJointId(name) for name in self._SHOULDER_JOINT_NAMES
+        )
+
+        self._forward(self.ready_q)
+        self._shoulder_roots = tuple(
+            self.data.oMi[joint_id].translation.copy()
+            for joint_id in self._shoulder_joint_ids
+        )
+        ready_frames = self._forward(self.ready_q)
+        straight_frames = self._forward(self.home_q)
+        self._ready_reach = np.array(
+            [
+                np.linalg.norm(frame.translation - root)
+                for frame, root in zip(ready_frames, self._shoulder_roots)
+            ],
+            dtype=np.float64,
+        )
+        self._straight_reach = np.array(
+            [
+                np.linalg.norm(frame.translation - root)
+                for frame, root in zip(straight_frames, self._shoulder_roots)
+            ],
+            dtype=np.float64,
+        )
+        if np.any(self._straight_reach <= self._ready_reach + 1e-6):
+            raise RuntimeError(
+                "SG2 virtual-leader IK requires the home pose to reach farther than the ready pose."
+            )
+
+    def _elbow_posture_target(self, targets):
+        posture = np.zeros(14, dtype=np.float64)
+        for side, (target, root, elbow_index) in enumerate(
+            zip(targets, self._shoulder_roots, self._ELBOW_INDICES)
+        ):
+            reach = np.linalg.norm(target.translation - root)
+            extension = np.clip(
+                (reach - self._ready_reach[side])
+                / (self._straight_reach[side] - self._ready_reach[side]),
+                0.0,
+                1.0,
+            )
+            extension = extension * extension * (3.0 - 2.0 * extension)
+            elbow_target = (
+                (1.0 - extension) * self.ready_q[elbow_index]
+                + extension * self.home_q[elbow_index]
+            )
+            posture[elbow_index] = elbow_target
+        return posture
+
+    def solve_ik(self, left_wrist, right_wrist, current_lr_arm_q=None, current_lr_arm_dq=None):
+        del current_lr_arm_dq
+        left_input = self._pose(left_wrist)
+        right_input = self._pose(right_wrist)
+        measured_q = (
+            np.asarray(current_lr_arm_q, dtype=np.float64).reshape(-1)
+            if current_lr_arm_q is not None
+            else self._last_q.copy()
+        )
+        if measured_q.size != 14 or not np.all(np.isfinite(measured_q)):
+            measured_q = self._last_q.copy()
+        measured_q = np.clip(measured_q, self.lower, self.upper)
+
+        if self._input_anchor is None:
+            self._input_anchor = (left_input.copy(), right_input.copy())
+            self._robot_anchor = self._forward(measured_q)
+            self._robot_orientation_anchor = tuple(
+                self._corrected_home_rotations[index]
+                if self._has_wrist_roll_correction[index]
+                else self._robot_anchor[index].rotation.copy()
+                for index in range(2)
+            )
+            self._last_q = measured_q.copy()
+
+        targets = (
+            self._target(
+                left_input,
+                self._input_anchor[0],
+                self._robot_anchor[0],
+                self._robot_orientation_anchor[0],
+                self._wrist_mount_rotations[0],
+                self._wrist_roll_corrections[0],
+            ),
+            self._target(
+                right_input,
+                self._input_anchor[1],
+                self._robot_anchor[1],
+                self._robot_orientation_anchor[1],
+                self._wrist_mount_rotations[1],
+                self._wrist_roll_corrections[1],
+            ),
+        )
+        frame_ids = (self.left_frame_id, self.right_frame_id)
+        previous_q = self._last_q.copy()
+        q = previous_q.copy()
+        elbow_target = self._elbow_posture_target(targets)
+
+        try:
+            for _ in range(self.max_iterations):
+                self.pin.forwardKinematics(self.model, self.data, q)
+                self.pin.updateFramePlacements(self.model, self.data)
+                errors = []
+                jacobians = []
+                for frame_id, target in zip(frame_ids, targets):
+                    current = self.data.oMf[frame_id]
+                    errors.append(self.pin.log6(current.inverse() * target).vector)
+                    jacobians.append(
+                        self.pin.computeFrameJacobian(
+                            self.model,
+                            self.data,
+                            q,
+                            frame_id,
+                            self.pin.ReferenceFrame.LOCAL,
+                        )
+                    )
+                error = np.concatenate(errors)
+                jacobian = np.vstack(jacobians)
+                inverse = np.linalg.solve(
+                    jacobian @ jacobian.T + self._virtual_damping * np.eye(12),
+                    np.eye(12),
+                )
+                damped_pseudoinverse = jacobian.T @ inverse
+                task_projector = np.eye(14) - damped_pseudoinverse @ jacobian
+                posture_error = np.zeros(14, dtype=np.float64)
+                for elbow_index in self._ELBOW_INDICES:
+                    posture_error[elbow_index] = elbow_target[elbow_index] - q[elbow_index]
+                dq = (
+                    damped_pseudoinverse @ error
+                    + self._virtual_posture_gain * task_projector @ posture_error
+                )
+                if not np.all(np.isfinite(dq)):
+                    return previous_q, np.zeros(14, dtype=np.float64)
+                max_step = np.max(np.abs(dq))
+                if max_step > self._virtual_max_step:
+                    dq *= self._virtual_max_step / max_step
+                q = np.clip(self.pin.integrate(self.model, q, dq), self.lower, self.upper)
+        except np.linalg.LinAlgError:
+            return previous_q, np.zeros(14, dtype=np.float64)
+
+        q = previous_q + np.clip(
+            q - previous_q,
+            -self._virtual_max_step,
+            self._virtual_max_step,
+        )
+        q = np.clip(q, self.lower, self.upper)
+        if not np.all(np.isfinite(q)):
+            return previous_q, np.zeros(14, dtype=np.float64)
+        self._last_q = q.copy()
+        return q, np.zeros(14, dtype=np.float64)
+
+
 class AIWorkerArmController:
     """Publish AI Worker arm targets using ROBOTIS CycloneDDS messages."""
 
@@ -353,6 +527,19 @@ class AIWorkerArmController:
         """Wait until all 14 measured arm joints have initialized the controller."""
         return self._joint_state_received.wait(timeout=max(0.0, float(timeout)))
 
+    def sync_arm_command_to_measured(self):
+        """Re-anchor the velocity limiter to the latest measured arm pose."""
+        measured = np.asarray(self.get_current_dual_arm_q(), dtype=np.float64).reshape(14)
+        if not np.all(np.isfinite(measured)):
+            raise RuntimeError("Cannot anchor arm commands to invalid joint state.")
+        self._last_command = np.clip(
+            measured,
+            AI_WORKER_ARM_LOWER,
+            AI_WORKER_ARM_UPPER,
+        )
+        self._last_command_time = time.monotonic()
+        return self._last_command.copy()
+
     def _publish_side(self, key, names, positions):
         self.transport.publish(key, names, positions, self.command_duration)
 
@@ -378,6 +565,54 @@ class AIWorkerArmController:
         self._last_command = target
         self._last_command_time = now
         self._last_write_ok = True
+
+    def ctrl_dual_arm_smooth_to(self, q, duration, num_points=100):
+        """Send one zero-velocity quintic trajectory from measured q to target q."""
+        target = np.asarray(q, dtype=np.float64).reshape(14)
+        target = np.clip(target, AI_WORKER_ARM_LOWER, AI_WORKER_ARM_UPPER)
+        start = np.asarray(self.get_current_dual_arm_q(), dtype=np.float64).reshape(14)
+        if not np.all(np.isfinite(start)):
+            raise RuntimeError("Cannot start a smooth arm trajectory from invalid joint state.")
+
+        delta = target - start
+        requested_duration = max(0.1, float(duration))
+        velocity_limit = max(0.01, float(self.arm_velocity_limit))
+        # The peak derivative of 10u^3 - 15u^4 + 6u^5 is 1.875.
+        minimum_duration = 1.875 * float(np.max(np.abs(delta))) / velocity_limit
+        trajectory_duration = max(requested_duration, minimum_duration)
+        num_points = max(2, int(num_points))
+
+        times = np.linspace(0.0, trajectory_duration, num_points, dtype=np.float64)
+        u = times / trajectory_duration
+        position_coeff = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
+        velocity_coeff = (30.0 * u**2 - 60.0 * u**3 + 30.0 * u**4) / trajectory_duration
+        acceleration_coeff = (60.0 * u - 180.0 * u**2 + 120.0 * u**3) / (
+            trajectory_duration * trajectory_duration
+        )
+        positions = start[None, :] + position_coeff[:, None] * delta[None, :]
+        velocities = velocity_coeff[:, None] * delta[None, :]
+        accelerations = acceleration_coeff[:, None] * delta[None, :]
+
+        self.transport.publish_trajectory(
+            "left",
+            AI_WORKER_LEFT_ARM_JOINTS,
+            positions[:, :7],
+            times,
+            velocities[:, :7],
+            accelerations[:, :7],
+        )
+        self.transport.publish_trajectory(
+            "right",
+            AI_WORKER_RIGHT_ARM_JOINTS,
+            positions[:, 7:],
+            times,
+            velocities[:, 7:],
+            accelerations[:, 7:],
+        )
+        self._last_command = target.copy()
+        self._last_command_time = time.monotonic()
+        self._last_write_ok = True
+        return trajectory_duration
 
     def speed_gradual_max(self):
         # Unitree controllers ramp an internal DDS gain here. ROS trajectory
