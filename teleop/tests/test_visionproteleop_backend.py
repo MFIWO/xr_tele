@@ -8,6 +8,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -110,6 +111,37 @@ def make_packet(
         "right_joints": right_joints,
     }
     return packet, raw
+
+
+def convert_with_vuer_wrapper(
+    *,
+    head_openxr: np.ndarray,
+    left_wrist_openxr: np.ndarray,
+    right_wrist_openxr: np.ndarray,
+):
+    """Run raw OpenXR poses through the existing Vuer conversion path."""
+    tvuer = SimpleNamespace(
+        head_pose=head_openxr,
+        left_arm_pose=left_wrist_openxr,
+        right_arm_pose=right_wrist_openxr,
+        left_hand_positions=np.zeros((25, 3), dtype=np.float64),
+        right_hand_positions=np.zeros((25, 3), dtype=np.float64),
+        left_hand_pinch=False,
+        left_hand_pinchValue=0.1,
+        left_hand_squeeze=False,
+        left_hand_squeezeValue=0.0,
+        right_hand_pinch=False,
+        right_hand_pinchValue=0.1,
+        right_hand_squeeze=False,
+        right_hand_squeezeValue=0.0,
+    )
+    wrapper = vuer_conventions.TeleVuerWrapper.__new__(
+        vuer_conventions.TeleVuerWrapper
+    )
+    wrapper.use_hand_tracking = True
+    wrapper.return_hand_rot_data = False
+    wrapper.tvuer = tvuer
+    return wrapper.get_tele_data()
 
 
 class FakeClock:
@@ -395,6 +427,83 @@ class VisionProTeleopBackendTests(unittest.TestCase):
                         actual_delta, np.asarray(expected_delta), atol=1e-12
                     )
 
+    def test_isolated_wrist_rotation_axes_match_existing_vuer_path(self):
+        backend = self.make_backend()
+        identity = np.eye(4)
+        baseline_packet, _ = make_packet(
+            head_openxr=identity,
+            left_wrist_openxr=identity,
+            right_wrist_openxr=identity,
+        )
+        baseline_native = backend._convert_packet(baseline_packet)
+        baseline_vuer = convert_with_vuer_wrapper(
+            head_openxr=identity,
+            left_wrist_openxr=identity,
+            right_wrist_openxr=identity,
+        )
+        angle = 0.25
+        # OpenXR +X/+Y/+Z become robot -Y/+Z/-X respectively.  Comparing
+        # R_moved @ R_neutral.T removes the different fixed left/right wrist
+        # conventions and exposes the world-axis delta consumed by arm IK.
+        rotation_cases = (
+            ("openxr_x_to_robot_minus_y", rotation_x, backend_module._rotation_y, -1.0),
+            ("openxr_y_to_robot_plus_z", backend_module._rotation_y, rotation_z, 1.0),
+            ("openxr_z_to_robot_minus_x", rotation_z, rotation_x, -1.0),
+        )
+        for side in ("left", "right"):
+            inactive_side = "right" if side == "left" else "left"
+            for sign in (-1.0, 1.0):
+                for name, input_rotation, output_rotation, output_sign in rotation_cases:
+                    with self.subTest(side=side, sign=sign, axis=name):
+                        wrists = {"left": identity, "right": identity}
+                        wrists[side] = input_rotation(sign * angle)
+                        packet, _ = make_packet(
+                            head_openxr=identity,
+                            left_wrist_openxr=wrists["left"],
+                            right_wrist_openxr=wrists["right"],
+                        )
+                        native = backend._convert_packet(packet)
+                        vuer = convert_with_vuer_wrapper(
+                            head_openxr=identity,
+                            left_wrist_openxr=wrists["left"],
+                            right_wrist_openxr=wrists["right"],
+                        )
+
+                        for wrist_side in ("left", "right"):
+                            np.testing.assert_allclose(
+                                getattr(native, f"{wrist_side}_wrist_pose"),
+                                getattr(vuer, f"{wrist_side}_wrist_pose"),
+                                atol=1e-12,
+                            )
+
+                        moved_rotation = getattr(native, f"{side}_wrist_pose")[:3, :3]
+                        neutral_rotation = getattr(
+                            baseline_native, f"{side}_wrist_pose"
+                        )[:3, :3]
+                        expected_delta = output_rotation(
+                            output_sign * sign * angle
+                        )[:3, :3]
+                        np.testing.assert_allclose(
+                            moved_rotation @ neutral_rotation.T,
+                            expected_delta,
+                            atol=1e-12,
+                        )
+                        np.testing.assert_allclose(
+                            getattr(native, f"{side}_wrist_pose")[:3, 3],
+                            getattr(baseline_native, f"{side}_wrist_pose")[:3, 3],
+                            atol=1e-12,
+                        )
+                        np.testing.assert_allclose(
+                            getattr(native, f"{inactive_side}_wrist_pose"),
+                            getattr(baseline_native, f"{inactive_side}_wrist_pose"),
+                            atol=1e-12,
+                        )
+                        np.testing.assert_allclose(
+                            getattr(vuer, f"{inactive_side}_wrist_pose"),
+                            getattr(baseline_vuer, f"{inactive_side}_wrist_pose"),
+                            atol=1e-12,
+                        )
+
     def test_head_roll_pitch_yaw_rotation_directions(self):
         backend = self.make_backend()
         identity = np.eye(4)
@@ -483,13 +592,13 @@ class VisionProTeleopBackendTests(unittest.TestCase):
         self.assertFalse(stale.tracking_active)
         self.assertFalse(stale.session_alive)
 
-    def test_enable_latches_until_distinct_valid_packets_finish_settling(self):
+    def test_early_enable_is_consumed_until_distinct_packets_finish_settling(self):
         backend = self.make_backend(settling_time_s=0.2, tracking_timeout_s=0.25)
         packet, _ = make_packet()
         self.streamer.latest = packet
         self.assertEqual(backend.get_tele_data().tracking_state, REANCHOR_REQUIRED)
         self.assertFalse(backend.request_enable())
-        self.assertTrue(backend.get_status()["enable_requested"])
+        self.assertFalse(backend.get_status()["enable_requested"])
 
         # Re-polling the same raw object does not count toward settling.
         self.clock.advance(0.1)
@@ -501,8 +610,26 @@ class VisionProTeleopBackendTests(unittest.TestCase):
         self.clock.advance(0.11)
         self.streamer.latest = copy.deepcopy(packet)
         settled = backend.get_tele_data()
-        self.assertEqual(settled.tracking_state, TRACKING_OK)
-        self.assertTrue(settled.tracking_active)
+        self.assertEqual(settled.tracking_state, REANCHOR_REQUIRED)
+        self.assertFalse(settled.tracking_active)
+        self.assertTrue(backend.request_enable())
+        self.assertTrue(backend.get_tele_data().tracking_active)
+
+    def test_settling_ready_message_is_emitted_once(self):
+        backend = self.make_backend(settling_time_s=0.2, tracking_timeout_s=0.5)
+        packet, _ = make_packet()
+        self.streamer.latest = packet
+        backend.get_tele_data()
+
+        self.clock.advance(0.21)
+        self.streamer.latest = copy.deepcopy(packet)
+        backend.get_tele_data()
+        self.clock.advance(0.01)
+        self.streamer.latest = copy.deepcopy(packet)
+        backend.get_tele_data()
+
+        ready_messages = [message for message in self.logs if "press R once" in message]
+        self.assertEqual(len(ready_messages), 1)
 
     def test_reconnect_requires_a_new_explicit_enable(self):
         backend = self.make_backend(tracking_timeout_s=0.2)
@@ -594,6 +721,29 @@ class VisionProTeleopBackendTests(unittest.TestCase):
         self.streamer.latest = moved
         self.assertEqual(backend.get_tele_data().tracking_state, HOLD)
         self.assertIn("wrist velocity", backend.state_reason)
+
+    def test_simulation_can_explicitly_disable_wrist_motion_rejection(self):
+        backend = self.make_backend(
+            max_wrist_translation_jump_m=0.01,
+            max_wrist_rotation_jump_rad=0.01,
+            max_wrist_velocity_m_s=0.01,
+            max_wrist_angular_velocity_rad_s=0.01,
+            motion_rejection_enabled=False,
+        )
+        packet, raw = make_packet()
+        self.prime_and_enable(backend, packet)
+
+        moved_wrist = raw["left_wrist"].copy()
+        moved_wrist[0, 3] += 0.2
+        moved_wrist = moved_wrist @ rotation_z(1.0)
+        moved, _ = make_packet(left_wrist_openxr=moved_wrist)
+        self.clock.advance(0.01)
+        self.streamer.latest = moved
+
+        output = backend.get_tele_data()
+        self.assertEqual(output.tracking_state, TRACKING_OK)
+        self.assertTrue(output.tracking_active)
+        self.assertEqual(backend.rejected_jump_count, 0)
 
     def test_operator_hold_never_auto_resumes(self):
         backend = self.make_backend()

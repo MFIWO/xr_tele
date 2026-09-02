@@ -327,6 +327,14 @@ tracking recovery never clears a latched `U` E-stop.
 (tv) $ python ai_worker_pedal_teleop.py --domain-id 30
 ```
 
+If no PCsensor pedal is connected, use an attached system keyboard as the input
+source. This reads real Linux key press/release events, so the key mapping and
+tracking/E-stop safety behavior are identical. Press `Ctrl+C` to exit:
+
+```bash
+(tv) $ python ai_worker_pedal_teleop.py --keyboard --domain-id 30
+```
+
 HX5-D20 uses the same `dex_retargeting.RetargetingConfig` and DexPilot optimizer
 path as RH5DG2. Its YAML contains the standard 15 thumb/fingertip/wrist vector
 pairs, and the optimizer output is reordered into the HX5 DDS 1..20 joint

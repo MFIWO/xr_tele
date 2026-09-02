@@ -32,6 +32,11 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
+try:
+    import cv2
+except ModuleNotFoundError:  # Keep command-sink/unit tests dependency-light.
+    cv2 = None
+
 
 TRACKING_OK = "TRACKING_OK"
 TRACKING_STALE = "TRACKING_STALE"
@@ -458,6 +463,7 @@ class VisionProTeleopBackend:
         max_wrist_rotation_jump_rad: float = math.radians(100.0),
         max_wrist_velocity_m_s: float = 6.0,
         max_wrist_angular_velocity_rad_s: float = 12.0,
+        motion_rejection_enabled: bool = True,
         pinch_threshold_m: float = 0.025,
         webrtc_port: int = 9999,
         start_video: bool = True,
@@ -508,6 +514,7 @@ class VisionProTeleopBackend:
         self.max_wrist_rotation_jump_rad = float(max_wrist_rotation_jump_rad)
         self.max_wrist_velocity_m_s = float(max_wrist_velocity_m_s)
         self.max_wrist_angular_velocity_rad_s = float(max_wrist_angular_velocity_rad_s)
+        self.motion_rejection_enabled = bool(motion_rejection_enabled)
         self.pinch_threshold_m = float(pinch_threshold_m)
         self._clock = clock
         self._status_callback = status_callback
@@ -673,10 +680,11 @@ class VisionProTeleopBackend:
             return False
         self._enable_requested = True
         if not self._settling_complete:
+            self._enable_requested = False
             elapsed = self._settling_elapsed(now)
             self._transition(
                 REANCHOR_REQUIRED,
-                "operator enable latched; valid tracking settling "
+                "operator enable rejected; valid tracking settling "
                 f"{elapsed:.3f}/{self.settling_time_s:.3f}s",
             )
             return False
@@ -1035,6 +1043,8 @@ class VisionProTeleopBackend:
         self._last_observed_wrist_poses = tuple(pose.copy() for pose in current)
         self._last_observed_monotonic = now
 
+        if not self.motion_rejection_enabled:
+            return None
         if previous is None or previous_time is None:
             return None
         delta_time = now - previous_time
@@ -1078,6 +1088,7 @@ class VisionProTeleopBackend:
         return raw
 
     def _record_continuous_valid(self, now: float) -> None:
+        was_settled = self._settling_complete
         if self._continuous_valid_since is None:
             self._continuous_valid_since = now
             self._continuous_valid_packet_count = 1
@@ -1091,6 +1102,14 @@ class VisionProTeleopBackend:
                 or self._continuous_valid_packet_count >= 2
             )
         )
+        if (
+            self._settling_complete
+            and not was_settled
+            and self._status_callback is not None
+        ):
+            self._status_callback(
+                "[VisionProTeleop] REANCHOR_REQUIRED: tracking settled; press R once to enable."
+            )
 
     def _settling_elapsed(self, now: float) -> float:
         if self._continuous_valid_since is None:
@@ -1214,6 +1233,17 @@ class VisionProTeleopBackend:
         if frame.shape[:2] == target_shape:
             return frame
         source_height, source_width = frame.shape[:2]
+        if cv2 is not None:
+            interpolation = (
+                cv2.INTER_AREA
+                if target_height < source_height or target_width < source_width
+                else cv2.INTER_LINEAR
+            )
+            return cv2.resize(
+                frame,
+                (target_width, target_height),
+                interpolation=interpolation,
+            )
         y_indices = np.linspace(0, source_height - 1, target_height).astype(np.intp)
         x_indices = np.linspace(0, source_width - 1, target_width).astype(np.intp)
         return frame[y_indices][:, x_indices]

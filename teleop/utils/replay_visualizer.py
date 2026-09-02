@@ -339,6 +339,7 @@ class ReplayVisualizer:
         sent_actions=None,
         live_states=None,
         replay_time_s=None,
+        timeline_idx=None,
         status=None,
     ):
         """Queue one display update without waiting for the Rerun worker.
@@ -350,7 +351,9 @@ class ReplayVisualizer:
             return False
 
         try:
-            frame_idx = int(frame.get("idx", 0))
+            frame_idx = int(
+                frame.get("idx", 0) if timeline_idx is None else timeline_idx
+            )
         except (TypeError, ValueError):
             frame_idx = 0
         frame_colors = frame.get("colors", {})

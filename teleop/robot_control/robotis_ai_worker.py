@@ -2,8 +2,9 @@
 
 The kinematic model is loaded from the official ``ai_worker`` checkout instead
 of duplicating its URDF in xr_tele.  Vision Pro and AI Worker wrist frames are
-aligned on the first valid IK frame, then translation and spatial rotation
-deltas are applied in the shared robot/world basis.
+aligned on the first valid IK frame.  Wrist rotation can then follow either a
+spatial delta in the shared robot/world basis or a body-local delta expressed
+in the aligned wrist frames.
 """
 
 from pathlib import Path
@@ -128,8 +129,11 @@ class AIWorkerArmIK:
         )
         self.data = self.model.createData()
 
-        if wrist_orientation_mode not in ("absolute", "relative"):
-            raise ValueError("wrist_orientation_mode must be 'absolute' or 'relative'.")
+        if wrist_orientation_mode not in ("absolute", "relative", "relative-local"):
+            raise ValueError(
+                "wrist_orientation_mode must be 'absolute', 'relative', "
+                "or 'relative-local'."
+            )
         self.wrist_orientation_mode = wrist_orientation_mode
 
         # The virtual target frames have the same semantic orientation as
@@ -202,13 +206,21 @@ class AIWorkerArmIK:
             # The virtual wrist EE uses the same absolute orientation convention
             # as H1_2; the HX5 mount is intentionally outside the arm IK target.
             rotation = input_pose[:3, :3] @ wrist_mount_rotation
-        else:
+        elif self.wrist_orientation_mode == "relative":
             # Preserve the robot's initial wrist orientation while applying the
             # VR rotation in the shared/world basis.  Multiplication in the old
             # order applied a human-local axis directly in the robot-local basis,
             # which made the two wrists rotate about different apparent axes.
             world_delta = input_pose[:3, :3] @ input_anchor[:3, :3].T
             rotation = world_delta @ robot_orientation_anchor
+        else:
+            # Preserve the robot's initial wrist orientation while mapping a
+            # rotation about an operator-wrist local axis to the same local axis
+            # of the aligned robot wrist.  This keeps pitch and terminal wrist
+            # rotation distinct even when the two anchor frames differ by the
+            # left/right hand-convention correction.
+            local_delta = input_anchor[:3, :3].T @ input_pose[:3, :3]
+            rotation = robot_orientation_anchor @ local_delta
         if self.wrist_orientation_mode == "absolute":
             # Absolute targets have no startup anchor, so apply their static
             # hand-axis correction directly.
@@ -296,12 +308,17 @@ class AIWorkerVirtualLeaderIK(AIWorkerArmIK):
     """Reach-aware SG2 IK that behaves like a continuous virtual 7-axis leader.
 
     The legacy solver intentionally remains unchanged.  This opt-in solver uses
-    the previous virtual joint command as its seed and selects the elbow bend
-    from hand reach.  The posture correction is applied through a
-    damped task-space projector so it stays subordinate to the wrist EE target.
+    the measured joint state as its primary seed, keeps the elbows on the
+    anatomical branch, and selects elbow bend from hand reach.  Whole-arm
+    continuity comes from measured-state reseeding plus a weak shoulder
+    null-space anchor.  During extension, elbow and axial-arm posture enter the
+    weighted least-squares objective so a small wrist-pose residual is preferred
+    over a corkscrewed or backwards-elbow solution.
     """
 
     _ELBOW_INDICES = (3, 10)
+    _AXIAL_POSTURE_INDICES = ((2, 4), (9, 11))
+    _WRIST_JOINT_INDICES = (4, 5, 6, 11, 12, 13)
     _SHOULDER_JOINT_NAMES = ("arm_l_joint1", "arm_r_joint1")
 
     def __init__(self, *args, **kwargs):
@@ -312,9 +329,20 @@ class AIWorkerVirtualLeaderIK(AIWorkerArmIK):
                 "AI Worker virtual-leader IK currently supports the SG2 follower URDF only."
             )
 
-        self._virtual_damping = 1e-3
-        self._virtual_posture_gain = 0.10
+        self._virtual_damping = 2e-3
         self._virtual_max_step = 0.12
+        self._virtual_translation_weight = np.sqrt(50.0)
+        self._virtual_rotation_weight = 1.0
+        self._virtual_anchor_nullspace_gain = 0.05
+        self._virtual_elbow_regularization = 1.0
+        self._virtual_axial_regularization = 0.10
+        self._virtual_position_tolerance = 1e-4
+        self._virtual_rotation_tolerance = 1e-3
+        self._virtual_branch_retry_threshold = 0.10
+        self._virtual_max_position_residual = 0.08
+        self._virtual_startup_elbow_tolerance = 0.05
+        self._posture_anchor_q = None
+        self._anchor_reach = None
         self._shoulder_joint_ids = tuple(
             self.model.getJointId(name) for name in self._SHOULDER_JOINT_NAMES
         )
@@ -345,25 +373,213 @@ class AIWorkerVirtualLeaderIK(AIWorkerArmIK):
                 "SG2 virtual-leader IK requires the home pose to reach farther than the ready pose."
             )
 
+    def reset_anchor(self):
+        super().reset_anchor()
+        self._posture_anchor_q = None
+        self._anchor_reach = None
+
+    def _project_target_to_workspace(self, target, side):
+        """Project targets onto the straight, anatomical-elbow reach sphere."""
+        root = self._shoulder_roots[side]
+        offset = target.translation - root
+        reach = float(np.linalg.norm(offset))
+        maximum_reach = self._straight_reach[side]
+        if reach <= maximum_reach or reach <= 1e-9:
+            return target
+        translation = root + offset * (maximum_reach / reach)
+        return self.pin.SE3(target.rotation.copy(), translation)
+
     def _elbow_posture_target(self, targets):
         posture = np.zeros(14, dtype=np.float64)
+        anchor_q = self._posture_anchor_q
+        anchor_reach = self._anchor_reach
+        if anchor_q is None or anchor_reach is None:
+            anchor_q = self.ready_q
+            anchor_reach = self._ready_reach
         for side, (target, root, elbow_index) in enumerate(
             zip(targets, self._shoulder_roots, self._ELBOW_INDICES)
         ):
             reach = np.linalg.norm(target.translation - root)
+            start_reach = anchor_reach[side]
+            end_reach = max(self._straight_reach[side], start_reach + 1e-3)
+            reach_span = end_reach - start_reach
             extension = np.clip(
-                (reach - self._ready_reach[side])
-                / (self._straight_reach[side] - self._ready_reach[side]),
+                (reach - start_reach) / max(reach_span, 1e-6),
                 0.0,
                 1.0,
             )
             extension = extension * extension * (3.0 - 2.0 * extension)
-            elbow_target = (
-                (1.0 - extension) * self.ready_q[elbow_index]
-                + extension * self.home_q[elbow_index]
-            )
+            anchor_elbow = min(anchor_q[elbow_index], 0.0)
+            elbow_target = (1.0 - extension) * anchor_elbow
             posture[elbow_index] = elbow_target
         return posture
+
+    def _extension_from_elbow_target(self, elbow_target):
+        extension = np.zeros(2, dtype=np.float64)
+        for side, elbow_index in enumerate(self._ELBOW_INDICES):
+            anchor_elbow = min(self._posture_anchor_q[elbow_index], 0.0)
+            if anchor_elbow < -1e-6:
+                extension[side] = np.clip(
+                    1.0 - elbow_target[elbow_index] / anchor_elbow,
+                    0.0,
+                    1.0,
+                )
+            else:
+                extension[side] = 1.0
+        return extension
+
+    def _task_terms(self, q, targets):
+        self.pin.forwardKinematics(self.model, self.data, q)
+        self.pin.updateFramePlacements(self.model, self.data)
+        errors = []
+        jacobians = []
+        max_position_error = 0.0
+        max_rotation_error = 0.0
+        for frame_id, target in zip((self.left_frame_id, self.right_frame_id), targets):
+            current = self.data.oMf[frame_id]
+            motion_error = self.pin.log6(current.inverse() * target)
+            errors.append(motion_error.vector)
+            jacobians.append(
+                self.pin.computeFrameJacobian(
+                    self.model,
+                    self.data,
+                    q,
+                    frame_id,
+                    self.pin.ReferenceFrame.LOCAL,
+                )
+            )
+            max_position_error = max(
+                max_position_error,
+                float(np.linalg.norm(motion_error.linear)),
+            )
+            max_rotation_error = max(
+                max_rotation_error,
+                float(np.linalg.norm(motion_error.angular)),
+            )
+
+        error = np.concatenate(errors)
+        jacobian = np.vstack(jacobians)
+        weights = []
+        for _ in targets:
+            weights.extend(
+                [self._virtual_translation_weight] * 3
+                + [self._virtual_rotation_weight] * 3
+            )
+        weights = np.asarray(weights, dtype=np.float64)
+        return (
+            weights * error,
+            weights[:, None] * jacobian,
+            max_position_error,
+            max_rotation_error,
+        )
+
+    def _task_metrics(self, q, targets):
+        frames = self._forward(q)
+        metrics = []
+        for current, target in zip(frames, targets):
+            motion_error = self.pin.log6(current.inverse() * target)
+            position_error = float(np.linalg.norm(motion_error.linear))
+            rotation_error = float(np.linalg.norm(motion_error.angular))
+            rotation_cost = self._virtual_rotation_weight**2
+            cost = self._virtual_translation_weight**2 * position_error**2 + (
+                rotation_cost * rotation_error**2
+            )
+            metrics.append((position_error, rotation_error, cost))
+        return metrics
+
+    def _objective_costs(self, q, targets, elbow_target, extension):
+        metrics = self._task_metrics(q, targets)
+        costs = np.array([metric[2] for metric in metrics], dtype=np.float64)
+        for side, elbow_index in enumerate(self._ELBOW_INDICES):
+            side_extension = extension[side]
+            costs[side] += (
+                self._virtual_elbow_regularization
+                * side_extension
+                * (q[elbow_index] - elbow_target[elbow_index]) ** 2
+            )
+            for axial_index in self._AXIAL_POSTURE_INDICES[side]:
+                costs[side] += (
+                    self._virtual_axial_regularization
+                    * side_extension
+                    * (q[axial_index] - self._posture_anchor_q[axial_index]) ** 2
+                )
+        return costs
+
+    def _solve_candidate(self, seed_q, targets, elbow_target, extension):
+        q = np.asarray(seed_q, dtype=np.float64).reshape(14).copy()
+        q = np.clip(q, self.lower, self.upper)
+        first_step_q = q.copy()
+        safe_upper = self.upper.copy()
+        safe_upper[list(self._ELBOW_INDICES)] = 0.0
+        regularization = np.zeros(14, dtype=np.float64)
+        posture_reference = self._posture_anchor_q.copy()
+        for side, elbow_index in enumerate(self._ELBOW_INDICES):
+            side_extension = extension[side]
+            regularization[elbow_index] += (
+                self._virtual_elbow_regularization * side_extension
+            )
+            posture_reference[elbow_index] = elbow_target[elbow_index]
+            for axial_index in self._AXIAL_POSTURE_INDICES[side]:
+                regularization[axial_index] += (
+                    self._virtual_axial_regularization * side_extension
+                )
+
+        for iteration in range(self.max_iterations):
+            (
+                weighted_error,
+                weighted_jacobian,
+                position_error,
+                rotation_error,
+            ) = self._task_terms(q, targets)
+            elbow_error = np.max(
+                np.abs(
+                    q[list(self._ELBOW_INDICES)]
+                    - elbow_target[list(self._ELBOW_INDICES)]
+                )
+            )
+            system = (
+                weighted_jacobian.T @ weighted_jacobian
+                + np.diag(regularization)
+                + self._virtual_damping * np.eye(14)
+            )
+            rhs = (
+                weighted_jacobian.T @ weighted_error
+                + regularization * (posture_reference - q)
+            )
+            dq = np.linalg.solve(system, rhs)
+            task_projector = (
+                np.eye(14)
+                - np.linalg.pinv(weighted_jacobian, rcond=1e-5)
+                @ weighted_jacobian
+            )
+            anchor_error = posture_reference - q
+            anchor_error[list(self._WRIST_JOINT_INDICES)] = 0.0
+            dq += self._virtual_anchor_nullspace_gain * (
+                task_projector @ anchor_error
+            )
+            if not np.all(np.isfinite(dq)):
+                return None
+            max_step = np.max(np.abs(dq))
+            if (
+                max_step <= 1e-6
+                or (
+                    position_error <= self._virtual_position_tolerance
+                    and rotation_error <= self._virtual_rotation_tolerance
+                    and elbow_error <= 0.01
+                    and np.max(
+                        np.abs(task_projector @ anchor_error)
+                    )
+                    <= 1e-5
+                )
+            ):
+                break
+            if max_step > self._virtual_max_step:
+                dq *= self._virtual_max_step / max_step
+            q = self.pin.integrate(self.model, q, dq)
+            q = np.clip(q, self.lower, safe_upper)
+            if iteration == 0:
+                first_step_q = q.copy()
+        return q, first_step_q
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_q=None, current_lr_arm_dq=None):
         del current_lr_arm_dq
@@ -379,6 +595,13 @@ class AIWorkerVirtualLeaderIK(AIWorkerArmIK):
         measured_q = np.clip(measured_q, self.lower, self.upper)
 
         if self._input_anchor is None:
+            startup_elbows = measured_q[list(self._ELBOW_INDICES)]
+            if np.any(startup_elbows > self._virtual_startup_elbow_tolerance):
+                raise RuntimeError(
+                    "AI Worker virtual-leader cannot anchor from the backwards-elbow "
+                    f"branch (q4={np.round(startup_elbows, 4).tolist()}). "
+                    "Reset the simulator or move the arms to a supervised safe pose first."
+                )
             self._input_anchor = (left_input.copy(), right_input.copy())
             self._robot_anchor = self._forward(measured_q)
             self._robot_orientation_anchor = tuple(
@@ -387,9 +610,17 @@ class AIWorkerVirtualLeaderIK(AIWorkerArmIK):
                 else self._robot_anchor[index].rotation.copy()
                 for index in range(2)
             )
+            self._posture_anchor_q = measured_q.copy()
+            self._anchor_reach = np.array(
+                [
+                    np.linalg.norm(frame.translation - root)
+                    for frame, root in zip(self._robot_anchor, self._shoulder_roots)
+                ],
+                dtype=np.float64,
+            )
             self._last_q = measured_q.copy()
 
-        targets = (
+        raw_targets = (
             self._target(
                 left_input,
                 self._input_anchor[0],
@@ -407,59 +638,126 @@ class AIWorkerVirtualLeaderIK(AIWorkerArmIK):
                 self._wrist_roll_corrections[1],
             ),
         )
-        frame_ids = (self.left_frame_id, self.right_frame_id)
-        previous_q = self._last_q.copy()
-        q = previous_q.copy()
+        targets = tuple(
+            self._project_target_to_workspace(target, side)
+            for side, target in enumerate(raw_targets)
+        )
+        previous_q = measured_q.copy()
         elbow_target = self._elbow_posture_target(targets)
+        extension = self._extension_from_elbow_target(elbow_target)
 
         try:
-            for _ in range(self.max_iterations):
-                self.pin.forwardKinematics(self.model, self.data, q)
-                self.pin.updateFramePlacements(self.model, self.data)
-                errors = []
-                jacobians = []
-                for frame_id, target in zip(frame_ids, targets):
-                    current = self.data.oMf[frame_id]
-                    errors.append(self.pin.log6(current.inverse() * target).vector)
-                    jacobians.append(
-                        self.pin.computeFrameJacobian(
-                            self.model,
-                            self.data,
-                            q,
-                            frame_id,
-                            self.pin.ReferenceFrame.LOCAL,
-                        )
+            candidate = self._solve_candidate(
+                measured_q,
+                targets,
+                elbow_target,
+                extension,
+            )
+            if candidate is None:
+                return previous_q, np.zeros(14, dtype=np.float64)
+            q, measured_first_step_q = candidate
+
+            elbow_mismatch = np.abs(
+                q[list(self._ELBOW_INDICES)]
+                - elbow_target[list(self._ELBOW_INDICES)]
+            )
+            retry_sides = elbow_mismatch > self._virtual_branch_retry_threshold
+            if np.any(retry_sides):
+                anchor_result = self._solve_candidate(
+                    self._posture_anchor_q,
+                    targets,
+                    elbow_target,
+                    extension,
+                )
+                if anchor_result is not None:
+                    anchor_candidate, _ = anchor_result
+                    measured_metrics = self._task_metrics(q, targets)
+                    anchor_metrics = self._task_metrics(
+                        anchor_candidate,
+                        targets,
                     )
-                error = np.concatenate(errors)
-                jacobian = np.vstack(jacobians)
-                inverse = np.linalg.solve(
-                    jacobian @ jacobian.T + self._virtual_damping * np.eye(12),
-                    np.eye(12),
-                )
-                damped_pseudoinverse = jacobian.T @ inverse
-                task_projector = np.eye(14) - damped_pseudoinverse @ jacobian
-                posture_error = np.zeros(14, dtype=np.float64)
-                for elbow_index in self._ELBOW_INDICES:
-                    posture_error[elbow_index] = elbow_target[elbow_index] - q[elbow_index]
-                dq = (
-                    damped_pseudoinverse @ error
-                    + self._virtual_posture_gain * task_projector @ posture_error
-                )
-                if not np.all(np.isfinite(dq)):
-                    return previous_q, np.zeros(14, dtype=np.float64)
-                max_step = np.max(np.abs(dq))
-                if max_step > self._virtual_max_step:
-                    dq *= self._virtual_max_step / max_step
-                q = np.clip(self.pin.integrate(self.model, q, dq), self.lower, self.upper)
+                    for side, retry_side in enumerate(retry_sides):
+                        if not retry_side:
+                            continue
+                        arm_slice = slice(side * 7, side * 7 + 7)
+                        elbow_index = self._ELBOW_INDICES[side]
+                        measured_position, measured_rotation, measured_cost = (
+                            measured_metrics[side]
+                        )
+                        anchor_position, anchor_rotation, anchor_cost = (
+                            anchor_metrics[side]
+                        )
+                        task_is_equivalent = (
+                            anchor_position <= max(1e-3, measured_position + 1e-3)
+                            and anchor_rotation <= max(1e-2, measured_rotation + 1e-2)
+                        )
+                        anchor_elbow_error = abs(
+                            anchor_candidate[elbow_index] - elbow_target[elbow_index]
+                        )
+                        measured_elbow_error = abs(
+                            q[elbow_index] - elbow_target[elbow_index]
+                        )
+                        posture_is_better = (
+                            anchor_elbow_error + 1e-4 < measured_elbow_error
+                        )
+                        if (
+                            task_is_equivalent and posture_is_better
+                        ) or anchor_cost + 1e-8 < measured_cost:
+                            q[arm_slice] = anchor_candidate[arm_slice]
         except np.linalg.LinAlgError:
             return previous_q, np.zeros(14, dtype=np.float64)
 
-        q = previous_q + np.clip(
-            q - previous_q,
-            -self._virtual_max_step,
-            self._virtual_max_step,
+        solved_metrics = self._task_metrics(q, targets)
+        previous_costs = self._objective_costs(
+            previous_q,
+            targets,
+            elbow_target,
+            extension,
         )
-        q = np.clip(q, self.lower, self.upper)
+        solved_q = q.copy()
+        q = previous_q.copy()
+        for side, previous_cost in enumerate(previous_costs):
+            arm_slice = slice(side * 7, side * 7 + 7)
+            elbow_index = self._ELBOW_INDICES[side]
+            position_error = solved_metrics[side][0]
+            if (
+                not np.isfinite(position_error)
+                or position_error > self._virtual_max_position_residual
+            ):
+                continue
+
+            best_cost = previous_cost
+            best_arm_q = previous_q[arm_slice].copy()
+            for step_target in (solved_q, measured_first_step_q):
+                command_delta = (
+                    step_target[arm_slice] - previous_q[arm_slice]
+                )
+                command_step = float(np.max(np.abs(command_delta)))
+                if command_step > self._virtual_max_step:
+                    command_delta *= self._virtual_max_step / command_step
+                for alpha in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125):
+                    trial_q = q.copy()
+                    trial_q[arm_slice] = (
+                        previous_q[arm_slice] + alpha * command_delta
+                    )
+                    trial_q = np.clip(trial_q, self.lower, self.upper)
+                    if previous_q[elbow_index] <= 0.0:
+                        trial_q[elbow_index] = min(trial_q[elbow_index], 0.0)
+                    else:
+                        trial_q[elbow_index] = min(
+                            trial_q[elbow_index],
+                            previous_q[elbow_index],
+                        )
+                    trial_cost = self._objective_costs(
+                        trial_q,
+                        targets,
+                        elbow_target,
+                        extension,
+                    )[side]
+                    if np.isfinite(trial_cost) and trial_cost < best_cost - 1e-12:
+                        best_cost = trial_cost
+                        best_arm_q = trial_q[arm_slice].copy()
+            q[arm_slice] = best_arm_q
         if not np.all(np.isfinite(q)):
             return previous_q, np.zeros(14, dtype=np.float64)
         self._last_q = q.copy()

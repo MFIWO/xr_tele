@@ -220,6 +220,22 @@ def _fmt_vec_debug(values):
     )
 
 
+def _log_operator_instructions(record, screen_record, tactile_overlay):
+    """Print the compact keyboard guide used by both XR startup paths."""
+    logger_mp.info("----------------------------------------------------------------")
+    logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+    if record:
+        logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
+    elif screen_record:
+        logger_mp.info("🟡  Press [s] to START or STOP head camera screen recording.")
+    else:
+        logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
+    if tactile_overlay:
+        logger_mp.info("🟣  Press [t] to SHOW or HIDE the RH5DG2 tactile VR overlay.")
+    logger_mp.info("🔴  Press [q] to stop and exit the program.")
+    logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+
+
 def _read_body_qpos(arm_ctrl, enabled=True):
     if not enabled or arm_ctrl is None or not hasattr(arm_ctrl, "get_current_motor_q"):
         return []
@@ -278,6 +294,55 @@ class NeckFeedbackReceiver:
 
     def close(self):
         self.socket.close()
+
+
+def _create_neck_control(args):
+    """Construct the selected neck transport after its safety gate is open."""
+    if args.arm == "AI_WORKER":
+        controller = AIWorkerNeckController(
+            yaw_limit=args.neck_yaw_limit,
+            pitch_limit=args.neck_pitch_limit,
+            smoothing_alpha=args.neck_smoothing_alpha,
+            max_step=args.neck_max_step,
+            command_duration=args.ai_worker_command_duration,
+            pitch_gain=args.neck_pitch_gain,
+            pitch_invert=args.ai_worker_neck_pitch_invert,
+        )
+        logger_mp.info(
+            "[teleop neck] AI Worker DDS enabled topic=%s joints=%s",
+            "/leader/joystick_controller_left/joint_trajectory",
+            ["head_joint1", "head_joint2"],
+        )
+        return controller, None
+
+    controller = VisionProNeckController(
+        host=args.neck_host or args.img_server_ip,
+        port=args.neck_port,
+        yaw_limit=args.neck_yaw_limit,
+        pitch_limit=args.neck_pitch_limit,
+        smoothing_alpha=args.neck_smoothing_alpha,
+        max_step=args.neck_max_step,
+    )
+    logger_mp.info(
+        "[teleop neck] enabled target=%s:%d yaw_limit=%.3f pitch_limit=%.3f "
+        "alpha=%.3f max_step=%.3f",
+        args.neck_host or args.img_server_ip,
+        args.neck_port,
+        args.neck_yaw_limit,
+        args.neck_pitch_limit,
+        args.neck_smoothing_alpha,
+        args.neck_max_step,
+    )
+    feedback = None
+    try:
+        feedback = NeckFeedbackReceiver(args.neck_feedback_port)
+        logger_mp.info(
+            "[teleop neck feedback] listening udp=0.0.0.0:%d",
+            args.neck_feedback_port,
+        )
+    except OSError as exc:
+        logger_mp.warning("[teleop neck feedback] disabled: %s", exc)
+    return controller, feedback
 
 
 class RH5DG2TactileUDPReceiver:
@@ -483,7 +548,54 @@ def _apply_camera_orientation(image, camera_name, args):
         oriented = np.flipud(oriented).copy()
     if camera_name == "right_wrist" and args.right_wrist_camera_vflip:
         oriented = np.flipud(oriented).copy()
+    rotation_deg = int(
+        args.left_wrist_camera_rotation
+        if camera_name == "left_wrist"
+        else args.right_wrist_camera_rotation
+        if camera_name == "right_wrist"
+        else 0
+    )
+    if rotation_deg:
+        # np.rot90 uses counter-clockwise quarter turns. CLI angles are
+        # clockwise so a camera that currently appears 90 degrees clockwise
+        # can be restored with --*-wrist-camera-rotation 270.
+        oriented = np.rot90(oriented, k=-(rotation_deg // 90)).copy()
     return oriented
+
+
+def _resize_bgr_to_height(image, target_h):
+    image = np.asarray(image)
+    if image.ndim != 3 or target_h <= 0:
+        return None
+    if image.shape[0] == target_h:
+        return np.ascontiguousarray(image)
+    target_w = max(1, int(round(image.shape[1] * target_h / image.shape[0])))
+    if cv2 is not None:
+        return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    y_indices = np.linspace(0, image.shape[0] - 1, target_h).astype(np.intp)
+    x_indices = np.linspace(0, image.shape[1] - 1, target_w).astype(np.intp)
+    return np.ascontiguousarray(image[y_indices][:, x_indices])
+
+
+def _compose_head_with_side_wrist_bgr(head_bgr, left_bgr, right_bgr):
+    """Place portrait wrist views on the left and right of the head view."""
+    available = [image for image in (left_bgr, head_bgr, right_bgr) if image is not None]
+    if not available:
+        return None
+    if head_bgr is not None and np.asarray(head_bgr).ndim == 3:
+        target_h = int(np.asarray(head_bgr).shape[0])
+    else:
+        target_h = max(int(np.asarray(image).shape[0]) for image in available)
+    panels = []
+    for image in (left_bgr, head_bgr, right_bgr):
+        if image is None:
+            continue
+        panel = _resize_bgr_to_height(image, target_h)
+        if panel is not None:
+            panels.append(panel)
+    if not panels:
+        return None
+    return np.ascontiguousarray(np.concatenate(panels, axis=1))
 
 def _compose_both_wrist_bgr(left_bgr, right_bgr):
     if left_bgr is None:
@@ -568,6 +680,15 @@ def _fit_bgr_to_shape(image, target_shape):
 def _get_head_and_wrist_bgr(img_client, args):
     head_frame = img_client.get_head_frame()
     head_bgr = None if head_frame is None else getattr(head_frame, "bgr", None)
+    if args.head_wrist_layout == "side-portrait":
+        left_frame = img_client.get_left_wrist_frame()
+        right_frame = img_client.get_right_wrist_frame()
+        left_bgr = None if left_frame is None else getattr(left_frame, "bgr", None)
+        right_bgr = None if right_frame is None else getattr(right_frame, "bgr", None)
+        left_bgr = _apply_camera_orientation(left_bgr, "left_wrist", args)
+        right_bgr = _apply_camera_orientation(right_bgr, "right_wrist", args)
+        composite = _compose_head_with_side_wrist_bgr(head_bgr, left_bgr, right_bgr)
+        return composite, head_frame, left_frame, right_frame
     wrist_bgr, left_frame, right_frame = _get_both_wrist_bgr(img_client, args)
     return _compose_head_and_wrist_bgr(head_bgr, wrist_bgr), head_frame, left_frame, right_frame
 
@@ -1180,18 +1301,22 @@ if __name__ == '__main__':
     parser.add_argument('--xr-backend', choices=['vuer', 'visionproteleop'], default='vuer', help='XR tracking/display backend. vuer remains the default.')
     parser.add_argument('--visionpro-ip', default=os.environ.get('VISIONPRO_IP'), help='Tracking Streamer Local Network IP (or room code). May also be set with VISIONPRO_IP.')
     parser.add_argument('--visionpro-webrtc-port', type=int, default=9999, help='Linux WebRTC port advertised to Tracking Streamer for the native video plane.')
+    parser.add_argument('--visionpro-video-width', type=int, default=0, help='Native Tracking Streamer video width. Zero keeps the camera-derived width; set together with --visionpro-video-height.')
+    parser.add_argument('--visionpro-video-height', type=int, default=0, help='Native Tracking Streamer video height. Zero keeps the camera-derived height; set together with --visionpro-video-width.')
     parser.add_argument('--visionpro-tracking-timeout', type=float, default=0.25, help='Host-monotonic seconds without a new VisionProTeleop packet before fail-closed hold.')
     parser.add_argument('--visionpro-settle-time', type=float, default=0.5, help='Continuous valid tracking required before an explicit R enable can take effect.')
     parser.add_argument('--visionpro-max-wrist-translation-jump', type=float, default=0.15, help='Per-packet native backend wrist translation jump limit in metres.')
     parser.add_argument('--visionpro-max-wrist-rotation-jump-deg', type=float, default=60.0, help='Per-packet native backend wrist rotation jump limit in degrees.')
     parser.add_argument('--visionpro-max-wrist-velocity', type=float, default=3.0, help='Native backend wrist translation velocity limit in metres/second; violation holds tracking.')
     parser.add_argument('--visionpro-max-wrist-angular-velocity', type=float, default=8.0, help='Native backend wrist angular velocity limit in radians/second; violation holds tracking.')
+    parser.add_argument('--visionpro-motion-rejection', action=argparse.BooleanOptionalAction, default=True, help='Reject native wrist jumps/velocity spikes. Use --no-visionpro-motion-rejection only in simulation or command-sink diagnostics.')
     parser.add_argument('--visionpro-status-rate', type=float, default=1.0, help='Native backend tracking/video/hold diagnostic rate in Hz. Set 0 to disable periodic output.')
     parser.add_argument('--visionpro-synthetic', action='store_true', help='Use deterministic synthetic AVP packets for DDS-free offline validation only; requires --command-sink.')
     parser.add_argument('--command-sink', action='store_true', help='Run AI Worker IK and HX5 retargeting with in-memory targets and no motor DDS publishers.')
     parser.add_argument('--command-sink-duration', type=float, default=0.0, help='Auto-start and stop a command-sink diagnostic after this many seconds; requires --visionpro-synthetic.')
     parser.add_argument('--command-sink-log-rate', type=float, default=1.0, help='In-memory arm/HX5 target diagnostic rate in Hz. Set 0 to disable periodic output.')
     parser.add_argument('--allow-real-hardware', action='store_true', help='Explicitly permit native Vision Pro backend to construct real AI Worker/HX5 controllers. Never use for first validation.')
+    parser.add_argument('--visionpro-home-before-enable', action='store_true', help='Explicitly allow AI Worker startup ready-pose motion before R when using the native backend. R still gates all tracking-driven commands.')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'AI_WORKER'], default='H1_2', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco', 'hx5_d20'], default='rh5dg2_dfx', help='Select end effector controller')
@@ -1199,12 +1324,15 @@ if __name__ == '__main__':
     parser.add_argument('--image-source', choices=['auto', 'teleimager', 'robotis_dds', 'none'], default='auto', help='Camera transport. none is a deterministic synthetic source allowed only with --command-sink.')
     parser.add_argument('--viewer-host-ip', type=str, default=None, help='Host IP advertised to the XR browser for the HTTPS/WSS viewer. If omitted, infer it from the route to --img-server-ip.')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
-    parser.add_argument('--camera', '--viewer-camera', dest='camera', type=str, choices=['head', 'left_wrist', 'right_wrist', 'both', 'both_wrist', 'head_and_wrist', 'head_wrist', 'all'], default='head', help='Camera stream shown in the 8012 XR viewer. Use head_and_wrist to show the head view with both wrist cameras below it.')
+    parser.add_argument('--camera', '--viewer-camera', dest='camera', type=str, choices=['head', 'left_wrist', 'right_wrist', 'both', 'both_wrist', 'head_and_wrist', 'head_wrist', 'all'], default='head', help='Camera stream shown in the XR viewer. Use head_and_wrist with --head-wrist-layout to choose the composite layout.')
+    parser.add_argument('--head-wrist-layout', choices=['below', 'side-portrait'], default='below', help='Place both wrist views below the head image or as portrait panels on its left/right sides.')
     parser.add_argument('--viewer-camera-mode', type=str, choices=['auto', 'webrtc', 'zmq', 'none'], default='zmq', help='Select how the 8012 XR viewer receives the selected camera.')
     parser.add_argument('--viewer-display-fps', type=float, default=15.0, help='XR JPEG push rate for ZMQ camera mode. Lower this on congested Wi-Fi.')
     parser.add_argument('--viewer-jpeg-quality', type=int, default=60, help='XR JPEG quality for ZMQ camera mode, from 1 to 100.')
     parser.add_argument('--no-left-wrist-camera-vflip', dest='left_wrist_camera_vflip', action='store_false', help='Disable vertical flip correction for the left wrist camera.')
     parser.add_argument('--right-wrist-camera-vflip', action='store_true', help='Enable vertical flip correction for the right wrist camera.')
+    parser.add_argument('--left-wrist-camera-rotation', type=int, choices=[0, 90, 180, 270], default=0, help='Clockwise wrist-camera display rotation in degrees. Use 270 to undo an image that appears 90 degrees clockwise.')
+    parser.add_argument('--right-wrist-camera-rotation', type=int, choices=[0, 90, 180, 270], default=0, help='Clockwise wrist-camera display rotation in degrees. Use 270 to undo an image that appears 90 degrees clockwise.')
     parser.add_argument('--hand-control-hz', type=float, default=50.0, help='RH5DG2 hand retarget/publish loop frequency.')
     parser.add_argument('--ai-worker-urdf', type=str, default=None, help='Expanded AI Worker SH5 URDF. Defaults to the sibling external_repos/ai_worker checkout.')
     parser.add_argument('--ai-worker-ros-domain-id', type=int, default=None, help='DDS domain ID used by AI Worker arm/hand trajectory topics (robotis_lab commonly uses 30).')
@@ -1222,7 +1350,7 @@ if __name__ == '__main__':
     parser.add_argument('--pedal-estop-host', default='127.0.0.1', help='Local address for AI Worker pedal E-stop messages.')
     parser.add_argument('--pedal-estop-port', type=int, default=8765, help='UDP port for the latched AI Worker upper-body E-stop.')
     parser.add_argument('--pedal-safety-port', type=int, default=8766, help='UDP destination for pedal base/lift tracking-safety heartbeats.')
-    parser.add_argument('--ai-worker-wrist-orientation-mode', choices=['relative', 'absolute'], default='relative', help='AI Worker wrist orientation mapping. relative aligns the Vision Pro and SH5 wrist frames at startup before applying rotation; absolute is an experimental H1_2-frame mapping.')
+    parser.add_argument('--ai-worker-wrist-orientation-mode', choices=['relative', 'relative-local', 'absolute'], default='relative', help='AI Worker wrist orientation mapping. relative applies startup-anchored rotation in the shared world basis; relative-local applies it about the aligned wrist-local axes so pitch and terminal rotation stay distinct; absolute is an experimental H1_2-frame mapping.')
     parser.add_argument('--ai-worker-left-wrist-roll-offset-deg', type=float, default=0.0, help='Static HX5 left-hand roll correction in degrees about the hand longitudinal axis.')
     parser.add_argument('--ai-worker-right-wrist-roll-offset-deg', type=float, default=0.0, help='Static HX5 right-hand roll correction in degrees about the hand longitudinal axis.')
     parser.add_argument('--hx5-d20-retarget-mode', choices=['dexpilot', 'geometric'], default='dexpilot', help='HX5-D20 hand retargeter. dexpilot jointly optimizes all fingertips; geometric keeps the legacy per-joint mapping.')
@@ -1271,7 +1399,7 @@ if __name__ == '__main__':
     parser.add_argument('--disable-hand', action='store_true', help='Disable end-effector initialization and command publishing while keeping XR arm control active.')
     parser.add_argument('--disable-body', action=argparse.BooleanOptionalAction, default=True, help='Disable high-level body/loco command publishing.')
     parser.add_argument('--hand-only', action='store_true', help='Run XR input and end-effector hand control only; arm and body control stay off.')
-    parser.add_argument('--enable-neck', action=argparse.BooleanOptionalAction, default=True, help='Send Vision Pro head yaw/pitch to the external UDP neck controller.')
+    parser.add_argument('--enable-neck', action=argparse.BooleanOptionalAction, default=None, help='Send Vision Pro head yaw/pitch to the neck controller. Defaults on for Vuer and off for native Tracking Streamer, where --enable-neck is an explicit hardware opt-in.')
     parser.add_argument('--neck-host', type=str, default=None, help='External neck controller host. Defaults to --img-server-ip.')
     parser.add_argument('--neck-port', type=int, default=9091, help='External neck controller UDP command port.')
     parser.add_argument('--neck-yaw-limit', type=float, default=1.2, help='Absolute relative neck yaw command limit in radians.')
@@ -1339,6 +1467,7 @@ if __name__ == '__main__':
     parser.add_argument('--screen-record', action='store_true', help='Record only the head camera view to MP4; toggle with s.')
     parser.add_argument('--screen-record-dir', type=str, default='./screen_records', help='Directory for head camera MP4 recordings.')
     parser.add_argument('--record-body-state', action=argparse.BooleanOptionalAction, default=True, help='Record full robot/body qpos from arm controller lowstate when available.')
+    parser.add_argument('--arm-trace-path', type=str, default=None, help='Write a lightweight JSONL arm trace from [r] until exit: raw/IK wrist poses, measured q, raw IK q, requested q, and velocity-limited sent q. This is independent of --record and stores no images.')
     parser.add_argument('--enable-audio', action='store_true', help='Record host-side microphone audio continuously into episode_xxxx/audios/audio.wav.')
     parser.add_argument('--audio-device', type=str, default='plughw:2,0', help='ALSA/sounddevice input device for host-side continuous audio.')
     parser.add_argument('--audio-sample-rate', type=int, default=48000, help='Host-side continuous audio sample rate in Hz.')
@@ -1360,6 +1489,10 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    if args.enable_neck is None:
+        # Preserve the established Vuer default while requiring an explicit
+        # motor opt-in for the native Tracking Streamer production path.
+        args.enable_neck = args.xr_backend != "visionproteleop"
     native_production_gate = bool(
         args.xr_backend == "visionproteleop" and not args.command_sink
     )
@@ -1379,21 +1512,41 @@ if __name__ == '__main__':
                 "Native Vision Pro real controller construction is inhibited. Start with "
                 "--command-sink; supervised hardware use additionally requires --allow-real-hardware."
             )
+        if args.visionpro_home_before_enable and (
+            args.command_sink or args.disable_arm or not args.ai_worker_home_on_start
+        ):
+            raise ValueError(
+                "--visionpro-home-before-enable requires the production AI Worker arm "
+                "with --ai-worker-home-on-start enabled."
+            )
+        if not args.visionpro_motion_rejection and not (args.sim or args.command_sink):
+            raise ValueError(
+                "--no-visionpro-motion-rejection is restricted to --sim or --command-sink."
+            )
+        if not args.visionpro_motion_rejection:
+            logger_mp.warning(
+                "[VisionProTeleop simulation] wrist jump/velocity rejection is disabled; "
+                "URDF joint limits and downstream command limiting remain active."
+            )
         if args.arm_standby_action != "hold":
             logger_mp.warning(
                 "[VisionProTeleop safety] forcing --arm-standby-action hold; stale native tracking must not move toward ready."
             )
             args.arm_standby_action = "hold"
-        if args.ai_worker_home_on_start:
+        if args.visionpro_home_before_enable:
             logger_mp.warning(
-                "[VisionProTeleop safety] disabling pre-enable arm homing; measured pose is held until tracking settles and R is pressed."
+                "[VisionProTeleop arm startup] explicit pre-enable ready-pose motion is enabled; "
+                "the arm will move before R, while tracking-driven commands remain gated."
             )
-            args.ai_worker_home_on_start = False
+        elif args.ai_worker_home_on_start:
+            logger_mp.info(
+                "[VisionProTeleop arm startup] the ready-pose move is deferred until "
+                "fresh tracking settles and R is explicitly accepted."
+            )
         if not args.skip_arm_go_home_on_exit:
-            logger_mp.warning(
-                "[VisionProTeleop safety] enabling --skip-arm-go-home-on-exit so shutdown cannot create an untracked arm motion."
+            logger_mp.info(
+                "[VisionProTeleop arm shutdown] smooth return to the model home pose is enabled."
             )
-            args.skip_arm_go_home_on_exit = True
         if args.camera not in ("head_and_wrist", "head_wrist"):
             logger_mp.info(
                 "[VisionProTeleop video] using the PoC head + left wrist + right wrist composite."
@@ -1426,6 +1579,16 @@ if __name__ == '__main__':
         raise ValueError("Command-sink and VisionProTeleop status rates must be zero or greater.")
     if args.visionpro_webrtc_port <= 0 or args.visionpro_webrtc_port > 65535:
         raise ValueError("--visionpro-webrtc-port must be between 1 and 65535.")
+    if (args.visionpro_video_width == 0) != (args.visionpro_video_height == 0):
+        raise ValueError(
+            "--visionpro-video-width and --visionpro-video-height must both be zero or both be set."
+        )
+    if args.visionpro_video_width < 0 or args.visionpro_video_height < 0:
+        raise ValueError("VisionProTeleop video width/height cannot be negative.")
+    if args.visionpro_video_width and args.xr_backend != "visionproteleop":
+        raise ValueError(
+            "--visionpro-video-width/height are available only with --xr-backend visionproteleop."
+        )
     if (
         not np.isfinite(args.visionpro_tracking_timeout)
         or not np.isfinite(args.visionpro_settle_time)
@@ -1444,20 +1607,17 @@ if __name__ == '__main__':
         or args.visionpro_max_wrist_angular_velocity <= 0.0
     ):
         raise ValueError("VisionProTeleop wrist jump and velocity limits must be greater than zero.")
-    if (args.command_sink or args.xr_backend == "visionproteleop") and args.enable_neck:
-        if args.command_sink:
-            neck_disable_reason = (
-                "command-sink mode permits no motor DDS publisher"
-            )
-        else:
-            neck_disable_reason = (
-                "the minimal native PoC controls only AI Worker arms and HX5 hands"
-            )
+    if args.command_sink and args.enable_neck:
         logger_mp.warning(
-            "[teleop safety] disabling the neck controller because %s.",
-            neck_disable_reason,
+            "[teleop safety] disabling the neck controller because command-sink mode "
+            "permits no motor DDS publisher."
         )
         args.enable_neck = False
+    elif args.xr_backend == "visionproteleop" and args.enable_neck:
+        logger_mp.warning(
+            "[VisionProTeleop neck] explicit real-hardware neck tracking requested; "
+            "controller construction and head-driven commands remain gated until R."
+        )
     if args.command_sink and args.sim:
         logger_mp.warning(
             "[command sink] --sim is not the safety boundary for AI Worker; the in-memory sink is."
@@ -1667,6 +1827,7 @@ if __name__ == '__main__':
     screen_record_writer = None
     screen_record_path = None
     recorder = None
+    arm_trace_file = None
     sim_state_subscriber = None
     neck_ctrl = None
     neck_feedback = None
@@ -1681,10 +1842,40 @@ if __name__ == '__main__':
     loop_robot = None
     loop_camera = None
     native_hardware_armed = not native_production_gate
+    ai_worker_startup_home_done = False
     upper_body_estop = False
     exit_code = 0
 
     try:
+        if args.arm_trace_path:
+            arm_trace_path = os.path.abspath(os.path.expanduser(args.arm_trace_path))
+            arm_trace_parent = os.path.dirname(arm_trace_path)
+            if arm_trace_parent:
+                os.makedirs(arm_trace_parent, exist_ok=True)
+            arm_trace_file = open(
+                arm_trace_path,
+                "w",
+                encoding="utf-8",
+                buffering=1,
+            )
+            arm_trace_file.write(
+                json.dumps(
+                    {
+                        "type": "metadata",
+                        "schema": "xr_tele.ai_worker_arm_trace.v1",
+                        "xr_backend": args.xr_backend,
+                        "arm": args.arm,
+                        "ik_mode": args.ai_worker_ik_mode,
+                        "wrist_orientation_mode": args.ai_worker_wrist_orientation_mode,
+                        "frequency_hz": args.frequency,
+                        "simulation": args.sim,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            logger_mp.info("[teleop arm trace] writing JSONL=%s", arm_trace_path)
+
         # setup dds communication domains id
         if args.arm != "AI_WORKER":
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -1692,45 +1883,14 @@ if __name__ == '__main__':
                 ChannelFactoryInitialize(1, networkInterface=args.network_interface)
             else:
                 ChannelFactoryInitialize(0, networkInterface=args.network_interface)
-        if args.enable_neck:
-            if args.arm == "AI_WORKER":
-                neck_ctrl = AIWorkerNeckController(
-                    yaw_limit=args.neck_yaw_limit,
-                    pitch_limit=args.neck_pitch_limit,
-                    smoothing_alpha=args.neck_smoothing_alpha,
-                    max_step=args.neck_max_step,
-                    command_duration=args.ai_worker_command_duration,
-                    pitch_gain=args.neck_pitch_gain,
-                    pitch_invert=args.ai_worker_neck_pitch_invert,
-                )
-                logger_mp.info(
-                    "[teleop neck] AI Worker DDS enabled topic=%s joints=%s",
-                    "/leader/joystick_controller_left/joint_trajectory",
-                    ["head_joint1", "head_joint2"],
-                )
-            else:
-                neck_ctrl = VisionProNeckController(
-                    host=args.neck_host or args.img_server_ip,
-                    port=args.neck_port,
-                    yaw_limit=args.neck_yaw_limit,
-                    pitch_limit=args.neck_pitch_limit,
-                    smoothing_alpha=args.neck_smoothing_alpha,
-                    max_step=args.neck_max_step,
-                )
-                logger_mp.info(
-                    f"[teleop neck] enabled target={args.neck_host or args.img_server_ip}:{args.neck_port} "
-                    f"yaw_limit={args.neck_yaw_limit:.3f} pitch_limit={args.neck_pitch_limit:.3f} "
-                    f"alpha={args.neck_smoothing_alpha:.3f} max_step={args.neck_max_step:.3f}"
-                )
-            if args.arm != "AI_WORKER":
-                try:
-                    neck_feedback = NeckFeedbackReceiver(args.neck_feedback_port)
-                    logger_mp.info(
-                        f"[teleop neck feedback] listening udp=0.0.0.0:{args.neck_feedback_port}"
-                    )
-                except OSError as e:
-                    neck_feedback = None
-                    logger_mp.warning(f"[teleop neck feedback] disabled: {e}")
+        native_neck_deferred = bool(native_production_gate and args.enable_neck)
+        if args.enable_neck and not native_neck_deferred:
+            neck_ctrl, neck_feedback = _create_neck_control(args)
+        elif native_neck_deferred:
+            logger_mp.info(
+                "[VisionProTeleop neck] DDS controller deferred until fresh settled "
+                "tracking is explicitly enabled with R."
+            )
 
         if args.arm == "AI_WORKER" and not auto_command_sink:
             pedal_estop = PedalEstopReceiver(args.pedal_estop_host, args.pedal_estop_port)
@@ -1948,6 +2108,11 @@ if __name__ == '__main__':
         selected_zmq_port = selected_camera_config.get("zmq_port")
         webrtc_offer_url = f"https://{args.img_server_ip}:{selected_webrtc_port}/offer" if selected_webrtc_port else None
         selected_img_shape = tuple(selected_camera_config['image_shape'])
+        if args.xr_backend == "visionproteleop" and args.visionpro_video_width:
+            selected_img_shape = (
+                int(args.visionpro_video_height),
+                int(args.visionpro_video_width),
+            )
         if xr_need_local_img:
             if selected_camera_name == "head_and_wrist":
                 sample_bgr, head_sample, left_sample, right_sample = _get_head_and_wrist_bgr(img_client, args)
@@ -1966,7 +2131,24 @@ if __name__ == '__main__':
             )
             if sample_bgr is not None:
                 actual_img_shape = tuple(sample_bgr.shape[:2])
-                if actual_img_shape != selected_img_shape and not selected_composite_wrist:
+                if (
+                    actual_img_shape != selected_img_shape
+                    and args.xr_backend == "visionproteleop"
+                    and not args.visionpro_video_width
+                ):
+                    # RobotisDDSImageClient's configured shapes are only startup
+                    # hints.  In particular, composite views used to retain those
+                    # larger hints and upscale the already JPEG-compressed source,
+                    # which made the native video plane bigger but visibly softer.
+                    # With no explicit output override, encode the first real
+                    # composite dimensions exactly and avoid that extra resize.
+                    logger_mp.info(
+                        f"[teleop camera shape] camera_name={selected_camera_name} "
+                        f"configured_shape={selected_img_shape} actual_shape={actual_img_shape}; "
+                        "using native DDS composite shape without upscaling."
+                    )
+                    selected_img_shape = actual_img_shape
+                elif actual_img_shape != selected_img_shape and not selected_composite_wrist:
                     logger_mp.warning(
                         f"[teleop camera shape] camera_name={selected_camera_name} "
                         f"configured_shape={selected_img_shape} actual_shape={actual_img_shape}; "
@@ -1983,7 +2165,10 @@ if __name__ == '__main__':
             f"[teleop camera selected] requested_camera={args.camera} "
             f"selected_camera={selected_camera_name} selected_key={selected_camera_key} "
             f"all_mode_displays=head_only={args.camera == 'all'} "
-            f"left_wrist_vflip={args.left_wrist_camera_vflip} right_wrist_vflip={args.right_wrist_camera_vflip}"
+            f"layout={args.head_wrist_layout} "
+            f"left_wrist_vflip={args.left_wrist_camera_vflip} right_wrist_vflip={args.right_wrist_camera_vflip} "
+            f"wrist_rotation_cw=(L{args.left_wrist_camera_rotation},R{args.right_wrist_camera_rotation}) "
+            f"output_shape={selected_img_shape}"
         )
         for camera_name in ("head", "left_wrist", "right_wrist"):
             camera = camera_config[_camera_config_key(camera_name)]
@@ -2096,6 +2281,7 @@ if __name__ == '__main__':
                 max_wrist_rotation_jump_rad=np.deg2rad(args.visionpro_max_wrist_rotation_jump_deg),
                 max_wrist_velocity_m_s=args.visionpro_max_wrist_velocity,
                 max_wrist_angular_velocity_rad_s=args.visionpro_max_wrist_angular_velocity,
+                motion_rejection_enabled=args.visionpro_motion_rejection,
                 webrtc_port=args.visionpro_webrtc_port,
                 start_video=True,
                 streamer=synthetic_streamer,
@@ -2113,20 +2299,79 @@ if __name__ == '__main__':
         xr_enable_generation_applied = 0
         xr_ever_enabled = False
         visionpro_status_last = 0.0
+        operator_instructions_logged = False
+
+        if native_production_gate and args.visionpro_home_before_enable:
+            from teleop.robot_control.robotis_ai_worker import (
+                AIWorkerArmController,
+                AIWorkerArmIK,
+                AIWorkerVirtualLeaderIK,
+            )
+
+            arm_ik_class = (
+                AIWorkerVirtualLeaderIK
+                if args.ai_worker_ik_mode == "virtual-leader"
+                else AIWorkerArmIK
+            )
+            arm_ik = arm_ik_class(
+                urdf_path=args.ai_worker_urdf,
+                translation_scale=args.ai_worker_arm_scale,
+                wrist_orientation_mode=args.ai_worker_wrist_orientation_mode,
+                left_wrist_roll_offset_deg=args.ai_worker_left_wrist_roll_offset_deg,
+                right_wrist_roll_offset_deg=args.ai_worker_right_wrist_roll_offset_deg,
+            )
+            arm_ctrl = AIWorkerArmController(
+                command_duration=args.ai_worker_command_duration,
+                home_q=arm_ik.home_q,
+                ready_q=arm_ik.ready_q,
+            )
+            if not arm_ctrl.wait_for_joint_state(timeout=5.0):
+                raise RuntimeError(
+                    "AI Worker did not receive all 14 arm joints on /joint_states within 5 seconds; "
+                    "refusing the explicit pre-enable ready-pose motion."
+                )
+            logger_mp.warning(
+                "[VisionProTeleop arm startup] moving to the SG2 ready pose before R over %.2fs.",
+                args.ai_worker_home_duration,
+            )
+            ai_worker_startup_home_done = _smooth_arm_go_home(
+                arm_ctrl,
+                duration=args.ai_worker_home_duration,
+                velocity_cap=args.arm_shutdown_velocity,
+                phase="startup",
+                target_q=arm_ctrl.ready_q,
+            )
+            if not ai_worker_startup_home_done:
+                raise RuntimeError(
+                    "VisionProTeleop pre-enable ready-pose motion failed; refusing to continue to R."
+                )
 
         if native_production_gate:
-            # A production controller constructor opens a motor DDS transport.
-            # Keep every such object nonexistent until a *new* R press occurs
-            # after continuously fresh native tracking has settled.  Rejected R
-            # generations are consumed so recovery can never auto-arm later.
+            # Tracking-driven commands remain inhibited until a *new* R press
+            # after continuously fresh native tracking has settled.  The
+            # explicit --visionpro-home-before-enable exception may have opened
+            # only the arm transport for its one startup ready-pose trajectory.
             xr_enable_generation_applied = XR_ENABLE_GENERATION
             START = False
             READY = True
             prearm_status_last = 0.0
+            prearm_status_interval = (
+                1.0 / args.visionpro_status_rate
+                if args.visionpro_status_rate > 0.0
+                else None
+            )
+            _log_operator_instructions(
+                args.record,
+                args.screen_record,
+                bool(rh5dg2_tactile_heat_mappers),
+            )
+            operator_instructions_logged = True
             logger_mp.warning(
-                "[VisionProTeleop hardware gate] motor controllers are NOT constructed. "
+                "[VisionProTeleop hardware gate] tracking commands are inhibited; "
+                "controller_state=%s. "
                 "Wait for state=REANCHOR_REQUIRED and settling_complete=True with U released, "
-                "then press R once. Press Q or Ctrl+C to abort without motor cleanup commands."
+                "then press R once. Press Q or Ctrl+C to abort.",
+                "arm-ready-only" if arm_ctrl is not None else "absent",
             )
             while not STOP and not native_hardware_armed:
                 prearm_tick = time.monotonic()
@@ -2175,7 +2420,7 @@ if __name__ == '__main__':
                             START = True
                             logger_mp.warning(
                                 "[VisionProTeleop hardware gate] R accepted after fresh settled "
-                                "tracking; AI Worker arm/HX5 controller construction is now permitted."
+                                "tracking; tracking-driven arm/HX5 commands are now permitted."
                             )
                         else:
                             tv_wrapper.request_hold(
@@ -2202,12 +2447,15 @@ if __name__ == '__main__':
                         "[VisionProTeleop hardware gate camera]",
                     )
 
-                if prearm_tick - prearm_status_last >= 1.0:
+                if (
+                    prearm_status_interval is not None
+                    and prearm_tick - prearm_status_last >= prearm_status_interval
+                ):
                     prearm_status_last = prearm_tick
                     prearm_status = tv_wrapper.get_status()
                     logger_mp.info(
                         "[VisionProTeleop hardware gate] state=%s session_alive=%s "
-                        "settling_complete=%s fresh_ms=%s U_hold=%s motor_controllers=absent "
+                        "settling_complete=%s fresh_ms=%s U_hold=%s controller_state=%s "
                         "camera=(head=%s,left=%s,right=%s)",
                         prearm_status.get("state"),
                         prearm_status.get("session_alive"),
@@ -2220,6 +2468,7 @@ if __name__ == '__main__':
                             else f"{prearm_status.get('sample_age_s') * 1000.0:.1f}"
                         ),
                         upper_body_estop,
+                        "arm-ready-only" if arm_ctrl is not None else "absent",
                         _frame_debug(prearm_head),
                         _frame_debug(prearm_left),
                         _frame_debug(prearm_right),
@@ -2229,6 +2478,16 @@ if __name__ == '__main__':
 
             if not native_hardware_armed:
                 raise KeyboardInterrupt
+
+        if native_neck_deferred:
+            if not native_hardware_armed:
+                raise RuntimeError(
+                    "VisionProTeleop neck gate invariant failed before DDS construction."
+                )
+            neck_ctrl, neck_feedback = _create_neck_control(args)
+            logger_mp.warning(
+                "[VisionProTeleop neck] R accepted; head-driven AI Worker neck commands are enabled."
+            )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.arm == "AI_WORKER":
@@ -2288,13 +2547,14 @@ if __name__ == '__main__':
                 if args.ai_worker_ik_mode == "virtual-leader"
                 else AIWorkerArmIK
             )
-            arm_ik = arm_ik_class(
-                urdf_path=args.ai_worker_urdf,
-                translation_scale=args.ai_worker_arm_scale,
-                wrist_orientation_mode=args.ai_worker_wrist_orientation_mode,
-                left_wrist_roll_offset_deg=args.ai_worker_left_wrist_roll_offset_deg,
-                right_wrist_roll_offset_deg=args.ai_worker_right_wrist_roll_offset_deg,
-            )
+            if arm_ik is None:
+                arm_ik = arm_ik_class(
+                    urdf_path=args.ai_worker_urdf,
+                    translation_scale=args.ai_worker_arm_scale,
+                    wrist_orientation_mode=args.ai_worker_wrist_orientation_mode,
+                    left_wrist_roll_offset_deg=args.ai_worker_left_wrist_roll_offset_deg,
+                    right_wrist_roll_offset_deg=args.ai_worker_right_wrist_roll_offset_deg,
+                )
             logger_mp.info(
                 "[teleop arm IK] AI Worker mode=%s solver=%s",
                 args.ai_worker_ik_mode,
@@ -2322,11 +2582,12 @@ if __name__ == '__main__':
                     raise RuntimeError(
                         "VisionProTeleop hardware gate invariant failed before AI Worker arm construction."
                     )
-                arm_ctrl = AIWorkerArmController(
-                    command_duration=args.ai_worker_command_duration,
-                    home_q=arm_ik.home_q,
-                    ready_q=arm_ik.ready_q,
-                )
+                if arm_ctrl is None:
+                    arm_ctrl = AIWorkerArmController(
+                        command_duration=args.ai_worker_command_duration,
+                        home_q=arm_ik.home_q,
+                        ready_q=arm_ik.ready_q,
+                    )
             if not arm_ctrl.wait_for_joint_state(timeout=5.0):
                 raise RuntimeError(
                     "AI Worker did not receive all 14 arm joints on /joint_states within 5 seconds; "
@@ -2340,7 +2601,7 @@ if __name__ == '__main__':
                 args.ai_worker_home_on_start,
                 args.ai_worker_home_duration,
             )
-            if args.ai_worker_home_on_start:
+            if args.ai_worker_home_on_start and not ai_worker_startup_home_done:
                 if not _smooth_arm_go_home(
                     arm_ctrl,
                     duration=args.ai_worker_home_duration,
@@ -2692,6 +2953,11 @@ if __name__ == '__main__':
             recording_metadata = {
                 "schema_extensions": {
                     "timestamps": "per-frame host/source nanoseconds; absent in older episodes",
+                    "arm_trace": (
+                        "states.teleop_trace stores raw/IK wrist poses, the raw IK "
+                        "solution, the post-startup-clamp request, and the velocity-limited "
+                        "transport command for deterministic IK comparison"
+                    ),
                 },
                 "robot": {
                     "arm": args.arm,
@@ -2827,18 +3093,12 @@ if __name__ == '__main__':
             loop_camera.connect()
             logger_mp.info(f"[loop] streaming robot state + cameras to Config Loop at {args.loop_addr}")
 
-        logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
-        if args.record:
-            logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
-        elif args.screen_record:
-            logger_mp.info("🟡  Press [s] to START or STOP head camera screen recording.")
-        else:
-            logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
-        if rh5dg2_tactile_heat_mappers:
-            logger_mp.info("🟣  Press [t] to SHOW or HIDE the RH5DG2 tactile VR overlay.")
-        logger_mp.info("🔴  Press [q] to stop and exit the program.")
-        logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+        if not operator_instructions_logged:
+            _log_operator_instructions(
+                args.record,
+                args.screen_record,
+                bool(rh5dg2_tactile_heat_mappers),
+            )
         READY = True                  # now ready to (1) enter START state
         logger_mp.info(f"[teleop ready state] READY={READY} START={START} STOP={STOP} disable_arm={args.disable_arm}")
         while not START and not STOP: # wait for start or stop signal.
@@ -3007,6 +3267,9 @@ if __name__ == '__main__':
             control_tick_time_ns = time.time_ns()
             neck_record = None
             arm_command_time_ns = None
+            arm_command_published = False
+            raw_ik_sol_q = None
+            sent_arm_q = None
             left_wrist_bgr = None
             right_wrist_bgr = None
             # get image ( --loop also needs frames every tick, independent of record )
@@ -3419,7 +3682,7 @@ if __name__ == '__main__':
                         if waist_command is not None:
                             waist_actual = arm_ctrl.get_waist_yaw_relative_position()
                             waist_error = waist_command - waist_actual
-                        logger_mp.debug(
+                        logger_mp.info(
                             f"[teleop neck] raw_head={np.round(neck_measured, 4).tolist()} "
                             f"target={np.round(neck_target, 4).tolist()} "
                             f"command={np.round(neck_command, 4).tolist()} "
@@ -3462,6 +3725,14 @@ if __name__ == '__main__':
 
             left_wrist_pose = tele_data.left_wrist_pose
             right_wrist_pose = tele_data.right_wrist_pose
+            raw_left_wrist_pose = np.asarray(
+                left_wrist_pose,
+                dtype=np.float64,
+            ).copy()
+            raw_right_wrist_pose = np.asarray(
+                right_wrist_pose,
+                dtype=np.float64,
+            ).copy()
             if (
                 args.arm_max_frame_jump > 0.0
                 and raw_arm_tracking_ready
@@ -3696,6 +3967,7 @@ if __name__ == '__main__':
                         f"right_wrist={_fmt_pose_debug(right_wrist_pose)}"
                     )
                 sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist_pose, right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+                raw_ik_sol_q = np.asarray(sol_q, dtype=np.float64).copy()
                 time_ik_end = time.time()
                 logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
                 if loop_count % 50 == 0:
@@ -3750,6 +4022,14 @@ if __name__ == '__main__':
                     )
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
                 arm_command_time_ns = time.time_ns()
+                arm_command_published = True
+                if hasattr(arm_ctrl, "get_last_commanded_dual_arm_q"):
+                    sent_arm_q = np.asarray(
+                        arm_ctrl.get_last_commanded_dual_arm_q(),
+                        dtype=np.float64,
+                    ).copy()
+                else:
+                    sent_arm_q = np.asarray(sol_q, dtype=np.float64).copy()
                 if loop_count % 50 == 0:
                     arm_write_ok = arm_ctrl.get_last_write_ok() if hasattr(arm_ctrl, "get_last_write_ok") else None
                     logger_mp.debug(
@@ -3763,6 +4043,71 @@ if __name__ == '__main__':
                         "[VisionProTeleop arm hold] command publish inhibited because "
                         "the velocity limiter could not sync to measured pose."
                     )
+
+            teleop_trace = {
+                "raw_left_wrist_pose": raw_left_wrist_pose.tolist(),
+                "raw_right_wrist_pose": raw_right_wrist_pose.tolist(),
+                "ik_left_wrist_pose": np.asarray(
+                    left_wrist_pose,
+                    dtype=np.float64,
+                ).tolist(),
+                "ik_right_wrist_pose": np.asarray(
+                    right_wrist_pose,
+                    dtype=np.float64,
+                ).tolist(),
+                "measured_arm_qpos": np.asarray(
+                    current_lr_arm_q,
+                    dtype=np.float64,
+                ).tolist(),
+                "measured_arm_qvel": np.asarray(
+                    current_lr_arm_dq,
+                    dtype=np.float64,
+                ).tolist(),
+                "raw_ik_qpos": (
+                    raw_ik_sol_q.tolist()
+                    if raw_ik_sol_q is not None
+                    else np.asarray(sol_q, dtype=np.float64).tolist()
+                ),
+                "published_request_qpos": np.asarray(
+                    sol_q,
+                    dtype=np.float64,
+                ).tolist(),
+                "sent_arm_qpos": (
+                    sent_arm_q.tolist()
+                    if sent_arm_q is not None
+                    else []
+                ),
+                "arm_command_published": arm_command_published,
+                "arm_fsm": arm_fsm,
+                "tracking_active": bool(
+                    getattr(tele_data, "tracking_active", True)
+                ),
+                "head_pose_is_valid": bool(
+                    getattr(tele_data, "head_pose_is_valid", True)
+                ),
+                "left_arm_is_valid": bool(
+                    getattr(tele_data, "left_arm_is_valid", True)
+                ),
+                "right_arm_is_valid": bool(
+                    getattr(tele_data, "right_arm_is_valid", True)
+                ),
+            }
+            if arm_trace_file is not None:
+                arm_trace_file.write(
+                    json.dumps(
+                        {
+                            "type": "frame",
+                            "frame": loop_count,
+                            "control_tick_time_ns": control_tick_time_ns,
+                            "tracking_sample_time_ns": tracking_sample_time_ns,
+                            "robot_state_time_ns": robot_state_time_ns,
+                            "arm_command_time_ns": arm_command_time_ns,
+                            **teleop_trace,
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
 
             # stream robot state to Config Loop (non-blocking; never breaks teleop)
             if loop_robot is not None:
@@ -3941,7 +4286,8 @@ if __name__ == '__main__':
                         }, 
                         "body": {
                             "qpos": current_body_state,
-                        }, 
+                        },
+                        "teleop_trace": teleop_trace,
                     }
                     actions = {
                         "left_arm": {                                   
@@ -4035,6 +4381,13 @@ if __name__ == '__main__':
                 recorder = None
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+
+        try:
+            if arm_trace_file is not None:
+                arm_trace_file.close()
+                arm_trace_file = None
+        except Exception as e:
+            logger_mp.error(f"Failed to close arm trace: {e}")
 
         try:
             if neck_ctrl is not None:

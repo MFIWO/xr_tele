@@ -127,6 +127,29 @@ class AIWorkerEpisodeTest(unittest.TestCase):
                         [_frame()],
                     )
 
+    def test_preflight_arm_only_accepts_disabled_hand_metadata(self):
+        frame = _frame()
+        del frame["actions"]["left_ee"]
+        del frame["actions"]["right_ee"]
+
+        validated = preflight_ai_worker_episode(
+            _info(end_effector=None),
+            [frame],
+            replay_hand=False,
+        )
+
+        self.assertIsNotNone(validated[0].arm_action)
+        self.assertIsNone(validated[0].hand_action)
+
+    def test_preflight_hand_replay_still_requires_hx5_metadata(self):
+        with self.assertRaisesRegex(ValueError, "end_effector=hx5_d20"):
+            preflight_ai_worker_episode(
+                _info(end_effector=None),
+                [_frame()],
+                replay_arm=False,
+                replay_hand=True,
+            )
+
     def test_preflight_metadata_override_does_not_relax_action_validation(self):
         frame = _frame()
         del frame["actions"]["left_arm"]

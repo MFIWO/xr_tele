@@ -128,17 +128,25 @@ def load_episode(path: str | Path) -> tuple[float, list[dict[str, Any]], Path, d
     return _validated_fps(info), frames, episode_path, info
 
 
-def _require_metadata(info: dict[str, Any], allow_metadata_mismatch: bool) -> None:
+def _require_metadata(
+    info: dict[str, Any],
+    allow_metadata_mismatch: bool,
+    *,
+    replay_hand: bool,
+) -> None:
     if allow_metadata_mismatch:
         return
     recording = info.get("recording") or {}
     robot = (recording.get("robot") or {}) if isinstance(recording, dict) else {}
     arm = robot.get("arm") if isinstance(robot, dict) else None
     end_effector = robot.get("end_effector") if isinstance(robot, dict) else None
-    if str(arm).strip().upper() != "AI_WORKER" or str(end_effector).strip().lower() != "hx5_d20":
+    arm_matches = str(arm).strip().upper() == "AI_WORKER"
+    hand_matches = str(end_effector).strip().lower() == "hx5_d20"
+    if not arm_matches or (replay_hand and not hand_matches):
+        expected_end_effector = " and recording.robot.end_effector=hx5_d20" if replay_hand else ""
         raise ValueError(
-            "episode metadata must identify recording.robot.arm=AI_WORKER and "
-            "recording.robot.end_effector=hx5_d20; pass allow_metadata_mismatch=True "
+            "episode metadata must identify recording.robot.arm=AI_WORKER"
+            f"{expected_end_effector}; pass allow_metadata_mismatch=True "
             "only for a manually verified legacy episode "
             f"(got arm={arm!r}, end_effector={end_effector!r})"
         )
@@ -236,7 +244,11 @@ def preflight_ai_worker_episode(
         raise ValueError("episode contains no frames")
 
     _validated_fps(info)
-    _require_metadata(info, allow_metadata_mismatch)
+    _require_metadata(
+        info,
+        allow_metadata_mismatch,
+        replay_hand=replay_hand,
+    )
 
     validated: list[AIWorkerReplayFrame] = []
     arm_lower = np.asarray(AI_WORKER_ARM_LOWER, dtype=np.float64).reshape(14)

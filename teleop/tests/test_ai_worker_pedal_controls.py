@@ -1,10 +1,12 @@
 import socket
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
 from teleop.ai_worker_pedal_teleop import (
-    KEY_O, KEY_P, KEY_U, PedalAuxState, motion_is_allowed,
-    TeleopSafetyReceiver,
+    CONTROL_KEY_CODES, KEY_O, KEY_P, KEY_U, PedalAuxState,
+    discover_system_keyboards, motion_is_allowed, TeleopSafetyReceiver,
 )
 from teleop.robot_control.robotis_ai_worker_lift import AIWorkerLiftController
 from teleop.teleop_hand_and_arm import (
@@ -31,6 +33,26 @@ def make_lift(position=-0.25):
 
 
 class AIWorkerPedalControlsTest(unittest.TestCase):
+    def test_discovers_full_system_keyboard_and_ignores_limited_device(self):
+        key_bitmap = sum(1 << code for code in CONTROL_KEY_CODES)
+        proc_text = f'''I: Bus=0003 Vendor=0001 Product=0001 Version=0001
+N: Name="USB Keyboard"
+H: Handlers=sysrq kbd event7
+B: KEY={key_bitmap:x}
+
+I: Bus=0019 Vendor=0000 Product=0001 Version=0000
+N: Name="Power Button"
+H: Handlers=kbd event0
+B: KEY=10000000000000 0
+'''
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_devices = Path(temp_dir) / "devices"
+            proc_devices.write_text(proc_text, encoding="utf-8")
+            self.assertEqual(
+                discover_system_keyboards(proc_devices),
+                ["/dev/input/event7"],
+            )
+
     def test_aux_keys_drive_lift_and_toggle_estop_once_per_key_down(self):
         state = PedalAuxState()
         state.update("pedal", KEY_O, 1)

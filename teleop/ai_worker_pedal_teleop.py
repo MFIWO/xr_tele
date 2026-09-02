@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive the AI Worker base from PCsensor USB pedal key press/release events."""
+"""Drive the AI Worker base/lift from a PCsensor pedal or system keyboard."""
 
 import argparse
 import math
@@ -23,6 +23,7 @@ KEY_TO_MOTION = {
 KEY_O = 24
 KEY_P = 25
 KEY_U = 22
+CONTROL_KEY_CODES = set(KEY_TO_MOTION) | {KEY_O, KEY_P, KEY_U}
 INPUT_EVENT = struct.Struct("@llHHI")
 
 
@@ -39,6 +40,33 @@ def discover_pedal_keyboards(proc_devices="/proc/bus/input/devices"):
             for handler in line.split("=", 1)[1].split():
                 if handler.startswith("event"):
                     devices.append(f"/dev/input/{handler}")
+    return sorted(set(devices))
+
+
+def discover_system_keyboards(proc_devices="/proc/bus/input/devices"):
+    """Return non-pedal keyboard event devices that provide all control keys."""
+    text = Path(proc_devices).read_text(encoding="utf-8", errors="replace")
+    devices = []
+    for block in text.split("\n\n"):
+        if 'N: Name="PCsensor FootSwitch Keyboard"' in block:
+            continue
+        handlers = []
+        key_bits = None
+        for line in block.splitlines():
+            if line.startswith("H: Handlers="):
+                handlers = line.split("=", 1)[1].split()
+            elif line.startswith("B: KEY="):
+                try:
+                    key_bits = int("".join(line.split("=", 1)[1].split()), 16)
+                except ValueError:
+                    key_bits = None
+        if "kbd" not in handlers or key_bits is None:
+            continue
+        if not all(key_bits & (1 << code) for code in CONTROL_KEY_CODES):
+            continue
+        devices.extend(
+            f"/dev/input/{item}" for item in handlers if item.startswith("event")
+        )
     return sorted(set(devices))
 
 
@@ -188,7 +216,15 @@ class CmdVelPublisher:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Publish /cmd_vel only while a PCsensor foot pedal is physically held."
+        description="Control the AI Worker base/lift from a PCsensor pedal or system keyboard."
+    )
+    parser.add_argument(
+        "--keyboard",
+        action="store_true",
+        help=(
+            "Read W/A/S/D, O/P, and U from an auto-detected system keyboard "
+            "instead of a PCsensor pedal."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -221,12 +257,27 @@ def parse_args():
 
 def main():
     args = parse_args()
-    devices = args.device or discover_pedal_keyboards()
+    if args.keyboard and args.device:
+        raise ValueError("--keyboard cannot be combined with --device")
+    devices = (
+        discover_system_keyboards()
+        if args.keyboard
+        else (args.device or discover_pedal_keyboards())
+    )
     if args.list_devices:
         print("\n".join(devices))
         return 0
     if not devices:
-        raise RuntimeError("No PCsensor FootSwitch keyboard event devices were found.")
+        if args.keyboard:
+            raise RuntimeError(
+                "No system keyboard event devices were found. "
+                "Use --device /dev/input/eventN to select one explicitly."
+            )
+        else:
+            raise RuntimeError(
+                "No PCsensor FootSwitch keyboard event devices were found. "
+                "Use --keyboard for system keyboard control."
+            )
     if not math.isfinite(args.publish_rate) or args.publish_rate <= 0.0:
         raise ValueError("--publish-rate must be finite and greater than zero")
     if not math.isfinite(args.lift_speed) or args.lift_speed < 0.0:
@@ -275,7 +326,10 @@ def main():
     next_publish = time.monotonic()
     last_displayed = object()
 
-    print(f"Pedal devices: {', '.join(devices)}")
+    if args.keyboard:
+        print(f"Keyboard devices: {', '.join(devices)}")
+    else:
+        print(f"Pedal devices: {', '.join(devices)}")
     print(
         "W=forward, S=backward, A=counter-clockwise, D=clockwise; "
         "O=lift up, P=lift down, U=toggle latched upper-body E-stop; release=stop. Ctrl+C exits."
@@ -335,13 +389,14 @@ def main():
                 last_displayed = display_state
 
             now = time.monotonic()
-            if publisher is not None and now >= next_publish:
-                publisher.publish(motion)
-                if not motion_allowed or aux.lift_direction == 0:
-                    lift.hold()
-                else:
-                    lift.nudge(aux.lift_direction, args.lift_speed * period)
-                estop_notifier.publish(aux.estop)
+            if now >= next_publish:
+                if publisher is not None:
+                    publisher.publish(motion)
+                    if not motion_allowed or aux.lift_direction == 0:
+                        lift.hold()
+                    else:
+                        lift.nudge(aux.lift_direction, args.lift_speed * period)
+                    estop_notifier.publish(aux.estop)
                 next_publish = now + period
     except KeyboardInterrupt:
         pass
