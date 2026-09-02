@@ -3,4 +3,3 @@ rerun-sdk==0.20.1
 meshcat==0.3.2
 sshkeyboard==2.3.1
 pyserial==3.5
-loop-sdk    # optional, only needed for --loop streaming to Config Loop

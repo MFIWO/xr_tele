@@ -1203,11 +1203,18 @@ class RH5DG2_Controller_DFX:
         restore_settle_s=0.75,
         curl_scale=1.0,
         index_curl_scale=1.0,
+        middle_curl_scale=1.0,
+        ring_curl_scale=1.0,
+        little_curl_scale=1.0,
+        thumb_curl_scale=1.0,
+        thumb_curl_threshold=0.15,
         enable_thumb=False,
         thumb_source="raw",
         thumb10_scale=0.3,
         thumb11_scale=1.0,
         thumb12_scale=1.0,
+        right_thumb_close_gain=1.0,
+        lock_spread_joints=True,
         retarget_mode=None,
     ):
         logger_mp.info("Initialize RH5DG2_Controller_DFX...")
@@ -1234,7 +1241,12 @@ class RH5DG2_Controller_DFX:
         self.curl_scale = float(np.clip(curl_scale, 0.0, 10.0))
         self.finger_curl_scales = {
             "index": float(np.clip(index_curl_scale, 0.0, 10.0)),
+            "middle": float(np.clip(middle_curl_scale, 0.0, 10.0)),
+            "ring": float(np.clip(ring_curl_scale, 0.0, 10.0)),
+            "little": float(np.clip(little_curl_scale, 0.0, 10.0)),
+            "thumb": float(np.clip(thumb_curl_scale, 0.0, 10.0)),
         }
+        self.thumb_curl_threshold = float(np.clip(thumb_curl_threshold, 0.0, 0.95))
         self.enable_thumb = bool(enable_thumb)
         self.thumb_source = str(thumb_source or "raw").strip().lower()
         if self.thumb_source not in ("raw", "curl"):
@@ -1245,6 +1257,8 @@ class RH5DG2_Controller_DFX:
             11: float(np.clip(thumb11_scale, 0.0, 10.0)),
             12: float(np.clip(thumb12_scale, 0.0, 10.0)),
         }
+        self.right_thumb_close_gain = float(np.clip(right_thumb_close_gain, 0.0, 10.0))
+        self.lock_spread_joints = bool(lock_spread_joints)
         self.pitch_only = bool(pitch_only)
         if self.pitch_only:
             enabled_indices = RH5DG2_RAW_PITCH_INDICES
@@ -1290,16 +1304,19 @@ class RH5DG2_Controller_DFX:
             logger_mp.warning("safe_abs_max: %s", np.round(RH5DG2_SAFE_ABS_MAX, 4).tolist())
             logger_mp.warning("raw_close_direction: %.1f", self.raw_close_direction)
             logger_mp.warning("safe_active_hand: %s", self.safe_active_hand)
+            logger_mp.warning("lock_spread_joints: %s", self.lock_spread_joints)
             logger_mp.warning(
-                "enable_thumb: %s thumb_source: %s thumb_scales: %s",
+                "enable_thumb: %s thumb_source: %s thumb_scales: %s right_thumb_close_gain: %.3f",
                 self.enable_thumb,
                 self.thumb_source,
                 self.thumb_scales,
+                self.right_thumb_close_gain,
             )
             logger_mp.warning(
-                "curl_scale: %.3f index_curl_scale: %.3f",
+                "curl_scale: %.3f finger_curl_scales: %s thumb_curl_threshold: %.3f",
                 self.curl_scale,
-                self.finger_curl_scales["index"],
+                self.finger_curl_scales,
+                self.thumb_curl_threshold,
             )
             logger_mp.warning(
                 "restore: repeat=%s interval_s=%.3f settle_s=%.3f",
@@ -1341,6 +1358,10 @@ class RH5DG2_Controller_DFX:
             if wait_count > 500:
                 logger_mp.warning("[RH5DG2_Controller_DFX] Timeout waiting for initial hand states. Proceeding anyway.")
                 break
+        # Raw command override, used by the policy-inference path: [enabled, left*N, right*N].
+        # A trained policy predicts the same raw angleSet values this loop publishes, so it
+        # must bypass landmark retargeting and the safe-mode postprocessing applied after it.
+        self.raw_command_array = Array("d", 1 + 2 * RH5DG2_Num_Motors, lock=True)
         logger_mp.info("[RH5DG2_Controller_DFX] Initial hand states received or timeout.")
         self._capture_initial_pose()
 
@@ -1362,6 +1383,39 @@ class RH5DG2_Controller_DFX:
         self._hand_control_thread.start()
 
         logger_mp.info("Initialize RH5DG2_Controller_DFX OK!")
+
+    def set_raw_command(self, left_cmd, right_cmd):
+        """Publish these raw angleSet values instead of the retargeted command.
+
+        Both arrays are RH5DG2_Num_Motors long, in raw motor units. Stays in effect until
+        clear_raw_command(); the control loop keeps its own rate and DDS publisher, so this
+        only replaces where the numbers come from.
+        """
+        left = np.asarray(left_cmd, dtype=np.float64).reshape(-1)
+        right = np.asarray(right_cmd, dtype=np.float64).reshape(-1)
+        if left.size != RH5DG2_Num_Motors or right.size != RH5DG2_Num_Motors:
+            raise ValueError(
+                f"raw command needs {RH5DG2_Num_Motors} values per hand, got {left.size}/{right.size}"
+            )
+        if not np.isfinite(left).all() or not np.isfinite(right).all():
+            raise ValueError("raw command contains non-finite values")
+        with self.raw_command_array.get_lock():
+            self.raw_command_array[0] = 1.0
+            self.raw_command_array[1:1 + RH5DG2_Num_Motors] = left
+            self.raw_command_array[1 + RH5DG2_Num_Motors:] = right
+
+    def clear_raw_command(self):
+        """Hand control back to the landmark retargeting path."""
+        with self.raw_command_array.get_lock():
+            self.raw_command_array[0] = 0.0
+
+    def _read_raw_command(self):
+        with self.raw_command_array.get_lock():
+            if self.raw_command_array[0] < 0.5:
+                return None, None
+            left = np.array(self.raw_command_array[1:1 + RH5DG2_Num_Motors], dtype=np.float64)
+            right = np.array(self.raw_command_array[1 + RH5DG2_Num_Motors:], dtype=np.float64)
+        return left, right
 
     def _debug_print(self, *args, **kwargs):
         if self.simulation_mode:
@@ -1557,18 +1611,6 @@ class RH5DG2_Controller_DFX:
             self._last_left_command = left_q_target.copy()
         if self._valid_restore_pose(right_q_target, right_active_mask):
             self._last_right_command = right_q_target.copy()
-        if not hasattr(self, "_publish_debug_count"):
-            self._publish_debug_count = 0
-        self._publish_debug_count += 1
-        if self.simulation_mode:
-            should_debug = (
-                self._publish_debug_count <= 5
-                or (self.log_throttle_s > 0 and publish_start - self._last_debug_ts >= self.log_throttle_s)
-            )
-        else:
-            real_log_interval = max(self.log_throttle_s, 2.0)
-            should_debug = self.log_throttle_s > 0 and publish_start - self._last_debug_ts >= real_log_interval
-        should_debug = should_debug and self._hand_input_ready_for_debug
         write_ok = self.HandCmd_publisher.Write(self.hand_msg)
         publish_done = time.time()
         publish_latency_ms = (publish_done - publish_start) * 1000.0
@@ -1578,56 +1620,6 @@ class RH5DG2_Controller_DFX:
                 f"write_ok={write_ok} topic={kTopicRH5DG2DFXCommand} domain={self.dds_domain_id} "
                 f"{_publisher_debug_status(self.HandCmd_publisher)}"
             )
-        if should_debug:
-            payload = np.asarray([cmd.q for cmd in self.hand_msg.cmds], dtype=np.float64)
-            right_active_indices = _cmd_active_indices(self.hand_msg.cmds, 0, RH5DG2_Num_Motors)
-            left_active_indices = _cmd_active_indices(self.hand_msg.cmds, RH5DG2_Num_Motors, RH5DG2_Num_Motors)
-            left_enabled_indices = self._safe_enabled_indices_for_side("left")
-            right_enabled_indices = self._safe_enabled_indices_for_side("right")
-            left_fields = _fmt_motor_fields_for_indices(self.hand_msg.cmds, left_active_indices, RH5DG2_Num_Motors)
-            right_fields = _fmt_motor_fields_for_indices(self.hand_msg.cmds, right_active_indices, 0)
-            if self.simulation_mode:
-                self._debug_print(
-                    f"[RH5DG2 teleop publish payload] topic={kTopicRH5DG2DFXCommand} domain={self.dds_domain_id} "
-                    f"write_ok={write_ok} "
-                    f"{_publisher_debug_status(self.HandCmd_publisher)} "
-                    f"safe_active_hand={self.safe_active_hand if self.safe_mode else 'all'} "
-                    f"left_enabled={left_enabled_indices} "
-                    f"right_enabled={right_enabled_indices} "
-                    f"len={payload.size} finite={np.isfinite(payload).all()} "
-                    f"min={payload.min():.4f} max={payload.max():.4f} "
-                    f"right0_12={np.round(payload[:RH5DG2_Num_Motors], 4).tolist()} "
-                    f"left13_25={np.round(payload[RH5DG2_Num_Motors:], 4).tolist()} "
-                    f"right_active={right_active_indices} "
-                    f"left_active={left_active_indices} "
-                    f"right_active_mask_requested={np.where(right_active_mask)[0].tolist()} "
-                    f"left_active_mask_requested={np.where(left_active_mask)[0].tolist()} "
-                    f"right_fields={right_fields} "
-                    f"left_fields={left_fields} "
-                    f"left={_fmt_debug(left_q_target)} right={_fmt_debug(right_q_target)} "
-                    f"left_fingers={_finger_command_values(left_q_target)} "
-                    f"right_fingers={_finger_command_values(right_q_target)}"
-                )
-                debug_field_count = RH5DG2_Num_Motors if self.safe_mode else 5
-                self._debug_print(f"[RH5DG2 teleop publish fields right] {_fmt_motor_fields(self.hand_msg.cmds, 0, debug_field_count)}")
-                self._debug_print(f"[RH5DG2 teleop publish fields left] {_fmt_motor_fields(self.hand_msg.cmds, RH5DG2_Num_Motors, debug_field_count)}")
-            else:
-                self._debug_print(
-                    f"[RH5DG2 teleop publish] topic={kTopicRH5DG2DFXCommand} domain={self.dds_domain_id} "
-                    f"write_ok={write_ok} len={payload.size} finite={np.isfinite(payload).all()} "
-                    f"safe_active_hand={self.safe_active_hand if self.safe_mode else 'all'} "
-                    f"left_enabled={left_enabled_indices} right_enabled={right_enabled_indices} "
-                    f"right_active={right_active_indices} left_active={left_active_indices} "
-                    f"right_fields={right_fields} "
-                    f"left_fields={left_fields} "
-                    f"blocked_print_count={getattr(self, '_blocked_print_count', 0)}"
-                )
-            self._debug_print(
-                f"[RH5DG2 publish hz] hz={_rate_hz(self._publish_debug_count, self._publish_rate_start_ts):.2f} "
-                f"count={self._publish_debug_count}"
-            )
-            self._debug_print(f"[RH5DG2 publish latency ms] latency_ms={publish_latency_ms:.3f}")
-            self._last_debug_ts = publish_start
         return publish_done, write_ok, publish_latency_ms
 
     def _postprocess_real_safe_command(
@@ -1673,6 +1665,12 @@ class RH5DG2_Controller_DFX:
             semantic_idx = RH5DG2_SAFE_RAW_FROM_NORMALIZED.get(raw_idx)
             if semantic_idx is None:
                 if raw_idx not in RH5DG2_RAW_SPREAD_INDICES:
+                    continue
+                if self.lock_spread_joints:
+                    after_clamp[raw_idx] = baseline[raw_idx]
+                    before_gain[raw_idx] = baseline[raw_idx]
+                    after_gain[raw_idx] = baseline[raw_idx]
+                    active_mask[raw_idx] = True
                     continue
                 limit = float(RH5DG2_SAFE_DELTA_LIMIT.get(raw_idx, 0.0))
                 direction = float(RH5DG2_SAFE_SPREAD_DIRECTION.get(raw_idx, 1.0))
@@ -1722,7 +1720,15 @@ class RH5DG2_Controller_DFX:
 
         if self.enable_thumb:
             thumb_score = debug["curl_debug"]["scores"].get("thumb", {})
-            thumb_landmark_curl = float(np.clip(thumb_score.get("curl", 0.0), 0.0, 1.0))
+            thumb_landmark_curl_raw = float(np.clip(thumb_score.get("curl", 0.0), 0.0, 1.0))
+            thumb_landmark_curl = float(
+                np.clip(
+                    (thumb_landmark_curl_raw - self.thumb_curl_threshold)
+                    / max(1.0 - self.thumb_curl_threshold, 1e-6),
+                    0.0,
+                    1.0,
+                )
+            )
             thumb_raw_named = _thumb_raw_values(raw_q, joint_names, side)
             thumb_raw_close_ratio = float(
                 np.clip(
@@ -1734,7 +1740,9 @@ class RH5DG2_Controller_DFX:
                     1.0,
                 )
             )
-            thumb_close_ratio = thumb_raw_close_ratio if self.thumb_source == "raw" else thumb_landmark_curl
+            thumb_close_ratio_base = thumb_raw_close_ratio if self.thumb_source == "raw" else thumb_landmark_curl
+            thumb_close_gain = self.right_thumb_close_gain if side == "right" else 1.0
+            thumb_close_ratio = float(np.clip(thumb_close_ratio_base * thumb_close_gain, 0.0, 1.0))
             thumb_targets = {}
             thumb_current = {}
             thumb_limits = {}
@@ -1761,7 +1769,11 @@ class RH5DG2_Controller_DFX:
             thumb_debug = {
                 "thumb_source": self.thumb_source,
                 "thumb_close_ratio": thumb_close_ratio,
+                "thumb_close_ratio_base": thumb_close_ratio_base,
+                "thumb_close_gain": thumb_close_gain,
                 "thumb_curl": thumb_landmark_curl,
+                "thumb_curl_raw": thumb_landmark_curl_raw,
+                "thumb_curl_threshold": self.thumb_curl_threshold,
                 "thumb_raw_close_ratio": thumb_raw_close_ratio,
                 "thumb_raw_named": thumb_raw_named,
                 "current": thumb_current,
@@ -1792,6 +1804,7 @@ class RH5DG2_Controller_DFX:
             "spread_debug": {
                 "score": spread_score,
                 "centered": spread_centered,
+                "locked": self.lock_spread_joints,
                 "direction": RH5DG2_SAFE_SPREAD_DIRECTION,
                 "active_indices": [
                     int(idx)
@@ -1806,7 +1819,7 @@ class RH5DG2_Controller_DFX:
         debug_attr = f"_last_safe_target_debug_{side}"
         last_debug = getattr(self, debug_attr, 0.0)
         safe_debug_interval = 1.0 if self.simulation_mode else 2.0
-        should_safe_debug = should_debug or now - last_debug >= safe_debug_interval
+        should_safe_debug = self.log_throttle_s > 0 and (should_debug or now - last_debug >= safe_debug_interval)
         if should_safe_debug:
             setattr(self, debug_attr, now)
             self._debug_print(
@@ -1849,7 +1862,11 @@ class RH5DG2_Controller_DFX:
                         "[RH5DG2 safe thumb detail] "
                         f"thumb_source={thumb_debug['thumb_source']} "
                         f"thumb_close_ratio={thumb_debug['thumb_close_ratio']:.4f} "
+                        f"thumb_close_ratio_base={thumb_debug['thumb_close_ratio_base']:.4f} "
+                        f"thumb_close_gain={thumb_debug['thumb_close_gain']:.3f} "
                         f"thumb_curl={thumb_debug['thumb_curl']:.4f} "
+                        f"thumb_curl_raw={thumb_debug['thumb_curl_raw']:.4f} "
+                        f"thumb_curl_threshold={thumb_debug['thumb_curl_threshold']:.4f} "
                         f"thumb_raw_close_ratio={thumb_debug['thumb_raw_close_ratio']:.4f} "
                         f"thumb_raw_named={thumb_debug['thumb_raw_named']} "
                         f"current={thumb_debug['current']} "
@@ -2260,6 +2277,15 @@ class RH5DG2_Controller_DFX:
                                 f"left_active={np.where(left_active_mask)[0].tolist()} "
                                 f"right_active={np.where(right_active_mask)[0].tolist()}"
                             )
+                    raw_left, raw_right = self._read_raw_command()
+                    if raw_left is not None:
+                        # Policy inference: the action already is a raw angleSet, so it
+                        # replaces the retargeted target and re-enables every actuator that
+                        # safe mode would otherwise hold inactive.
+                        left_q_target, right_q_target = raw_left, raw_right
+                        left_active_mask = np.ones(RH5DG2_Num_Motors, dtype=bool)
+                        right_active_mask = np.ones(RH5DG2_Num_Motors, dtype=bool)
+
                     action_data = np.concatenate((left_q_target, right_q_target))
                     if dual_hand_state_array is not None and dual_hand_action_array is not None:
                         with dual_hand_data_lock:
@@ -2432,21 +2458,6 @@ class RH5DG2_Controller_FTP:
         right_write_ok = self.RightHandCmd_publisher.Write(right_cmd_msg)
         publish_done = time.time()
         publish_latency_ms = (publish_done - publish_start) * 1000.0
-        if not hasattr(self, "_publish_debug_count"):
-            self._publish_debug_count = 0
-        self._publish_debug_count += 1
-        if self._publish_debug_count <= 5 or (self.log_throttle_s > 0 and publish_start - self._last_debug_ts >= self.log_throttle_s):
-            print(
-                f"[RH5DG2 teleop publish] topics=({kTopicRH5DG2FTPLeftCommand},{kTopicRH5DG2FTPRightCommand}) "
-                f"domain={self.dds_domain_id} left_write_ok={left_write_ok} right_write_ok={right_write_ok} "
-                f"left={_fmt_debug(left_angle_cmd_scaled)} right={_fmt_debug(right_angle_cmd_scaled)}"
-            )
-            print(
-                f"[RH5DG2 publish hz] hz={_rate_hz(self._publish_debug_count, self._publish_rate_start_ts):.2f} "
-                f"count={self._publish_debug_count}"
-            )
-            print(f"[RH5DG2 publish latency ms] latency_ms={publish_latency_ms:.3f}")
-            self._last_debug_ts = publish_start
         return publish_done, (left_write_ok, right_write_ok), publish_latency_ms
 
     def _retarget(self, left_hand_data, right_hand_data):

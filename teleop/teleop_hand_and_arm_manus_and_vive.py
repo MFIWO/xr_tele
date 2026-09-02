@@ -1,6 +1,7 @@
 import time
 import argparse
 import copy
+import importlib
 import json
 from multiprocessing import Value, Array, Lock
 import threading
@@ -18,24 +19,33 @@ import sys
 import socket
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-sys.path.insert(0, parent_dir)
-sys.path.insert(0, os.path.join(current_dir, "televuer", "src"))
-sys.path.insert(0, os.path.join(current_dir, "teleimager", "src"))
+sys.path.append(parent_dir)
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
-from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController
+from teleop.robot_control.robot_arm import (
+    G1_29_ArmController,
+    G1_29_JointArmIndex,
+    G1_23_ArmController,
+    G1_23_JointArmIndex,
+    H1_2_ArmController,
+    H1_2_JointArmIndex,
+    H1_ArmController,
+    H1_JointArmIndex,
+    H2_ArmController,
+    H2_JointArmIndex,
+)
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.comm_state_logger import CommStateLogger
 from teleop.utils.audio_recorder import BackgroundAudioRecorder, AudioRecorderError
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.utils.manus_haptics import ManusHapticUDPSender, ManusNormalForceMapper
 from teleop.utils.rh5dg2_tactile import RH5DG2TactileHeatMapper
 from teleop.neck_control import VisionProNeckController
 from sshkeyboard import listen_keyboard, stop_listening
-
-logger_mp.info("[teleop imports] televuer=%s", getattr(sys.modules.get("televuer"), "__file__", None))
 
 # for simulation
 from unitree_sdk2py.core.channel import ChannelPublisher
@@ -45,12 +55,1497 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
     publisher.Write(msg)
     logger_mp.info(f"published reset category: {category}")
 
+
+def _fast_mat_inv(mat):
+    ret = np.eye(4)
+    ret[:3, :3] = mat[:3, :3].T
+    ret[:3, 3] = -mat[:3, :3].T @ mat[:3, 3]
+    return ret
+
+
+T_MANUS_TO_UNITREE_HAND_LEFT = np.array([[0, 1, 0, 0],
+                                         [0, 0, -1, 0],
+                                         [1, 0, 0, 0],
+                                         [0, 0, 0, 1]], dtype=float)
+T_MANUS_TO_UNITREE_HAND_RIGHT = np.array([[0, 1, 0, 0],
+                                          [0, 0, -1, 0],
+                                          [1, 0, 0, 0],
+                                          [0, 0, 0, 1]], dtype=float)
+
+TRACKER_WORLD_UP = np.array([0.0, 0.0, 1.0], dtype=float)
+TRACKER_TRANSLATION_SCALE = 1.0
+CALIBRATION_ORIENTATION_MAX_ERROR_DEG = 45.0
+
+# Tracker-device -> arm EE axis correction. The tracker rotation is first
+# expressed in the calibrated tracker frame, matching the translation conversion.
+R_TRACKER_TO_EE_LEFT = np.array([[0, 0, 1],
+                                 [-1, 0, 0],
+                                 [0, -1, 0]], dtype=float)
+R_TRACKER_TO_EE_RIGHT = np.array([[0, 0, -1],
+                                  [-1, 0, 0],
+                                  [0, 1, 0]], dtype=float)
+R_TRACKER_TO_EE_ABS = {
+    "left": R_TRACKER_TO_EE_LEFT,
+    "right": R_TRACKER_TO_EE_RIGHT,
+}
+
+
+def _normalize_ros_msg_type(msg_type):
+    if "/msg/" in msg_type:
+        return msg_type
+    if "." in msg_type:
+        parts = msg_type.split(".")
+        if len(parts) >= 3 and parts[-2] == "msg":
+            return f"{parts[0]}/msg/{parts[-1]}"
+    if "/" in msg_type:
+        pkg, name = msg_type.split("/", 1)
+        return f"{pkg}/msg/{name}"
+    raise ValueError(f"ROS2 message type must look like 'pkg/msg/Type': {msg_type}")
+
+
+def _load_ros_msg_type(msg_type):
+    normalized = _normalize_ros_msg_type(msg_type)
+    try:
+        from rosidl_runtime_py.utilities import get_message
+        return get_message(normalized)
+    except Exception:
+        pkg, _, name = normalized.split("/")
+        module = importlib.import_module(f"{pkg}.msg")
+        return getattr(module, name)
+
+
+def _quat_to_rot(qx, qy, qz, qw):
+    quat = np.array([qx, qy, qz, qw], dtype=float)
+    norm = np.linalg.norm(quat)
+    if not np.isfinite(norm) or norm < 1e-8:
+        return None
+    x, y, z, w = quat / norm
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=float)
+
+
+def _pose_to_mat(position, orientation):
+    rot = _quat_to_rot(orientation.x, orientation.y, orientation.z, orientation.w)
+    if rot is None:
+        return None
+    mat = np.eye(4)
+    mat[:3, :3] = rot
+    mat[:3, 3] = [position.x, position.y, position.z]
+    return mat
+
+
+def _point_like_to_xyz(point):
+    if isinstance(point, dict):
+        if all(key in point for key in ("x", "y", "z")):
+            return [point["x"], point["y"], point["z"]]
+        if "pose" in point:
+            return _point_like_to_xyz(point["pose"])
+        if "position" in point:
+            return _point_like_to_xyz(point["position"])
+        if "pos" in point:
+            return _point_like_to_xyz(point["pos"])
+    if hasattr(point, "x") and hasattr(point, "y") and hasattr(point, "z"):
+        return [point.x, point.y, point.z]
+    if hasattr(point, "pose"):
+        return _point_like_to_xyz(point.pose)
+    if hasattr(point, "position"):
+        return _point_like_to_xyz(point.position)
+    if isinstance(point, (list, tuple, np.ndarray)) and len(point) >= 3:
+        return [point[0], point[1], point[2]]
+    return None
+
+
+def _extract_manus_glove_side(msg, topic=None):
+    side = getattr(msg, "side", None)
+    if isinstance(side, str) and side.lower() in ("left", "right"):
+        return side.lower()
+    if topic:
+        topic_lower = topic.lower()
+        if "left" in topic_lower or topic_lower.endswith("_l"):
+            return "left"
+        if "right" in topic_lower or topic_lower.endswith("_r"):
+            return "right"
+    return None
+
+
+def _extract_manus_glove_positions(msg):
+    raw_nodes = getattr(msg, "raw_nodes", None)
+    if not raw_nodes:
+        return None, None
+
+    positions = np.zeros((25, 3), dtype=float)
+    wrist_mat = None
+    filled = np.zeros(25, dtype=bool)
+    for node in raw_nodes:
+        node_id = getattr(node, "node_id", None)
+        if node_id is None or not (0 <= node_id < 25):
+            continue
+        pose = getattr(node, "pose", None)
+        if pose is None:
+            continue
+        position = getattr(pose, "position", None)
+        if position is None:
+            continue
+        xyz = _point_like_to_xyz(position)
+        if xyz is None:
+            continue
+        positions[node_id] = xyz
+        filled[node_id] = True
+        if node_id == 0 and hasattr(pose, "orientation"):
+            wrist_mat = _pose_to_mat(pose.position, pose.orientation)
+
+    if not filled[0]:
+        return None, None
+    return positions, wrist_mat
+
+
+def _pose_dict_to_mat(pose):
+    if not isinstance(pose, dict):
+        return None
+    position = pose.get("position", pose.get("pos"))
+    orientation = pose.get("orientation", pose.get("quat", pose.get("rotation")))
+    if position is None or orientation is None:
+        return None
+
+    def pick_xyz(value):
+        if isinstance(value, dict):
+            return [value.get("x"), value.get("y"), value.get("z")]
+        if isinstance(value, (list, tuple)) and len(value) >= 3:
+            return [value[0], value[1], value[2]]
+        return None
+
+    xyz = pick_xyz(position)
+    if isinstance(orientation, dict):
+        quat = [orientation.get("x"), orientation.get("y"), orientation.get("z"), orientation.get("w")]
+    elif isinstance(orientation, (list, tuple)) and len(orientation) >= 4:
+        quat = list(orientation[:4])
+    else:
+        quat = None
+    if xyz is None or quat is None or any(value is None for value in xyz + quat):
+        return None
+    rot = _quat_to_rot(quat[0], quat[1], quat[2], quat[3])
+    if rot is None:
+        return None
+    mat = np.eye(4)
+    mat[:3, :3] = rot
+    mat[:3, 3] = np.asarray(xyz, dtype=float)
+    return mat
+
+
+def _extract_manus_json_packet(packet):
+    if not isinstance(packet, dict):
+        return []
+
+    updates = []
+    for side in ("left", "right"):
+        side_packet = packet.get(side)
+        if side_packet is None:
+            continue
+        if isinstance(side_packet, dict):
+            positions = side_packet.get("positions", side_packet.get("raw_nodes", side_packet.get("nodes")))
+            wrist_pose = side_packet.get("wrist_pose", side_packet.get("wrist"))
+        else:
+            positions = side_packet
+            wrist_pose = None
+        updates.extend(_extract_manus_json_positions(side, positions, wrist_pose))
+
+    side = packet.get("side")
+    if isinstance(side, str) and side.lower() in ("left", "right"):
+        positions = packet.get("positions", packet.get("raw_nodes", packet.get("nodes")))
+        wrist_pose = packet.get("wrist_pose", packet.get("wrist"))
+        updates.extend(_extract_manus_json_positions(side.lower(), positions, wrist_pose))
+    return updates
+
+
+def _extract_manus_json_positions(side, positions_payload, wrist_pose_payload=None):
+    if positions_payload is None:
+        return []
+
+    positions = np.zeros((25, 3), dtype=float)
+    wrist_mat = _pose_dict_to_mat(wrist_pose_payload)
+    filled = 0
+
+    if isinstance(positions_payload, list) and any(
+        isinstance(item, dict) and ("node_id" in item or "pose" in item)
+        for item in positions_payload
+    ):
+        for node in positions_payload:
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get("node_id", node.get("id", node.get("index")))
+            if node_id is None or not (0 <= int(node_id) < 25):
+                continue
+            pose = node.get("pose")
+            position = node.get("position", node.get("pos"))
+            if position is None and isinstance(pose, dict):
+                position = pose.get("position", pose.get("pos"))
+            xyz = _point_like_to_xyz(position)
+            if xyz is not None:
+                positions[int(node_id)] = xyz
+                filled += 1
+            if wrist_mat is None and int(node_id) == 0:
+                wrist_mat = _pose_dict_to_mat(pose)
+    elif isinstance(positions_payload, list) and len(positions_payload) == 25 and all(
+        isinstance(item, (list, tuple, dict)) for item in positions_payload
+    ):
+        for idx, item in enumerate(positions_payload):
+            if isinstance(item, dict):
+                pose = item.get("pose")
+                xyz = _point_like_to_xyz(item.get("position", item.get("pos", pose)))
+                if wrist_mat is None and idx == 0 and pose is not None:
+                    wrist_mat = _pose_dict_to_mat(pose)
+            else:
+                xyz = _point_like_to_xyz(item)
+            if xyz is not None:
+                positions[idx] = xyz
+                filled += 1
+
+    if filled < 8 or not np.all(np.isfinite(positions)):
+        return []
+    return [(side, positions, wrist_mat)]
+
+
+def _vive_tracker_key_to_side(key):
+    key = str(key).lower()
+    if key in ("left", "right", "head"):
+        return key
+    if key.startswith("left") or key.startswith("l_"):
+        return "left"
+    if key.startswith("right") or key.startswith("r_"):
+        return "right"
+    if key.startswith("head") or key.startswith("h_"):
+        return "head"
+    return None
+
+
+def _extract_vive_json_packet(packet):
+    if not isinstance(packet, dict):
+        return []
+
+    updates = []
+    trackers = packet.get("trackers")
+    if isinstance(trackers, dict):
+        items = trackers.items()
+    else:
+        items = (
+            (key, packet.get(key))
+            for key in ("left", "right", "head", "left_tracker", "right_tracker", "head_tracker")
+            if key in packet
+        )
+
+    for key, item in items:
+        side = _vive_tracker_key_to_side(key)
+        if side is None or not isinstance(item, dict):
+            continue
+        if item.get("ok", True) is False:
+            continue
+        pose_payload = item.get("pose", item.get("transform", item))
+        pose = _pose_dict_to_mat(pose_payload)
+        if pose is None or not np.all(np.isfinite(pose)):
+            continue
+        updates.append((side, pose))
+    return updates
+
+
+def _normalize_vec(vec, eps=1e-6):
+    vec = np.asarray(vec, dtype=float)
+    norm = np.linalg.norm(vec)
+    if not np.isfinite(norm) or norm < eps:
+        return None
+    return vec / norm
+
+
+def _project_rotation(rot):
+    if rot is None or not np.all(np.isfinite(rot)):
+        return None
+    u, _, vt = np.linalg.svd(rot)
+    projected = u @ vt
+    if np.linalg.det(projected) < 0:
+        u[:, -1] *= -1.0
+        projected = u @ vt
+    return projected
+
+
+def _rot_to_euler_xyz(rot):
+    rot = _project_rotation(rot)
+    if rot is None:
+        return None
+    sy = np.sqrt(rot[0, 0] * rot[0, 0] + rot[1, 0] * rot[1, 0])
+    singular = sy < 1e-6
+    if not singular:
+        x = np.arctan2(rot[2, 1], rot[2, 2])
+        y = np.arctan2(-rot[2, 0], sy)
+        z = np.arctan2(rot[1, 0], rot[0, 0])
+    else:
+        x = np.arctan2(-rot[1, 2], rot[1, 1])
+        y = np.arctan2(-rot[2, 0], sy)
+        z = 0.0
+    return np.array([x, y, z], dtype=float)
+
+
+def _rot_to_euler_xyz_deg(rot):
+    euler_xyz = _rot_to_euler_xyz(rot)
+    if euler_xyz is None:
+        return None
+    return np.degrees(euler_xyz)
+
+
+def _rotation_error_deg(rot_a, rot_b):
+    rot_a = _project_rotation(rot_a)
+    rot_b = _project_rotation(rot_b)
+    if rot_a is None or rot_b is None:
+        return None
+    rel = _project_rotation(rot_a.T @ rot_b)
+    if rel is None:
+        return None
+    cos_angle = (np.trace(rel) - 1.0) * 0.5
+    angle = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+    return float(np.degrees(angle))
+
+
+def _fmt_vec(vec):
+    return f"[{vec[0]: .3f}, {vec[1]: .3f}, {vec[2]: .3f}]"
+
+
+def _fmt_mat(mat):
+    mat = np.asarray(mat, dtype=float)
+    return np.array2string(mat, precision=3, suppress_small=True)
+
+
+def _rot_summary_text(rot):
+    rot = _project_rotation(rot)
+    if rot is None:
+        return "invalid"
+    euler = _rot_to_euler_xyz_deg(rot)
+    angle = _rotation_error_deg(np.eye(3), rot)
+    euler_part = "xyz_deg=invalid" if euler is None else f"xyz_deg=[{euler[0]: .1f}, {euler[1]: .1f}, {euler[2]: .1f}]"
+    angle_part = "angle_deg=invalid" if angle is None else f"angle_deg={angle:.1f}"
+    return f"{euler_part} {angle_part}"
+
+
+def _tracker_rot_to_calib_frame(tracker_rot, tracker_basis):
+    tracker_rot = _project_rotation(tracker_rot)
+    if tracker_rot is None or tracker_basis is None:
+        return None
+    return _project_rotation(tracker_basis.T @ tracker_rot)
+
+
+def _tracker_abs_rot_to_ee_rot(tracker_rot, side, tracker_basis):
+    tracker_rot = _tracker_rot_to_calib_frame(tracker_rot, tracker_basis)
+    if tracker_rot is None:
+        return None
+    return _project_rotation(tracker_rot @ R_TRACKER_TO_EE_ABS[side])
+
+
+def _wrap_angle_rad(angle):
+    return (float(angle) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _pose_from_yaw_pitch(yaw_pitch):
+    yaw, pitch = np.asarray(yaw_pitch, dtype=np.float64).reshape(2)
+    yaw = _wrap_angle_rad(yaw)
+    pitch = float(np.clip(pitch, -np.pi * 0.5 + 1e-6, np.pi * 0.5 - 1e-6))
+    cp = np.cos(pitch)
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 0] = [cp * np.cos(yaw), cp * np.sin(yaw), np.sin(pitch)]
+    return pose
+
+
+def _vive_head_tracker_rot_yaw_pitch(rot, yaw_sign=1.0, pitch_sign=1.0):
+    euler_xyz = _rot_to_euler_xyz(rot)
+    if euler_xyz is None:
+        return None
+    # Vive head tracker axis mapping for the camera neck:
+    # Y rotation drives camera yaw, X rotation drives camera pitch, Z/roll is ignored.
+    yaw = float(yaw_sign) * float(euler_xyz[1])
+    pitch = float(pitch_sign) * float(euler_xyz[0])
+    return np.array([yaw, pitch], dtype=np.float64)
+
+
+def _vive_head_tracker_yaw_pitch(head_pose, yaw_sign=1.0, pitch_sign=1.0):
+    pose = np.asarray(head_pose, dtype=np.float64)
+    if pose.shape != (4, 4) or not np.isfinite(pose).all():
+        return None
+    return _vive_head_tracker_rot_yaw_pitch(
+        pose[:3, :3],
+        yaw_sign=yaw_sign,
+        pitch_sign=pitch_sign,
+    )
+
+
+class LibsurviveTFReader:
+    def __init__(
+        self,
+        node,
+        left_name,
+        right_name,
+        head_name=None,
+        tracking_frame="libsurvive_world",
+        stale_timeout=0.5,
+    ):
+        import tf2_ros
+
+        self._buffer = tf2_ros.Buffer()
+        self._listener = tf2_ros.TransformListener(self._buffer, node)
+        self._names = {"left": left_name, "right": right_name}
+        if head_name:
+            self._names["head"] = head_name
+        self._tracking_frame = tracking_frame
+        self._stale_timeout = stale_timeout
+        self._last_ok = {key: 0.0 for key in self._names}
+        self._last_poses = {key: None for key in self._names}
+        logger_mp.info(
+            f"LibsurviveTFReader: left='{left_name}' right='{right_name}' "
+            f"head='{head_name}' frame='{tracking_frame}'"
+        )
+
+    def _lookup_one(self, side):
+        name = self._names.get(side)
+        if not name:
+            return None, False
+        try:
+            from rclpy.time import Time as RclpyTime
+
+            transform = self._buffer.lookup_transform(self._tracking_frame, name, RclpyTime())
+            pose = _pose_to_mat(transform.transform.translation, transform.transform.rotation)
+            if pose is not None:
+                self._last_ok[side] = time.monotonic()
+                self._last_poses[side] = pose
+        except Exception as e:
+            now = time.monotonic()
+            if now - getattr(self, f"_last_err_{side}", 0.0) > 3.0:
+                logger_mp.warning(f"[Vive/TF] {side} lookup failed: {e}")
+                setattr(self, f"_last_err_{side}", now)
+
+        now = time.monotonic()
+        ok = (now - self._last_ok[side]) <= self._stale_timeout
+        return self._last_poses[side], ok
+
+    def read(self):
+        left_pose, left_ok = self._lookup_one("left")
+        right_pose, right_ok = self._lookup_one("right")
+        return left_pose, right_pose, left_ok, right_ok
+
+    def read_head(self):
+        if "head" not in self._names:
+            return None, False
+        return self._lookup_one("head")
+
+
+class ManusHandReader:
+    def __init__(self, node, topics, msg_type, stale_timeout):
+        self._lock = threading.Lock()
+        self._positions = {"left": None, "right": None}
+        self._wrist_mats = {"left": None, "right": None}
+        self._stamp = {"left": 0.0, "right": 0.0}
+        self._last_warn = {"left": 0.0, "right": 0.0}
+        self._stale_timeout = stale_timeout
+        ros_msg_type = _load_ros_msg_type(msg_type)
+        self._subs = []
+        for topic in topics:
+            self._subs.append(
+                node.create_subscription(
+                    ros_msg_type,
+                    topic,
+                    lambda msg, topic=topic: self._callback(msg, topic),
+                    5,
+                )
+            )
+        logger_mp.info(f"ManusHandReader subscribed: topics={topics}, type={msg_type}")
+
+    def _callback(self, msg, topic):
+        side = _extract_manus_glove_side(msg, topic)
+        if side is None:
+            now = time.monotonic()
+            if now - getattr(self, "_last_side_warn", 0.0) > 3.0:
+                logger_mp.warning("Cannot determine Manus glove side. Set msg.side or use left/right in topic names.")
+                self._last_side_warn = now
+            return
+
+        positions, wrist_mat = _extract_manus_glove_positions(msg)
+        now = time.monotonic()
+        if positions is None or positions.shape != (25, 3) or not np.all(np.isfinite(positions)):
+            if now - self._last_warn[side] > 2.0:
+                logger_mp.warning(f"Cannot parse {side} Manus hand positions as 25 xyz joints.")
+                self._last_warn[side] = now
+            return
+
+        with self._lock:
+            self._positions[side] = positions
+            self._wrist_mats[side] = wrist_mat
+            self._stamp[side] = now
+
+    def read(self):
+        now = time.monotonic()
+        with self._lock:
+            left_pos = None if self._positions["left"] is None else self._positions["left"].copy()
+            right_pos = None if self._positions["right"] is None else self._positions["right"].copy()
+            left_wrist = None if self._wrist_mats["left"] is None else self._wrist_mats["left"].copy()
+            right_wrist = None if self._wrist_mats["right"] is None else self._wrist_mats["right"].copy()
+            left_ok = left_pos is not None and (now - self._stamp["left"]) <= self._stale_timeout
+            right_ok = right_pos is not None and (now - self._stamp["right"]) <= self._stale_timeout
+        return left_pos, right_pos, left_wrist, right_wrist, left_ok, right_ok
+
+
+class ManusUDPJsonReader:
+    def __init__(self, host, port, stale_timeout, recv_size=65535):
+        self.host = host
+        self.port = int(port)
+        self._stale_timeout = float(stale_timeout)
+        self._lock = threading.Lock()
+        self._positions = {"left": None, "right": None}
+        self._wrist_mats = {"left": None, "right": None}
+        self._stamp = {"left": 0.0, "right": 0.0}
+        self._last_warn = 0.0
+        self._stop_event = threading.Event()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.bind((self.host, self.port))
+        self._socket.settimeout(0.1)
+        self._recv_size = int(recv_size)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        logger_mp.info("[manus udp] listening udp=%s:%s stale_timeout=%.3f", self.host, self.port, self._stale_timeout)
+
+    def _loop(self):
+        while not self._stop_event.is_set():
+            try:
+                raw, _ = self._socket.recvfrom(self._recv_size)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                packet = json.loads(raw.decode("utf-8"))
+                updates = _extract_manus_json_packet(packet)
+                now = time.monotonic()
+                if not updates:
+                    raise ValueError("packet does not contain usable Manus hand positions")
+                with self._lock:
+                    for side, positions, wrist_mat in updates:
+                        self._positions[side] = positions
+                        self._wrist_mats[side] = wrist_mat
+                        self._stamp[side] = now
+            except Exception as exc:
+                now = time.monotonic()
+                if now - self._last_warn > 2.0:
+                    logger_mp.warning("[manus udp] malformed packet: %s", exc)
+                    self._last_warn = now
+
+    def read(self):
+        now = time.monotonic()
+        with self._lock:
+            left_pos = None if self._positions["left"] is None else self._positions["left"].copy()
+            right_pos = None if self._positions["right"] is None else self._positions["right"].copy()
+            left_wrist = None if self._wrist_mats["left"] is None else self._wrist_mats["left"].copy()
+            right_wrist = None if self._wrist_mats["right"] is None else self._wrist_mats["right"].copy()
+            left_ok = left_pos is not None and (now - self._stamp["left"]) <= self._stale_timeout
+            right_ok = right_pos is not None and (now - self._stamp["right"]) <= self._stale_timeout
+        return left_pos, right_pos, left_wrist, right_wrist, left_ok, right_ok
+
+    def close(self):
+        self._stop_event.set()
+        try:
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+        self._socket.close()
+
+
+class ViveUDPJsonReader:
+    def __init__(self, host, port, stale_timeout, recv_size=65535):
+        self.host = host
+        self.port = int(port)
+        self._stale_timeout = float(stale_timeout)
+        self._lock = threading.Lock()
+        self._poses = {"left": None, "right": None, "head": None}
+        self._stamp = {"left": 0.0, "right": 0.0, "head": 0.0}
+        self._last_warn = 0.0
+        self._stop_event = threading.Event()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.bind((self.host, self.port))
+        self._socket.settimeout(0.1)
+        self._recv_size = int(recv_size)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        logger_mp.info("[vive udp] listening udp=%s:%s stale_timeout=%.3f", self.host, self.port, self._stale_timeout)
+
+    def _loop(self):
+        while not self._stop_event.is_set():
+            try:
+                raw, _ = self._socket.recvfrom(self._recv_size)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                packet = json.loads(raw.decode("utf-8"))
+                updates = _extract_vive_json_packet(packet)
+                now = time.monotonic()
+                if not updates:
+                    if packet.get("source") == "vive_tf_to_udp" and not packet.get("trackers"):
+                        continue
+                    raise ValueError("packet does not contain usable Vive tracker poses")
+                with self._lock:
+                    for side, pose in updates:
+                        self._poses[side] = pose
+                        self._stamp[side] = now
+            except Exception as exc:
+                now = time.monotonic()
+                if now - self._last_warn > 2.0:
+                    logger_mp.warning("[vive udp] malformed packet: %s", exc)
+                    self._last_warn = now
+
+    def _read_one(self, side):
+        now = time.monotonic()
+        with self._lock:
+            pose = None if self._poses[side] is None else self._poses[side].copy()
+            ok = pose is not None and (now - self._stamp[side]) <= self._stale_timeout
+        return pose, ok
+
+    def read(self):
+        left_pose, left_ok = self._read_one("left")
+        right_pose, right_ok = self._read_one("right")
+        return left_pose, right_pose, left_ok, right_ok
+
+    def read_head(self):
+        return self._read_one("head")
+
+    def close(self):
+        self._stop_event.set()
+        try:
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+        self._socket.close()
+
+
+class ViveManusInfoReader:
+    def __init__(
+        self,
+        left_tracker_name,
+        right_tracker_name,
+        head_tracker_name,
+        manus_topics,
+        manus_msg_type,
+        manus_transport="ros2",
+        manus_udp_host="0.0.0.0",
+        manus_udp_port=56120,
+        vive_transport="tf",
+        vive_udp_host="0.0.0.0",
+        vive_udp_port=56130,
+        libsurvive_tracking_frame="libsurvive_world",
+        stale_timeout=0.5,
+        manus_hand_transform="legacy",
+    ):
+        self.manus_hand_transform = str(manus_hand_transform or "legacy").strip().lower()
+        if self.manus_hand_transform not in ("legacy", "televuer"):
+            raise ValueError(
+                f"Unsupported Manus hand transform: {manus_hand_transform}. "
+                "Use legacy or televuer."
+            )
+        if self.manus_hand_transform == "televuer":
+            logger_mp.warning(
+                "[Vive/Manus] --manus-hand-transform=televuer is not valid for Manus raw skeleton axes; "
+                "using legacy Manus->Unitree transform instead."
+            )
+            self.manus_hand_transform = "legacy"
+        self._rclpy = None
+        self._owns_rclpy = False
+        self.node = None
+        self.executor = None
+        self.spin_thread = None
+
+        needs_ros = manus_transport == "ros2" or vive_transport == "tf"
+        if needs_ros:
+            import rclpy
+            from rclpy.executors import MultiThreadedExecutor
+
+            self._rclpy = rclpy
+            self._owns_rclpy = not rclpy.ok()
+            if self._owns_rclpy:
+                rclpy.init(args=None)
+
+            self.node = rclpy.create_node("vive_manus_info_reader")
+            self.executor = MultiThreadedExecutor()
+            self.executor.add_node(self.node)
+            self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
+            self.spin_thread.start()
+
+        if vive_transport == "tf":
+            if self.node is None:
+                raise RuntimeError("Vive TF transport requires an rclpy node.")
+            self.vive_reader = LibsurviveTFReader(
+                self.node,
+                left_name=left_tracker_name,
+                right_name=right_tracker_name,
+                head_name=head_tracker_name,
+                tracking_frame=libsurvive_tracking_frame,
+                stale_timeout=stale_timeout,
+            )
+        elif vive_transport == "udp_json":
+            self.vive_reader = ViveUDPJsonReader(vive_udp_host, vive_udp_port, stale_timeout)
+        else:
+            raise ValueError(f"Unsupported Vive transport: {vive_transport}")
+
+        if manus_transport == "ros2":
+            if self.node is None:
+                raise RuntimeError("Manus ROS2 transport requires an rclpy node.")
+            self.manus_reader = ManusHandReader(self.node, manus_topics, manus_msg_type, stale_timeout)
+        elif manus_transport == "udp_json":
+            self.manus_reader = ManusUDPJsonReader(manus_udp_host, manus_udp_port, stale_timeout)
+        else:
+            raise ValueError(f"Unsupported Manus transport: {manus_transport}")
+
+        logger_mp.info(
+            "[Vive/Manus] transports vive=%s manus=%s stale_timeout=%.3f hand_transform=%s",
+            vive_transport,
+            manus_transport,
+            float(stale_timeout),
+            self.manus_hand_transform,
+        )
+        self._tracker_ref = {"left": None, "right": None}
+        self._tracker_rot_ref = {"left": None, "right": None}
+        self._head_tracker_rot_ref = None
+        self._head_tracker_rot_ref_frame = None
+        self._wrist_ref = {"left": None, "right": None}
+        self._last_wrist_pose = {"left": None, "right": None}
+        self._tracker_origin = None
+        self._tracker_basis = None
+        self._relative_ref_ready = False
+
+    @property
+    def calibrated(self):
+        return self._tracker_basis is not None and self._tracker_origin is not None
+
+    @property
+    def relative_reference_ready(self):
+        return bool(self._relative_ref_ready)
+
+    def reset_calibration(self):
+        self._tracker_ref = {"left": None, "right": None}
+        self._tracker_rot_ref = {"left": None, "right": None}
+        self._head_tracker_rot_ref = None
+        self._head_tracker_rot_ref_frame = None
+        self._wrist_ref = {"left": None, "right": None}
+        self._last_wrist_pose = {"left": None, "right": None}
+        self._tracker_origin = None
+        self._tracker_basis = None
+        self._relative_ref_ready = False
+
+    def close(self):
+        for reader in (getattr(self, "vive_reader", None), getattr(self, "manus_reader", None)):
+            if reader is not None and hasattr(reader, "close"):
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+        try:
+            if self.executor is not None:
+                self.executor.shutdown()
+        except Exception:
+            pass
+        try:
+            if self.node is not None:
+                self.node.destroy_node()
+        except Exception:
+            pass
+        if self._owns_rclpy and self._rclpy is not None:
+            try:
+                self._rclpy.shutdown()
+            except Exception:
+                pass
+
+    def read(self):
+        left_tracker, right_tracker, left_tracker_ok, right_tracker_ok = self.vive_reader.read()
+        head_tracker, head_tracker_ok = self.vive_reader.read_head()
+        left_hand, right_hand, left_wrist, right_wrist, left_hand_ok, right_hand_ok = self.manus_reader.read()
+        return {
+            "left_tracker": left_tracker,
+            "right_tracker": right_tracker,
+            "head_tracker": head_tracker,
+            "left_tracker_ok": left_tracker_ok,
+            "right_tracker_ok": right_tracker_ok,
+            "head_tracker_ok": head_tracker_ok,
+            "left_hand": left_hand,
+            "right_hand": right_hand,
+            "left_wrist": left_wrist,
+            "right_wrist": right_wrist,
+            "left_hand_ok": left_hand_ok,
+            "right_hand_ok": right_hand_ok,
+        }
+
+    def read_head_tracker(self):
+        return self.vive_reader.read_head()
+
+    def reset_head_tracker_neck_ref(self):
+        self._head_tracker_rot_ref = None
+        self._head_tracker_rot_ref_frame = None
+
+    def reset_relative_motion_reference(self, left_wrist_ref, right_wrist_ref):
+        if not self.calibrated:
+            logger_mp.warning("[Vive/Relative] Cannot reset sync reference before calibration.")
+            return False
+        wrist_refs = {
+            "left": np.asarray(left_wrist_ref, dtype=np.float64),
+            "right": np.asarray(right_wrist_ref, dtype=np.float64),
+        }
+        for side, wrist_ref in wrist_refs.items():
+            if wrist_ref.shape != (4, 4) or not np.isfinite(wrist_ref).all():
+                logger_mp.warning("[Vive/Relative] Cannot reset %s sync reference: invalid robot EE pose.", side)
+                return False
+
+        info = self.read()
+        for side in ("left", "right"):
+            tracker_pose = info[f"{side}_tracker"]
+            if not info[f"{side}_tracker_ok"] or tracker_pose is None:
+                logger_mp.warning("[Vive/Relative] Cannot reset %s sync reference: tracker is invalid or stale.", side)
+                return False
+            tracker_rot = _tracker_abs_rot_to_ee_rot(tracker_pose[:3, :3], side, self._tracker_basis)
+            if tracker_rot is None:
+                logger_mp.warning("[Vive/Relative] Cannot reset %s sync reference: tracker rotation is invalid.", side)
+                return False
+
+            self._tracker_ref[side] = self._tracker_basis.T @ (tracker_pose[:3, 3] - self._tracker_origin)
+            self._tracker_rot_ref[side] = tracker_rot.copy()
+            self._wrist_ref[side] = wrist_refs[side].copy()
+
+        self._last_wrist_pose = {"left": None, "right": None}
+        self._relative_ref_ready = True
+        logger_mp.info(
+            "[Vive/Relative] sync reference reset at [r] from current robot EE pose. "
+            "left_wrist_ref=%s right_wrist_ref=%s left_tracker_ref=%s right_tracker_ref=%s",
+            np.round(self._wrist_ref["left"][:3, 3], 3).tolist(),
+            np.round(self._wrist_ref["right"][:3, 3], 3).tolist(),
+            np.round(self._tracker_ref["left"], 3).tolist(),
+            np.round(self._tracker_ref["right"], 3).tolist(),
+        )
+        return True
+
+    def read_head_tracker_yaw_pitch_for_neck(self, yaw_sign=1.0, pitch_sign=1.0):
+        head_tracker_pose, head_tracker_ok = self.read_head_tracker()
+        if not head_tracker_ok or head_tracker_pose is None:
+            return None, False
+        if self._tracker_basis is not None:
+            head_tracker_rot = _tracker_rot_to_calib_frame(head_tracker_pose[:3, :3], self._tracker_basis)
+            ref_frame = "calibrated"
+        else:
+            head_tracker_rot = _project_rotation(head_tracker_pose[:3, :3])
+            ref_frame = "raw"
+        if head_tracker_rot is None:
+            return None, False
+        if self._head_tracker_rot_ref is None or self._head_tracker_rot_ref_frame != ref_frame:
+            self._head_tracker_rot_ref = head_tracker_rot.copy()
+            self._head_tracker_rot_ref_frame = ref_frame
+            logger_mp.info(
+                "[Vive/Head] neck tracker_rot_ref set from current head tracker orientation "
+                f"(frame={ref_frame})."
+            )
+        relative_head_rot = _project_rotation(self._head_tracker_rot_ref.T @ head_tracker_rot)
+        yaw_pitch = _vive_head_tracker_rot_yaw_pitch(
+            relative_head_rot,
+            yaw_sign=yaw_sign,
+            pitch_sign=pitch_sign,
+        )
+        return yaw_pitch, yaw_pitch is not None
+
+    def calibrate_reference_frame(self, tele_data=None):
+        info = self.read()
+        if not (
+            info["left_tracker_ok"]
+            and info["right_tracker_ok"]
+            and info["left_tracker"] is not None
+            and info["right_tracker"] is not None
+        ):
+            logger_mp.warning("[Vive/Frame] Cannot calibrate. Need valid left/right trackers.")
+            return False
+
+        if tele_data is None:
+            logger_mp.warning("[Vive/Frame] Cannot calibrate orientation. Robot EE pose is not available yet.")
+            return False
+
+        left_xyz = info["left_tracker"][:3, 3].copy()
+        right_xyz = info["right_tracker"][:3, 3].copy()
+        origin = 0.5 * (left_xyz + right_xyz)
+
+        z_axis = TRACKER_WORLD_UP.copy()
+        side_axis = _normalize_vec(right_xyz - left_xyz)
+        if z_axis is None or side_axis is None:
+            logger_mp.warning("[Vive/Frame] Cannot calibrate. Tracker geometry is degenerate.")
+            return False
+
+        side_axis = _normalize_vec(side_axis - z_axis * float(side_axis @ z_axis))
+        if side_axis is None:
+            logger_mp.warning("[Vive/Frame] Cannot calibrate. side and z axes are nearly parallel.")
+            return False
+
+        x_axis = _normalize_vec(np.cross(z_axis, side_axis))
+        if x_axis is None:
+            logger_mp.warning("[Vive/Frame] Cannot calibrate. Failed to derive forward x-axis.")
+            return False
+        y_axis = _normalize_vec(np.cross(z_axis, x_axis))
+        if y_axis is None:
+            logger_mp.warning("[Vive/Frame] Cannot calibrate. Failed to orthogonalize y-axis.")
+            return False
+
+        tracker_basis = np.column_stack([x_axis, y_axis, z_axis])
+        orientation_errors = {}
+        orientation_debug = {}
+        for side in ("left", "right"):
+            tracker_raw_rot = _project_rotation(info[f"{side}_tracker"][:3, :3])
+            tracker_calib_rot = _tracker_rot_to_calib_frame(info[f"{side}_tracker"][:3, :3], tracker_basis)
+            tracker_rot = _tracker_abs_rot_to_ee_rot(info[f"{side}_tracker"][:3, :3], side, tracker_basis)
+            wrist_pose = getattr(tele_data, f"{side}_wrist_pose", None)
+            wrist_rot = None if wrist_pose is None else wrist_pose[:3, :3]
+            error_deg = _rotation_error_deg(tracker_rot, wrist_rot)
+            if error_deg is None:
+                logger_mp.warning(f"[Vive/Frame] Cannot calibrate. {side} orientation is invalid.")
+                return False
+            orientation_errors[side] = error_deg
+            orientation_debug[side] = (
+                tracker_raw_rot,
+                tracker_calib_rot,
+                tracker_rot,
+                _project_rotation(wrist_rot),
+            )
+
+        print("[Vive/Frame orientation check]", flush=True)
+        for side in ("left", "right"):
+            tracker_raw_rot, tracker_calib_rot, tracker_rot, wrist_rot = orientation_debug[side]
+            print(
+                f"{side} tracker_raw_rot=\n{_fmt_mat(tracker_raw_rot)}\n"
+                f"{side} tracker_calib_rot=\n{_fmt_mat(tracker_calib_rot)}\n"
+                f"{side} tracker_rot_ee=\n{_fmt_mat(tracker_rot)}\n"
+                f"{side} ee_rot=\n{_fmt_mat(wrist_rot)}\n"
+                f"{side} rot_error_deg={orientation_errors[side]:.1f}",
+                flush=True,
+            )
+
+        max_error = max(orientation_errors.values())
+        if max_error > CALIBRATION_ORIENTATION_MAX_ERROR_DEG:
+            logger_mp.warning(
+                "[Vive/Frame] Cannot calibrate. Tracker/EE orientation mismatch is too large: "
+                f"left={orientation_errors['left']:.1f}deg "
+                f"right={orientation_errors['right']:.1f}deg "
+                f"limit={CALIBRATION_ORIENTATION_MAX_ERROR_DEG:.1f}deg"
+            )
+            return False
+
+        self._tracker_origin = origin
+        self._tracker_basis = tracker_basis
+        self._tracker_ref["left"] = self._tracker_basis.T @ (left_xyz - origin)
+        self._tracker_ref["right"] = self._tracker_basis.T @ (right_xyz - origin)
+        self._tracker_rot_ref = {
+            "left": orientation_debug["left"][2].copy(),
+            "right": orientation_debug["right"][2].copy(),
+        }
+        self._head_tracker_rot_ref = None
+        self._head_tracker_rot_ref_frame = None
+        if info["head_tracker_ok"] and info["head_tracker"] is not None:
+            head_tracker_rot = _tracker_rot_to_calib_frame(info["head_tracker"][:3, :3], self._tracker_basis)
+            if head_tracker_rot is not None:
+                self._head_tracker_rot_ref = head_tracker_rot.copy()
+                self._head_tracker_rot_ref_frame = "calibrated"
+        self._last_wrist_pose = {"left": None, "right": None}
+        self._wrist_ref = {
+            "left": tele_data.left_wrist_pose.copy(),
+            "right": tele_data.right_wrist_pose.copy(),
+        }
+        self._relative_ref_ready = False
+
+        logger_mp.info(
+            "[Vive/Frame] Calibrated from attention pose. "
+            f"origin(wrist_mid)={origin.round(3)} "
+            f"x(forward)={x_axis.round(3)} "
+            f"y(right_to_left)={y_axis.round(3)} "
+            f"z(world_up)={z_axis.round(3)} "
+            f"orientation_error(left/right)={orientation_errors['left']:.1f}/{orientation_errors['right']:.1f}deg "
+            f"head_ref={'set' if self._head_tracker_rot_ref is not None else 'waiting'}"
+        )
+        return True
+
+    def _apply_side_relative_motion(self, tele_data, info, side):
+        if self._tracker_basis is None or self._tracker_origin is None:
+            return False
+        if not self._relative_ref_ready:
+            return False
+
+        tracker_pose = info[f"{side}_tracker"]
+        tracker_ok = info[f"{side}_tracker_ok"]
+        attr = f"{side}_wrist_pose"
+
+        if not tracker_ok or tracker_pose is None:
+            if self._last_wrist_pose[side] is not None:
+                setattr(tele_data, attr, self._last_wrist_pose[side].copy())
+            return False
+
+        current_tracker_xyz = self._tracker_basis.T @ (tracker_pose[:3, 3] - self._tracker_origin)
+        if self._wrist_ref[side] is None or self._tracker_ref[side] is None:
+            self._relative_ref_ready = False
+            return False
+
+        target_wrist_pose = self._wrist_ref[side].copy()
+        target_wrist_pose[:3, 3] = (
+            self._wrist_ref[side][:3, 3]
+            + (current_tracker_xyz - self._tracker_ref[side]) * TRACKER_TRANSLATION_SCALE
+        )
+        current_tracker_rot = _tracker_abs_rot_to_ee_rot(tracker_pose[:3, :3], side, self._tracker_basis)
+        if current_tracker_rot is not None:
+            if self._tracker_rot_ref[side] is None:
+                self._tracker_rot_ref[side] = current_tracker_rot.copy()
+                logger_mp.info(f"[Vive/Relative] {side} tracker_rot_ref set.")
+            relative_tracker_rot = self._tracker_rot_ref[side].T @ current_tracker_rot
+            target_wrist_rot = _project_rotation(self._wrist_ref[side][:3, :3] @ relative_tracker_rot)
+            if target_wrist_rot is not None:
+                target_wrist_pose[:3, :3] = target_wrist_rot
+        setattr(tele_data, attr, target_wrist_pose)
+        self._last_wrist_pose[side] = target_wrist_pose.copy()
+        return True
+
+    def apply_relative_wrist_motion(self, tele_data):
+        info = self.read()
+        left_ready = self._apply_side_relative_motion(tele_data, info, "left")
+        right_ready = self._apply_side_relative_motion(tele_data, info, "right")
+        return left_ready and right_ready
+
+    def _hand_pos_for_retargeting(self, hand_positions, wrist_mat, valid, side):
+        if not valid or hand_positions is None:
+            return np.zeros((25, 3))
+        if wrist_mat is not None:
+            arm = _fast_mat_inv(wrist_mat)
+        else:
+            wrist = hand_positions[0].copy()
+            arm = np.eye(4)
+            arm[:3, 3] = -wrist
+
+        t_manus_to_unitree = (
+            T_MANUS_TO_UNITREE_HAND_LEFT
+            if side == "left"
+            else T_MANUS_TO_UNITREE_HAND_RIGHT
+        )
+        hom = np.concatenate([hand_positions.T, np.ones((1, hand_positions.shape[0]))])
+        local = arm @ hom
+        return (t_manus_to_unitree @ local)[0:3, :].T
+
+    def apply_manus_hand_data(self, tele_data):
+        (
+            left_hand_raw,
+            right_hand_raw,
+            left_wrist_mat,
+            right_wrist_mat,
+            left_hand_ok,
+            right_hand_ok,
+        ) = self.manus_reader.read()
+
+        left_hand_pos = self._hand_pos_for_retargeting(
+            left_hand_raw, left_wrist_mat, left_hand_ok, "left"
+        )
+        right_hand_pos = self._hand_pos_for_retargeting(
+            right_hand_raw, right_wrist_mat, right_hand_ok, "right"
+        )
+
+        hands_ready = left_hand_ok and right_hand_ok
+        tele_data.left_hand_pos = left_hand_pos
+        tele_data.right_hand_pos = right_hand_pos
+        tele_data.left_hand_pinchValue = (
+            float(np.linalg.norm(left_hand_pos[4] - left_hand_pos[9]) * 100.0)
+            if left_hand_ok
+            else 0.0
+        )
+        tele_data.right_hand_pinchValue = (
+            float(np.linalg.norm(right_hand_pos[4] - right_hand_pos[9]) * 100.0)
+            if right_hand_ok
+            else 0.0
+        )
+        tele_data.hand_motion_data_ready = hands_ready
+        return hands_ready
+
+    def print_tracker_positions(self, tele_data=None):
+        info = self.read()
+        samples = [
+            ("left", info["left_tracker"], info["left_tracker_ok"]),
+            ("right", info["right_tracker"], info["right_tracker_ok"]),
+            ("head", info["head_tracker"], info["head_tracker_ok"]),
+        ]
+
+        frame_xyz_by_side = {}
+        for side, pose, valid in samples:
+            if pose is None:
+                continue
+            raw_xyz = pose[:3, 3]
+            if self._tracker_basis is not None and self._tracker_origin is not None:
+                frame_xyz = self._tracker_basis.T @ (raw_xyz - self._tracker_origin)
+                frame_xyz_by_side[side] = frame_xyz
+
+        if self._tracker_basis is None or self._tracker_origin is None:
+            print("[tracker calib pos] not calibrated. Press [c] in attention pose.", flush=True)
+        else:
+            tracker_parts = []
+            for side in ("left", "right", "head"):
+                valid = info[f"{side}_tracker_ok"]
+                frame_xyz = frame_xyz_by_side.get(side)
+                if frame_xyz is None:
+                    tracker_parts.append(f"{side}: invalid")
+                else:
+                    status = "" if valid else " stale"
+                    tracker_parts.append(f"{side}: {_fmt_vec(frame_xyz)}{status}")
+            print("[tracker calib pos] " + " | ".join(tracker_parts), flush=True)
+
+            if "left" in frame_xyz_by_side and "right" in frame_xyz_by_side:
+                center = 0.5 * (frame_xyz_by_side["left"] + frame_xyz_by_side["right"])
+                span = frame_xyz_by_side["right"] - frame_xyz_by_side["left"]
+                print(f"[tracker calib delta] center: {_fmt_vec(center)} | right-left: {_fmt_vec(span)}", flush=True)
+
+        ee_parts = []
+        for side in ("left", "right"):
+            attr = f"{side}_wrist_pose"
+            pose = None
+            if tele_data is not None and hasattr(tele_data, attr):
+                pose = getattr(tele_data, attr)
+            elif self._last_wrist_pose[side] is not None:
+                pose = self._last_wrist_pose[side]
+            if pose is None:
+                ee_parts.append(f"{side}: invalid")
+            else:
+                ee_parts.append(f"{side}: {_fmt_vec(pose[:3, 3])}")
+        print("[robot ee pos] " + " | ".join(ee_parts), flush=True)
+
+        if self._tracker_basis is None:
+            print("[tracker rot debug] not calibrated. Press [c] in attention pose.", flush=True)
+            return
+
+        for side in ("left", "right"):
+            tracker_pose = info[f"{side}_tracker"]
+            tracker_ok = info[f"{side}_tracker_ok"]
+            if not tracker_ok or tracker_pose is None:
+                print(f"[tracker rot debug] {side}: invalid tracker", flush=True)
+                continue
+
+            tracker_rot_ee = _tracker_abs_rot_to_ee_rot(tracker_pose[:3, :3], side, self._tracker_basis)
+            if tracker_rot_ee is None:
+                print(f"[tracker rot debug] {side}: invalid tracker_rot_ee", flush=True)
+                continue
+
+            relative_tracker_rot = None
+            if self._tracker_rot_ref.get(side) is not None:
+                relative_tracker_rot = _project_rotation(self._tracker_rot_ref[side].T @ tracker_rot_ee)
+
+            target_wrist_rot = None
+            if relative_tracker_rot is not None and self._wrist_ref.get(side) is not None:
+                target_wrist_rot = _project_rotation(self._wrist_ref[side][:3, :3] @ relative_tracker_rot)
+
+            attr = f"{side}_wrist_pose"
+            current_wrist_pose = None
+            if tele_data is not None and hasattr(tele_data, attr):
+                current_wrist_pose = getattr(tele_data, attr)
+            elif self._last_wrist_pose[side] is not None:
+                current_wrist_pose = self._last_wrist_pose[side]
+            current_wrist_rot = None if current_wrist_pose is None else _project_rotation(current_wrist_pose[:3, :3])
+
+            print(
+                f"[tracker rot debug] {side}\n"
+                f"tracker_rot_ee ({_rot_summary_text(tracker_rot_ee)})=\n{_fmt_mat(tracker_rot_ee)}\n"
+                f"relative_tracker_rot ({_rot_summary_text(relative_tracker_rot)})=\n{_fmt_mat(relative_tracker_rot) if relative_tracker_rot is not None else 'invalid'}\n"
+                f"target_wrist_rot_calc ({_rot_summary_text(target_wrist_rot)})=\n{_fmt_mat(target_wrist_rot) if target_wrist_rot is not None else 'invalid'}\n"
+                f"current_wrist_rot ({_rot_summary_text(current_wrist_rot)})=\n{_fmt_mat(current_wrist_rot) if current_wrist_rot is not None else 'invalid'}",
+                flush=True,
+            )
+
+
+VIVE_MANUS_READER = None
+PRINT_TRACKER_POSITION = False
+CALIBRATE_TRACKER_FRAME = False
+CALIBRATE_TRACKER_FRAME_AT = None
+CALIBRATE_TRACKER_FRAME_DELAY = 1.0
+CALIBRATE_WAIT_WARN_AT = 0.0
+START_SYNC_DELAY = 1.0
+START_SYNC_AT = None
+NECK_NEUTRAL_RESET_REQUEST = False
+NECK_CAMERA_SYNC_ACTIVE = False
+
+# Guards the [r]/[p]/[c] state transitions shared between the sshkeyboard listener
+# thread (on_press) and the main teleop loop (delayed sync / deferred calibration).
+STATE_LOCK = threading.Lock()
+
+
+def maybe_print_tracker_position(tele_data=None):
+    global PRINT_TRACKER_POSITION
+    if not PRINT_TRACKER_POSITION:
+        return
+    PRINT_TRACKER_POSITION = False
+    if VIVE_MANUS_READER is None:
+        logger_mp.warning("[Vive tracker position] reader is not ready yet.")
+        return
+    try:
+        VIVE_MANUS_READER.print_tracker_positions(tele_data=tele_data)
+    except Exception as e:
+        logger_mp.warning(f"[Vive tracker position] print failed: {e}")
+
+
+def maybe_calibrate_tracker_frame(tele_data=None):
+    global CALIBRATE_TRACKER_FRAME, CALIBRATE_TRACKER_FRAME_AT, CALIBRATE_WAIT_WARN_AT
+    if not CALIBRATE_TRACKER_FRAME:
+        return False
+    if CALIBRATE_TRACKER_FRAME_AT is not None and time.monotonic() < CALIBRATE_TRACKER_FRAME_AT:
+        return False
+    if tele_data is None:
+        now = time.monotonic()
+        if now - CALIBRATE_WAIT_WARN_AT > 1.0:
+            logger_mp.warning("[Vive/Frame] Waiting for robot EE pose before calibration.")
+            CALIBRATE_WAIT_WARN_AT = now
+        return False
+    calibrated = False
+    if VIVE_MANUS_READER is None:
+        logger_mp.warning("[Vive/Frame] reader is not ready yet.")
+    else:
+        try:
+            calibrated = bool(VIVE_MANUS_READER.calibrate_reference_frame(tele_data=tele_data))
+        except Exception as e:
+            logger_mp.warning(f"[Vive/Frame] calibration failed: {e}")
+    if calibrated:
+        CALIBRATE_TRACKER_FRAME = False
+        CALIBRATE_TRACKER_FRAME_AT = None
+        return True
+    # Keep the [c] request pending and retry instead of silently dropping it —
+    # otherwise the next [r] starts teleop uncalibrated and the arms never follow.
+    CALIBRATE_TRACKER_FRAME_AT = time.monotonic() + CALIBRATE_TRACKER_FRAME_DELAY
+    logger_mp.warning(
+        "[Vive/Frame] Calibration attempt failed; retrying in %.1fs. Hold the attention pose. "
+        "Press [c] to restart or [q] to quit.",
+        CALIBRATE_TRACKER_FRAME_DELAY,
+    )
+    return False
+
+
+def _maybe_calibrate_tracker_frame_and_pause_locked(tele_data=None):
+    global START, START_SYNC_AT, NECK_NEUTRAL_RESET_REQUEST, NECK_CAMERA_SYNC_ACTIVE
+    calibrated = maybe_calibrate_tracker_frame(tele_data=tele_data)
+    if calibrated:
+        START = False
+        NECK_NEUTRAL_RESET_REQUEST = True
+        NECK_CAMERA_SYNC_ACTIVE = False
+        if START_SYNC_AT is not None:
+            # A queued [r] is waiting on this calibration: re-arm the sync delay so the
+            # reference is captured a moment after calibration, not instantly.
+            START_SYNC_AT = time.monotonic() + START_SYNC_DELAY
+            logger_mp.info(
+                "[Vive/Frame] Calibration complete. Queued [r] resumes: sync starts in %.1fs — hold the desired pose.",
+                START_SYNC_DELAY,
+            )
+        else:
+            logger_mp.info("[Vive/Frame] Calibration complete. Press [r] to sync arm, Manus hand, and neck camera motion.")
+    return calibrated
+
+
+def maybe_calibrate_tracker_frame_and_pause(tele_data=None):
+    with STATE_LOCK:
+        return _maybe_calibrate_tracker_frame_and_pause_locked(tele_data=tele_data)
+
+
+def _maybe_start_delayed_sync_locked(arm_ik=None, arm_ctrl=None):
+    global START, START_SYNC_AT, PRINT_TRACKER_POSITION, PAUSE_TO_READY
+    global NECK_CAMERA_SYNC_ACTIVE, NECK_NEUTRAL_RESET_REQUEST
+    if START_SYNC_AT is None:
+        return False
+    if STOP:
+        START_SYNC_AT = None
+        return False
+    if CALIBRATE_TRACKER_FRAME:
+        # Calibration is still pending; keep the queued [r] and fire after it completes.
+        return False
+    if time.monotonic() < START_SYNC_AT:
+        return False
+    if START:
+        # A stale [r] press raced with an already-running teleop; do not re-fire the sync mid-run.
+        START_SYNC_AT = None
+        return False
+
+    sync_ready = VIVE_MANUS_READER is None or VIVE_MANUS_READER.calibrated
+    if sync_ready and VIVE_MANUS_READER is not None:
+        # Capture the sync reference BEFORE flipping START: starting with a broken
+        # reference leaves teleop "running" while the arms silently never follow.
+        left_wrist_ref, right_wrist_ref = _current_robot_ee_poses_from_fk(arm_ik, arm_ctrl)
+        relative_ref_ready = False
+        if left_wrist_ref is not None and right_wrist_ref is not None:
+            relative_ref_ready = VIVE_MANUS_READER.reset_relative_motion_reference(
+                left_wrist_ref,
+                right_wrist_ref,
+            )
+        if not relative_ref_ready:
+            START_SYNC_AT = time.monotonic() + START_SYNC_DELAY
+            logger_mp.warning(
+                "[teleop sync] sync reference capture failed (tracker or robot EE pose invalid); "
+                "start deferred, retrying in %.1fs. Hold the pose. Press [c] to recalibrate or [q] to quit.",
+                START_SYNC_DELAY,
+            )
+            return False
+        try:
+            VIVE_MANUS_READER.reset_head_tracker_neck_ref()
+        except Exception as exc:
+            logger_mp.debug("[Vive/Head] neck ref reset skipped: %s", exc)
+
+    START_SYNC_AT = None
+    START = True
+    PAUSE_TO_READY = False
+    PRINT_TRACKER_POSITION = True
+    NECK_NEUTRAL_RESET_REQUEST = True
+    NECK_CAMERA_SYNC_ACTIVE = bool(sync_ready)
+    if not sync_ready:
+        logger_mp.warning(
+            "[teleop start] started without Vive/Manus calibration. "
+            "Robot start/home behavior is preserved, but arm/Manus/neck camera sync stays disabled. "
+            "Press [c] to calibrate, then press [r] to sync."
+        )
+        return True
+    logger_mp.info(
+        "[teleop sync] robot, Manus hand, and neck camera sync started after %.1fs delay. "
+        "vive_arm_ref_ready=%s",
+        START_SYNC_DELAY,
+        True if VIVE_MANUS_READER is None else VIVE_MANUS_READER.relative_reference_ready,
+    )
+    return True
+
+
+def maybe_start_delayed_sync(arm_ik=None, arm_ctrl=None):
+    with STATE_LOCK:
+        return _maybe_start_delayed_sync_locked(arm_ik=arm_ik, arm_ctrl=arm_ctrl)
+
+
+def _apply_vive_manus_input(tele_data):
+    if VIVE_MANUS_READER is None:
+        return
+
+    maybe_calibrate_tracker_frame_and_pause(tele_data=tele_data)
+    if not START or CALIBRATE_TRACKER_FRAME:
+        tele_data.arm_motion_data_ready = False
+        tele_data.hand_motion_data_ready = False
+        tele_data.motion_data_ready = False
+        maybe_print_tracker_position(tele_data=tele_data)
+        return
+    if not VIVE_MANUS_READER.calibrated:
+        tele_data.arm_motion_data_ready = False
+        tele_data.hand_motion_data_ready = False
+        tele_data.motion_data_ready = False
+        now = time.monotonic()
+        if now - getattr(VIVE_MANUS_READER, "_last_calibration_required_log", 0.0) > 2.0:
+            logger_mp.warning("[Vive/Manus] Not calibrated. Press [c] in attention pose, then press [r] to sync.")
+            VIVE_MANUS_READER._last_calibration_required_log = now
+        maybe_print_tracker_position(tele_data=tele_data)
+        return
+
+    trackers_ready = VIVE_MANUS_READER.apply_relative_wrist_motion(tele_data)
+    hands_ready = VIVE_MANUS_READER.apply_manus_hand_data(tele_data)
+    tele_data.arm_motion_data_ready = trackers_ready
+    tele_data.motion_data_ready = trackers_ready or hands_ready
+    maybe_print_tracker_position(tele_data=tele_data)
+
+    if not trackers_ready:
+        now = time.monotonic()
+        if now - getattr(VIVE_MANUS_READER, "_last_tracker_wait_log", 0.0) > 2.0:
+            if not VIVE_MANUS_READER.relative_reference_ready:
+                logger_mp.warning("[Vive/Relative] Waiting for [r] sync reference from current robot EE pose.")
+            else:
+                logger_mp.warning("[Vive/Relative] Keep left/right/head trackers valid.")
+            VIVE_MANUS_READER._last_tracker_wait_log = now
+    if not hands_ready:
+        now = time.monotonic()
+        if now - getattr(VIVE_MANUS_READER, "_last_manus_wait_log", 0.0) > 2.0:
+            logger_mp.warning("[Manus] Waiting for valid left/right glove data.")
+            VIVE_MANUS_READER._last_manus_wait_log = now
+
+
+def _update_neck_control(
+    args,
+    neck_ctrl,
+    neck_feedback,
+    tele_data,
+    arm_ctrl,
+    loop_count,
+    neck_log_last_ts,
+    neck_log_interval,
+    allow_waist=True,
+):
+    global NECK_NEUTRAL_RESET_REQUEST, NECK_CAMERA_SYNC_ACTIVE
+    if neck_ctrl is None:
+        return None, neck_log_last_ts
+    try:
+        if args.neck_input_source == "vive_head":
+            if VIVE_MANUS_READER is None:
+                raise ValueError("Vive/Manus reader is not ready")
+            if not VIVE_MANUS_READER.calibrated:
+                NECK_CAMERA_SYNC_ACTIVE = False
+                raise ValueError("Vive/Manus frame is not calibrated. Press [c] first, then press [r].")
+            neck_measured, neck_pose_valid = VIVE_MANUS_READER.read_head_tracker_yaw_pitch_for_neck(
+                yaw_sign=args.vive_head_neck_yaw_sign,
+                pitch_sign=args.vive_head_neck_pitch_sign,
+            )
+            if not neck_pose_valid or neck_measured is None:
+                raise ValueError("Vive head tracker is not calibrated, invalid, or stale")
+            neck_pose = _pose_from_yaw_pitch(neck_measured)
+        else:
+            if tele_data is None or not getattr(tele_data, "head_pose_is_valid", True):
+                raise ValueError("Vision Pro head pose is invalid")
+            neck_pose = tele_data.head_pose
+            neck_measured = neck_ctrl._extract_yaw_pitch(neck_pose)
+
+        if NECK_NEUTRAL_RESET_REQUEST:
+            neck_ctrl.reset_neutral()
+            NECK_NEUTRAL_RESET_REQUEST = False
+            logger_mp.info("[teleop neck] neutral reset after Vive/Frame calibration.")
+
+        neck_command, neck_target = neck_ctrl.update(neck_pose)
+        neck_actual = neck_feedback.read_latest() if neck_feedback is not None else None
+        neck_record = {
+            "raw_head_yaw_pitch": neck_measured.tolist(),
+            "target_yaw_pitch": neck_target.tolist(),
+            "command_yaw_pitch": neck_command.tolist(),
+            "actual_yaw_pitch": None if neck_actual is None else neck_actual.get("yaw_pitch"),
+            "actual_timestamp": None if neck_actual is None else neck_actual.get("timestamp"),
+        }
+        waist_command = None
+        if allow_waist and args.enable_waist_follow_neck and arm_ctrl is not None:
+            waist_direction = -1.0 if args.waist_follow_neck_invert else 1.0
+            waist_command = arm_ctrl.ctrl_waist_yaw(
+                neck_command[0] * args.waist_yaw_gain * waist_direction,
+                limit=args.waist_yaw_limit,
+                velocity_limit=args.waist_yaw_velocity,
+            )
+        now = time.time()
+        should_log_neck = neck_log_interval is not None and now - neck_log_last_ts >= neck_log_interval
+        if should_log_neck:
+            neck_log_last_ts = now
+            waist_actual = None
+            waist_error = None
+            if waist_command is not None:
+                waist_actual = arm_ctrl.get_waist_yaw_relative_position()
+                waist_error = waist_command - waist_actual
+            logger_mp.info(
+                f"[teleop neck] source={args.neck_input_source} "
+                f"raw_head={np.round(neck_measured, 4).tolist()} "
+                f"target={np.round(neck_target, 4).tolist()} "
+                f"command={np.round(neck_command, 4).tolist()} "
+                f"actual={None if neck_actual is None else np.round(neck_actual.get('yaw_pitch'), 4).tolist()} "
+                f"waist_yaw={None if waist_command is None else round(waist_command, 4)} "
+                f"waist_actual={None if waist_actual is None else round(waist_actual, 4)} "
+                f"waist_error={None if waist_error is None else round(waist_error, 4)}"
+            )
+        return neck_record, neck_log_last_ts
+    except (ValueError, OSError) as e:
+        if loop_count % 30 == 0:
+            logger_mp.warning(f"[teleop neck] command skipped: {e}")
+        return None, neck_log_last_ts
+
 # state transition
 START          = False  # Enable to start robot following VR user motion
 STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+PAUSE_TO_READY = False  # True while teleop is paused by [p]; arms are driven back to the ready pose
 TACTILE_VR_OVERLAY_VISIBLE = True  # Toggle RH5DG2 tactile overlay visibility in the XR viewer
 # waist keyboard control (H1_2 only): [j]/[k] nudge the waist yaw left/right during teleop
 WAIST_YAW_REL     = 0.0     # current relative waist-yaw target (rad, relative to startup home)
@@ -71,11 +1566,59 @@ WAIST_KEY_INVERT  = False   # swap [j]/[k] direction; overwritten from args in m
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
+    with STATE_LOCK:
+        _on_press_locked(key)
+
+
+def _on_press_locked(key):
     global STOP, START, READY, RECORD_RUNNING, RECORD_TOGGLE, TACTILE_VR_OVERLAY_VISIBLE, WAIST_YAW_REL
+    global PRINT_TRACKER_POSITION, CALIBRATE_TRACKER_FRAME, CALIBRATE_TRACKER_FRAME_AT
+    global START_SYNC_AT, PAUSE_TO_READY
+    global NECK_CAMERA_SYNC_ACTIVE, NECK_NEUTRAL_RESET_REQUEST
     if key == 'r':
-        START = True
+        if START:
+            logger_mp.warning("[teleop] ignored [r]: teleop is already running. Press [p] to pause, or [q] to quit.")
+            return
+        START = False
+        PAUSE_TO_READY = False
+        PRINT_TRACKER_POSITION = False
+        START_SYNC_AT = time.monotonic() + START_SYNC_DELAY
+        NECK_CAMERA_SYNC_ACTIVE = False
+        NECK_NEUTRAL_RESET_REQUEST = True
+        if CALIBRATE_TRACKER_FRAME:
+            # Do not drop the [r]: keep it queued so the sync fires automatically
+            # (with a fresh delay) once the pending calibration completes.
+            logger_mp.info(
+                "[teleop sync] [r] queued while calibration is pending. "
+                "Sync will start %.1fs after calibration completes.",
+                START_SYNC_DELAY,
+            )
+        elif VIVE_MANUS_READER is not None and not VIVE_MANUS_READER.calibrated:
+            logger_mp.warning(
+                "[teleop start] [r] pressed before calibration. "
+                "Robot start/home behavior will run in %.1fs, but arm/Manus/neck camera sync requires [c] first.",
+                START_SYNC_DELAY,
+            )
+        else:
+            logger_mp.info("[teleop sync] [r] pressed. Sync will start in %.1fs; hold the desired pose.", START_SYNC_DELAY)
+    elif key == 'p':
+        if START:
+            # Pause teleop: drive the arms back to the ready pose and wait for [r] to resume.
+            START = False
+            START_SYNC_AT = None
+            PAUSE_TO_READY = True
+            PRINT_TRACKER_POSITION = False
+            NECK_CAMERA_SYNC_ACTIVE = False
+            NECK_NEUTRAL_RESET_REQUEST = True
+            logger_mp.info(
+                "[teleop pause] [p] pressed during teleop. Arms return to the ready pose and stay paused; "
+                "press [r] to re-sync and resume."
+            )
+        else:
+            logger_mp.warning("[teleop pause] ignored [p] because teleop is not running. Press [r] to start.")
     elif key == 'q':
         START = False
+        START_SYNC_AT = None
         STOP = True
     elif key == 's':
         if START == True and (READY or RECORD_RUNNING):
@@ -107,6 +1650,23 @@ def on_press(key):
         else:
             WAIST_YAW_REL = 0.0
             logger_mp.info("[teleop waist keyboard] [i] waist reset to home (0.0 deg)")
+    elif key == 'c':
+        START = False
+        START_SYNC_AT = None
+        NECK_CAMERA_SYNC_ACTIVE = False
+        NECK_NEUTRAL_RESET_REQUEST = True
+        if VIVE_MANUS_READER is not None:
+            try:
+                VIVE_MANUS_READER.reset_calibration()
+                VIVE_MANUS_READER.reset_head_tracker_neck_ref()
+            except Exception as exc:
+                logger_mp.debug("[Vive/Frame] calibration reset skipped: %s", exc)
+        CALIBRATE_TRACKER_FRAME = True
+        CALIBRATE_TRACKER_FRAME_AT = time.monotonic() + CALIBRATE_TRACKER_FRAME_DELAY
+        logger_mp.info(
+            f"[Vive/Frame] Calibration scheduled in {CALIBRATE_TRACKER_FRAME_DELAY:.1f}s. "
+            "Motion and neck camera sync are paused until [r]."
+        )
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -188,21 +1748,6 @@ def _read_body_qpos(arm_ctrl, enabled=True):
         return []
     return qpos.tolist()
 
-def _waist_state_snapshot(commanded_rel_rad, source):
-    """Snapshot the H1_2 waist yaw COMMAND at record start so each episode's data.json records
-    the commanded waist angle it was collected at, in both degrees (human-readable) and radians.
-    commanded_rel_rad is the current [j]/[k] relative target (rad, relative to startup home);
-    it is 0.0 before any [j]/[k] press and updates as the keys nudge the waist."""
-    snap = {
-        "source": source,  # "keyboard" | "follow_neck" | "fixed"
-        "commanded_relative_deg": None,
-        "commanded_relative_rad": None,
-    }
-    if commanded_rel_rad is not None:
-        snap["commanded_relative_rad"] = round(float(commanded_rel_rad), 6)
-        snap["commanded_relative_deg"] = round(float(np.degrees(commanded_rel_rad)), 3)
-    return snap
-
 def _safe_render_to_xr(tv_wrapper, image, log_prefix):
     try:
         tv_wrapper.render_to_xr(image)
@@ -266,6 +1811,7 @@ class RH5DG2TactileUDPReceiver:
         self.lock = threading.Lock()
         self.latest = {}
         self.last_rx_time = 0.0
+        self.side_last_rx_time = {"left_ee": 0.0, "right_ee": 0.0}
         self.packets = 0
         self.errors = 0
         self.last_debug = 0.0
@@ -289,8 +1835,31 @@ class RH5DG2TactileUDPReceiver:
                 if not isinstance(packet, dict):
                     raise ValueError("packet is not a JSON object")
                 with self.lock:
-                    self.latest = packet
-                    self.last_rx_time = time.time()
+                    now = time.time()
+                    side_updates = {}
+                    for side in ("left_ee", "right_ee"):
+                        if isinstance(packet.get(side), dict):
+                            side_updates[side] = packet[side]
+                    tactiles = packet.get("tactiles")
+                    if isinstance(tactiles, dict):
+                        for side in ("left_ee", "right_ee"):
+                            if isinstance(tactiles.get(side), dict):
+                                side_updates[side] = tactiles[side]
+                    if side_updates:
+                        merged = {
+                            key: value
+                            for key, value in self.latest.items()
+                            if key in ("left_ee", "right_ee")
+                        }
+                        merged.update(copy.deepcopy(side_updates))
+                        merged["timestamp"] = packet.get("timestamp", now)
+                        merged["source"] = packet.get("source", "rh5dg2_tactile_udp")
+                        self.latest = merged
+                        for side in side_updates:
+                            self.side_last_rx_time[side] = now
+                    else:
+                        self.latest = packet
+                    self.last_rx_time = now
                     self.packets += 1
             except Exception as exc:
                 with self.lock:
@@ -323,9 +1892,16 @@ class RH5DG2TactileUDPReceiver:
                 return {}
             latest = copy.deepcopy(self.latest)
             age = now - self.last_rx_time
+            stale_sides = [
+                side
+                for side, stamp in self.side_last_rx_time.items()
+                if stamp > 0.0 and now - stamp > self.timeout
+            ]
         if age > self.timeout:
             latest["_stale"] = True
             latest["_age_sec"] = age
+        if stale_sides:
+            latest["_stale_sides"] = stale_sides
         return latest
 
     def close(self):
@@ -918,6 +2494,30 @@ def _make_arm_ready_q(current_q):
         q[half + 3] = -0.3
     return q
 
+def _se3_to_mat(se3):
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, :3] = np.asarray(se3.rotation, dtype=np.float64)
+    mat[:3, 3] = np.asarray(se3.translation, dtype=np.float64).reshape(3)
+    return mat
+
+def _current_robot_ee_poses_from_fk(arm_ik, arm_ctrl):
+    if arm_ik is None or arm_ctrl is None or not hasattr(arm_ctrl, "get_current_dual_arm_q"):
+        return None, None
+    try:
+        q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
+        model = arm_ik.reduced_robot.model
+        data = arm_ik.reduced_robot.data
+        if q.size != model.nq or not np.isfinite(q).all():
+            raise ValueError(f"invalid q size={q.size}, expected={model.nq}")
+        import pinocchio as pin
+        pin.framesForwardKinematics(model, data, q)
+        left_id = getattr(arm_ik, "L_hand_id", model.getFrameId("L_ee"))
+        right_id = getattr(arm_ik, "R_hand_id", model.getFrameId("R_ee"))
+        return _se3_to_mat(data.oMf[left_id]), _se3_to_mat(data.oMf[right_id])
+    except Exception as exc:
+        logger_mp.warning("[teleop sync] failed to compute current robot EE pose for Vive reference: %s", exc)
+        return None, None
+
 def _smooth_arm_go_home(arm_ctrl, duration=3.0, frequency=100.0, velocity_cap=3.0):
     """Gradually lower both arms (and the H1_2 waist) from the current pose to the
     zero/home pose using a cosine ease, so they descend smoothly on exit instead of
@@ -984,6 +2584,50 @@ def _safe_enter_hand_standby_open(hand_ctrl):
             logger_mp.debug("[teleop hand standby] enter_standby_open failed: %s", exc)
     return False
 
+
+_ARM_JOINT_INDEX_BY_MODEL = {
+    "G1_29": G1_29_JointArmIndex,
+    "G1_23": G1_23_JointArmIndex,
+    "H1_2": H1_2_JointArmIndex,
+    "H1": H1_JointArmIndex,
+    "H2": H2_JointArmIndex,
+}
+
+
+def _format_motor_temperature(value):
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return "[" + ",".join(str(int(item)) for item in value) + "]"
+    return str(int(value))
+
+
+def _maybe_log_arm_joint_temperatures(args, arm_ctrl, last_log_time):
+    """Log the latest DDS arm-joint temperatures without another DDS reader."""
+    interval = max(0.0, float(args.joint_temperature_interval))
+    now = time.monotonic()
+    if interval <= 0.0 or arm_ctrl is None or now - last_log_time < interval:
+        return last_log_time
+
+    try:
+        temperatures = arm_ctrl.get_current_motor_temperatures()
+        joint_indices = _ARM_JOINT_INDEX_BY_MODEL[args.arm]
+        left = []
+        right = []
+        for joint in joint_indices:
+            value = temperatures[joint.value]
+            if value is None:
+                continue
+            item = f"{joint.name}={_format_motor_temperature(value)}"
+            (left if joint.name.startswith("kLeft") else right).append(item)
+        logger_mp.info(
+            "[arm joint temperature °C] robot=%s left={%s} right={%s}",
+            args.arm,
+            " ".join(left),
+            " ".join(right),
+        )
+    except Exception as exc:
+        logger_mp.warning("[arm joint temperature] read skipped: %s", exc)
+    return now
+
 def _safe_enter_hand_auto(hand_ctrl):
     if hand_ctrl is not None and hasattr(hand_ctrl, "enter_auto"):
         try:
@@ -1020,12 +2664,40 @@ if __name__ == '__main__':
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='H1_2', help='Select arm controller')
-    parser.add_argument('--arm-reference-mode', type=str, choices=['fixed', 'head_yaw_compensated', 'head', 'head_yaw'], default='fixed', help='XR wrist reference mode for arm IK. fixed (default) freezes the reference frame (initial head yaw + position) at tracking start so head motion never affects the arm targets; head subtracts the LIVE head position (head rotation still shifts targets by the device arc); head_yaw_compensated rotates targets WITH the head yaw (broken: raw wrist poses are already world-frame); head_yaw is the legacy live-head-yaw mode (arms rotate opposite to the head).')
-    parser.add_argument('--arm-yaw-compensation-sign', type=float, choices=[-1.0, 1.0], default=1.0, help='Yaw compensation direction for --arm-reference-mode head_yaw_compensated.')
+    parser.add_argument('--joint-temperature-interval', type=float, default=0.0, help='Seconds between arm-joint temperature logs from rt/lowstate. Set a positive value to enable (default: disabled).')
+    parser.add_argument('--comm-log', action=argparse.BooleanOptionalAction, default=True, help='Write a per-run JSONL log of arm/hand commands, states, DDS health, and motor temperatures (default: enabled).')
+    parser.add_argument('--comm-log-dir', type=str, default=None, help='Directory for communication/state logs (default: <teleop>/logs/comm_state).')
+    parser.add_argument('--comm-log-temp-interval', type=float, default=5.0, help='Seconds between motor-temperature records in the comm log (default: 5.0; 0 disables).')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco'], default='rh5dg2_dfx', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--viewer-host-ip', type=str, default=None, help='Host IP advertised to the XR browser for the HTTPS/WSS viewer. If omitted, infer it from the route to --img-server-ip.')
-    parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
+    parser.add_argument('--network-interface', type=str, default='enp44s0', help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
+    # Vive Tracker / Manus ROS2 input parameters
+    parser.add_argument('--left-tracker-name', type=str, default='LHR-36B992CB', help='libsurvive TF child frame for the left wrist tracker')
+    parser.add_argument('--right-tracker-name', type=str, default='LHR-0FAD1369', help='libsurvive TF child frame for the right wrist tracker')
+    parser.add_argument('--head-tracker-name', type=str, default='LHR-1F621773', help='libsurvive TF child frame for the head tracker; empty string disables head tracking')
+    parser.add_argument('--libsurvive-tracking-frame', type=str, default='libsurvive_world', help='libsurvive TF parent frame')
+    parser.add_argument('--ros-stale-timeout', type=float, default=0.5, help='Seconds before ROS2 tracker/glove data is considered stale')
+    parser.add_argument('--vive-transport', type=str, choices=['tf', 'udp_json'], default='udp_json', help='How to receive Vive tracker poses. udp_json reads JSON packets from vive_tf_to_udp.py.')
+    parser.add_argument('--vive-udp-host', type=str, default='0.0.0.0', help='UDP bind host for --vive-transport udp_json.')
+    parser.add_argument('--vive-udp-port', type=int, default=56130, help='UDP bind port for --vive-transport udp_json.')
+    parser.add_argument('--manus-transport', type=str, choices=['ros2', 'udp_json'], default='udp_json', help='How to receive Manus hand landmarks. udp_json reads JSON packets from manus_ros2_to_udp.py.')
+    parser.add_argument('--manus-udp-host', type=str, default='0.0.0.0', help='UDP bind host for --manus-transport udp_json.')
+    parser.add_argument('--manus-udp-port', type=int, default=56120, help='UDP bind port for --manus-transport udp_json.')
+    parser.add_argument('--manus-topics', type=str, nargs='+', default=['manus_glove_0', 'manus_glove_1'], help='ROS2 Manus glove topics; msg.side or topic name must identify left/right')
+    parser.add_argument('--manus-msg-type', type=str, default='manus_ros2_msgs/msg/ManusGlove', help='ROS2 message type for Manus glove data')
+    parser.add_argument('--manus-hand-transform', type=str, choices=['legacy', 'televuer'], default='legacy', help='Manus wrist-local hand axis transform before retargeting. legacy is the correct Manus raw-skeleton transform; televuer is accepted only as a deprecated alias.')
+    parser.add_argument('--enable-manus-haptics', action=argparse.BooleanOptionalAction, default=True, help='Map RH5DG2 fingertip normal force to MANUS finger vibration through the UDP bridge (default: enabled).')
+    parser.add_argument('--manus-haptic-host', type=str, default=os.getenv('MANUS_HAPTIC_HOST', '192.168.123.54'), help='Host running manus_ros2_to_udp.py with its haptic listener enabled. Defaults to MANUS_HAPTIC_HOST or 192.168.123.54.')
+    parser.add_argument('--manus-haptic-port', type=int, default=56121, help='UDP haptic command port on manus_ros2_to_udp.py.')
+    parser.add_argument('--manus-haptic-hz', type=float, default=20.0, help='MANUS haptic command heartbeat frequency.')
+    parser.add_argument('--manus-haptic-baseline-seconds', type=float, default=0.5, help='Quiet normal-force baseline duration after haptics become active.')
+    parser.add_argument('--manus-haptic-ema-alpha', type=float, default=0.9, help='EMA alpha for fingertip normal force before vibration mapping.')
+    parser.add_argument('--manus-haptic-deadband', type=float, default=1.0, help='Baseline-corrected normal-force deadband.')
+    parser.add_argument('--manus-haptic-normal-max', type=float, default=1000.0, help='Normal force value mapped to maximum MANUS vibration.')
+    parser.add_argument('--manus-haptic-gamma', type=float, default=1.0, help='Exponent applied after normalizing MANUS vibration power.')
+    parser.add_argument('--manus-haptic-debug-rate', type=float, default=0.0, help='Periodic raw fingertip normal force log rate in Hz. Set 0 to disable.')
+    parser.add_argument('--start-sync-delay', type=float, default=START_SYNC_DELAY, help='Seconds to wait after pressing [r] before enabling robot/Manus/neck sync.')
     parser.add_argument('--camera', '--viewer-camera', dest='camera', type=str, choices=['head', 'left_wrist', 'right_wrist', 'both', 'both_wrist', 'head_and_wrist', 'head_wrist', 'all'], default='head', help='Camera stream shown in the 8012 XR viewer. Use head_and_wrist to show the head view with both wrist cameras below it.')
     parser.add_argument('--viewer-camera-mode', type=str, choices=['auto', 'webrtc', 'zmq', 'none'], default='zmq', help='Select how the 8012 XR viewer receives the selected camera.')
     parser.add_argument('--viewer-display-fps', type=float, default=15.0, help='XR JPEG push rate for ZMQ camera mode. Lower this on congested Wi-Fi.')
@@ -1045,7 +2717,12 @@ if __name__ == '__main__':
     parser.add_argument('--inspire-dg2-transport', type=str, choices=['dds', 'serial'], default='dds', help='Inspire RH5DG2 transport. Use dds with rh5dg2_serial_dds_bridge.py on the robot PC.')
     parser.add_argument('--inspire-dg2-bridge-host', type=str, default=None, help='Reserved for legacy UDP bridge mode.')
     parser.add_argument('--inspire-dg2-bridge-port', type=int, default=9720, help='Reserved for legacy UDP bridge mode.')
-    parser.add_argument('--rh5dg2-log-throttle', type=float, default=1.0, help='RH5DG2 controller debug log rate in Hz.')
+    parser.add_argument('--inspire-dg2-thumb-curl-gain', type=float, default=1.0, help='Inspire DG2 thumb landmark curl gain before thresholding.')
+    parser.add_argument('--inspire-dg2-right-thumb-curl-gain', type=float, default=1.0, help='Extra Inspire DG2 right-thumb multiplier after --inspire-dg2-thumb-curl-gain.')
+    parser.add_argument('--inspire-dg2-thumb-curl-threshold', type=float, default=0.12, help='Inspire DG2 thumb curl deadzone before the thumb boost activates.')
+    parser.add_argument('--inspire-dg2-thumb-curl-strength', type=float, default=0.0, help='Inspire DG2 thumb boost strength toward the closed raw target.')
+    parser.add_argument('--inspire-dg2-thumb-curl-log-rate', type=float, default=0.0, help='Inspire DG2 thumb curl boost debug log rate in Hz. Set 0 to disable.')
+    parser.add_argument('--rh5dg2-log-throttle', type=float, default=0.0, help='RH5DG2 controller debug log rate in Hz. Set 0 to disable debug prints.')
     parser.add_argument('--rh5dg2-hand-swap', action='store_true', help='Enable RH5DG2-only left/right hand input swap for devices that report swapped hand labels.')
     parser.add_argument('--rh5dg2-fast-mode', action=argparse.BooleanOptionalAction, default=True, help='Enable lower-latency RH5DG2 retarget settings.')
     parser.add_argument('--rh5dg2-retarget-mode', type=str, choices=['config', 'vector', 'dexpilot'], default='config', help='RH5DG2 retargeting mode. config uses assets/RH5DG2/RH5DG2.yml; dexpilot enables DexPilot without editing the YAML type.')
@@ -1069,6 +2746,7 @@ if __name__ == '__main__':
     parser.add_argument('--headless', action=argparse.BooleanOptionalAction, default=True, help='Enable headless mode and disable Rerun recording visualization by default. Use --no-headless to enable Rerun.')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--disable-arm', action='store_true', help='Disable arm IK/control while keeping XR and hand paths alive.')
+    parser.add_argument('--disable-arm-tracking', action='store_true', help='Initialize and hold the arms at their start pose while keeping the normal Vive calibration/sync and Manus hand-control flow.')
     parser.add_argument('--disable-body', action=argparse.BooleanOptionalAction, default=True, help='Disable high-level body/loco command publishing.')
     parser.add_argument('--hand-only', action='store_true', help='Run XR input and end-effector hand control only; arm and body control stay off.')
     parser.add_argument('--enable-neck', action=argparse.BooleanOptionalAction, default=True, help='Send Vision Pro head yaw/pitch to the external UDP neck controller.')
@@ -1078,14 +2756,19 @@ if __name__ == '__main__':
     parser.add_argument('--neck-pitch-limit', type=float, default=0.8, help='Absolute relative neck pitch command limit in radians.')
     parser.add_argument('--neck-smoothing-alpha', type=float, default=0.25, help='Neck command low-pass alpha from 0 to 1.')
     parser.add_argument('--neck-max-step', type=float, default=0.08, help='Maximum neck command change per control frame in radians.')
+    parser.add_argument('--neck-command-deadband', type=float, default=0.04, help='Minimum yaw/pitch command change in radians before sending a new neck UDP command. Set 0 to send every frame.')
     parser.add_argument('--neck-feedback-port', type=int, default=9093, help='UDP port that receives actual neck yaw,pitch feedback from the pan/tilt process.')
     parser.add_argument('--neck-log-rate', type=float, default=0.0, help='Neck debug log rate in Hz. Set 0 to disable periodic neck logs.')
+    parser.add_argument('--neck-input-source', type=str, choices=['visionpro', 'vive_head'], default='vive_head', help='Head orientation source for neck/camera control. vive_head maps calibrated Vive head tracker relative Y->yaw and X->pitch, ignoring roll.')
+    parser.add_argument('--vive-head-neck-yaw-sign', type=float, choices=[-1.0, 1.0], default=-1.0, help='Sign for Vive head tracker Y-axis yaw when --neck-input-source vive_head.')
+    parser.add_argument('--vive-head-neck-pitch-sign', type=float, choices=[-1.0, 1.0], default=-1.0, help='Sign for Vive head tracker X-axis pitch when --neck-input-source vive_head.')
     parser.add_argument('--enable-waist-follow-neck', action='store_true', help='Make the H1_2 waist yaw slowly follow the neck yaw command, including in --motion mode.')
     parser.add_argument('--waist-follow-neck-invert', action=argparse.BooleanOptionalAction, default=True, help='Rotate the H1_2 waist OPPOSITE to the head/neck yaw direction. Use --no-waist-follow-neck-invert to make the waist turn the same way as the head.')
     parser.add_argument('--waist-yaw-gain', type=float, default=0.5, help='H1_2 waist-yaw gain applied to the neck yaw command.')
     parser.add_argument('--waist-yaw-limit', type=float, default=0.2618, help='H1_2 relative waist-yaw limit in radians; default is about 15 degrees.')
     parser.add_argument('--waist-yaw-velocity', type=float, default=0.25, help='H1_2 waist-yaw velocity limit in radians per second.')
     parser.add_argument('--enable-waist-keyboard', action='store_true', help='Rotate the H1_2 waist yaw with the [j]/[k] keys during teleop (sshkeyboard mode). Reuses --waist-yaw-limit and --waist-yaw-velocity; mutually exclusive with --enable-waist-follow-neck.')
+    parser.add_argument('--log-waist-angle', action='store_true', help='Periodically log the current H1_2 waist angle (default: disabled).')
     parser.add_argument('--waist-keyboard-step', type=float, default=0.05, help='Radians the H1_2 waist yaw moves per [j]/[k] key press (default ~2.9 deg).')
     parser.add_argument('--waist-keyboard-invert', action='store_true', help='Swap the [j]/[k] waist rotation direction.')
     parser.add_argument('--skip-arm-go-home-on-exit', action='store_true', help='Do not command arm zero/home pose during shutdown.')
@@ -1098,16 +2781,23 @@ if __name__ == '__main__':
     parser.add_argument('--rh5dg2-gain', type=float, default=1.0, help='RH5DG2 safe raw command gain from baseline toward retarget target.')
     parser.add_argument('--rh5dg2-raw-close-direction', type=float, default=-1.0, help='RH5DG2 safe raw close direction; use -1 if raw pitch closes in the opposite direction.')
     parser.add_argument('--rh5dg2-safe-baseline', type=str, default='demo_open', help='RH5DG2 safe raw open baseline: demo_open, current, or 13 comma-separated angleSet values.')
+    parser.add_argument('--rh5dg2-lock-spread-joints', action=argparse.BooleanOptionalAction, default=True, help='Hold RH5DG2 spread raw actuators 3 and 5 at the safe baseline value.')
     parser.add_argument('--rh5dg2-restore-repeat', type=int, default=80, help='RH5DG2 init-pose restore publish count on exit.')
     parser.add_argument('--rh5dg2-restore-interval', type=float, default=0.1, help='RH5DG2 init-pose restore publish interval in seconds.')
     parser.add_argument('--rh5dg2-restore-settle', type=float, default=0.75, help='Extra wait after RH5DG2 init-pose restore publishes.')
     parser.add_argument('--rh5dg2-curl-scale', type=float, default=1.2, help='Global RH5DG2 landmark curl multiplier before clipping.')
-    parser.add_argument('--rh5dg2-index-curl-scale', type=float, default=1.8, help='Additional RH5DG2 index-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-index-curl-scale', type=float, default=1.2, help='Additional RH5DG2 index-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-middle-curl-scale', type=float, default=0.85, help='Additional RH5DG2 middle-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-ring-curl-scale', type=float, default=0.85, help='Additional RH5DG2 ring-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-little-curl-scale', type=float, default=0.85, help='Additional RH5DG2 little-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-thumb-curl-scale', type=float, default=3.0, help='Additional RH5DG2 thumb landmark curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-thumb-curl-threshold', type=float, default=0.15, help='RH5DG2 thumb curl deadzone for curl-source thumb control; higher values make the thumb open more easily.')
     parser.add_argument('--rh5dg2-enable-thumb', action=argparse.BooleanOptionalAction, default=True, help='Enable RH5DG2 safe thumb actuators 10,11,12.')
-    parser.add_argument('--rh5dg2-thumb-source', type=str, choices=['curl', 'raw'], default='raw', help='RH5DG2 safe thumb close-ratio source.')
-    parser.add_argument('--rh5dg2-thumb10-scale', type=float, default=1.5, help='RH5DG2 thumb actuator 10 curl scale.')
+    parser.add_argument('--rh5dg2-thumb-source', type=str, choices=['curl', 'raw'], default='curl', help='RH5DG2 safe thumb close-ratio source.')
+    parser.add_argument('--rh5dg2-thumb10-scale', type=float, default=1.8, help='RH5DG2 thumb actuator 10 curl scale.')
     parser.add_argument('--rh5dg2-thumb11-scale', type=float, default=1.0, help='RH5DG2 thumb actuator 11 curl scale.')
-    parser.add_argument('--rh5dg2-thumb12-scale', type=float, default=1.5, help='RH5DG2 thumb actuator 12 curl scale.')
+    parser.add_argument('--rh5dg2-thumb12-scale', type=float, default=1.8, help='RH5DG2 thumb actuator 12 curl scale.')
+    parser.add_argument('--rh5dg2-right-thumb-close-gain', type=float, default=2.8, help='Extra close-ratio gain for the RH5DG2 right thumb after thumb source selection.')
     parser.add_argument('--rh56f1-tactile-port', type=str, default=None, help='Shortcut for a single RH56F1 tactile serial port; records as right_ee.')
     parser.add_argument('--rh56f1-tactile-left-port', type=str, default=None, help='RH56F1 left_ee tactile serial port.')
     parser.add_argument('--rh56f1-tactile-right-port', type=str, default=None, help='RH56F1 right_ee tactile serial port.')
@@ -1136,11 +2826,6 @@ if __name__ == '__main__':
     parser.add_argument('--no-loop', dest='loop', action='store_false', help='Disable Config Loop streaming')
     parser.add_argument('--loop-addr', type=str, default='127.0.0.1:5590', help='Config Loop sidecar TCP host:port')
     parser.add_argument('--loop-hand-name', type=str, default='rh5dg2', help='Config Loop source name for the separate RH5DG2 tactile stream.')
-    parser.add_argument('--loop-source-key', type=str, default='robot-step', help='Config Loop robot-state source_key; match this to the Cell Config robot source role.')
-    parser.add_argument('--loop-action-space', type=str, default='target_joint_position', help="Config Loop robot action_space label (Loop's SDK example uses 'target_joint_position').")
-    parser.add_argument('--loop-robot-type', type=str, default=None, help='Config Loop robot_type label to advertise (default: arm root key, e.g. g1/h1_2). Empty string to omit.')
-    parser.add_argument('--loop-gripper-type', type=str, default=None, help='Config Loop gripper_type label to advertise. Default: derived from --ee. Empty string to omit.')
-    parser.add_argument('--loop-finger-type', type=str, default=None, help='Config Loop finger_type label to advertise. Default: derived from --ee. Empty string to omit.')
     # record mode and task info
     parser.add_argument('--record', action=argparse.BooleanOptionalAction, default=True, help='Enable data recording mode')
     parser.add_argument('--screen-record', action='store_true', help='Record only the head camera view to MP4; toggle with s.')
@@ -1148,7 +2833,7 @@ if __name__ == '__main__':
     parser.add_argument('--record-body-state', action=argparse.BooleanOptionalAction, default=True, help='Record full robot/body qpos from arm controller lowstate when available.')
     parser.add_argument('--record-depth', action=argparse.BooleanOptionalAction, default=True, help='Compute and save head stereo depth while recording (ZED factory calibration + SGBM on this PC; robot side unchanged).')
     parser.add_argument('--record-depth-scale', type=float, default=0.5, help='Depth computation scale relative to one eye image (0.5 -> 640x360 from 1280x720).')
-    parser.add_argument('--zed-calib', type=str, default='', help='Path to the ZED factory calibration .conf. Default: assets/zed_calib/SN19294463.conf in this repo.')
+    parser.add_argument('--zed-calib', type=str, default='', help='Path enable-neckto the ZED factory calibration .conf. Default: assets/zed_calib/SN19294463.conf in this repo.')
     parser.add_argument('--enable-audio', action='store_true', help='Record host-side microphone audio continuously into episode_xxxx/audios/audio.wav.')
     parser.add_argument('--audio-device', type=str, default='plughw:2,0', help='ALSA/sounddevice input device for host-side continuous audio.')
     parser.add_argument('--audio-sample-rate', type=int, default=48000, help='Host-side continuous audio sample rate in Hz.')
@@ -1166,7 +2851,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
-    parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
+    parser.add_argument('--task-desc', type = str, default = 'distance:o', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
@@ -1174,14 +2859,46 @@ if __name__ == '__main__':
         raise ValueError("--viewer-display-fps must be greater than zero.")
     if not 1 <= args.viewer_jpeg_quality <= 100:
         raise ValueError("--viewer-jpeg-quality must be between 1 and 100.")
+    if args.ros_stale_timeout <= 0.0:
+        raise ValueError("--ros-stale-timeout must be greater than zero.")
+    if args.vive_transport == "udp_json" and args.vive_udp_port <= 0:
+        raise ValueError("--vive-udp-port must be greater than zero.")
+    if args.manus_transport == "udp_json" and args.manus_udp_port <= 0:
+        raise ValueError("--manus-udp-port must be greater than zero.")
+    if args.enable_manus_haptics:
+        if not args.manus_haptic_host:
+            raise ValueError("--manus-haptic-host must not be empty.")
+        if not 1 <= args.manus_haptic_port <= 65535:
+            raise ValueError("--manus-haptic-port must be between 1 and 65535.")
+        if args.manus_haptic_hz <= 0.0:
+            raise ValueError("--manus-haptic-hz must be greater than zero.")
+        if args.manus_haptic_baseline_seconds < 0.0:
+            raise ValueError("--manus-haptic-baseline-seconds must be zero or greater.")
+        if not 0.0 < args.manus_haptic_ema_alpha <= 1.0:
+            raise ValueError("--manus-haptic-ema-alpha must be greater than 0 and at most 1.")
+        if args.manus_haptic_deadband < 0.0:
+            raise ValueError("--manus-haptic-deadband must be zero or greater.")
+        if args.manus_haptic_normal_max <= 0.0:
+            raise ValueError("--manus-haptic-normal-max must be greater than zero.")
+        if args.manus_haptic_gamma <= 0.0:
+            raise ValueError("--manus-haptic-gamma must be greater than zero.")
+        if args.manus_haptic_debug_rate < 0.0:
+            raise ValueError("--manus-haptic-debug-rate must be zero or greater.")
+    if args.start_sync_delay < 0.0:
+        raise ValueError("--start-sync-delay must be zero or greater.")
+    START_SYNC_DELAY = float(args.start_sync_delay)
     if not 0.0 <= args.neck_smoothing_alpha <= 1.0:
         raise ValueError("--neck-smoothing-alpha must be between 0 and 1.")
     if args.neck_yaw_limit <= 0.0 or args.neck_pitch_limit <= 0.0:
         raise ValueError("--neck-yaw-limit and --neck-pitch-limit must be greater than zero.")
     if args.neck_max_step < 0.0:
         raise ValueError("--neck-max-step must be zero or greater.")
+    if args.neck_command_deadband < 0.0:
+        raise ValueError("--neck-command-deadband must be zero or greater.")
     if args.neck_log_rate < 0.0:
         raise ValueError("--neck-log-rate must be zero or greater.")
+    if args.neck_input_source == "vive_head" and not args.enable_neck:
+        logger_mp.warning("[teleop neck] --neck-input-source vive_head is set but neck control is disabled.")
     if args.record_audio_udp_port < 0:
         raise ValueError("--record-audio-udp-port must be zero or greater.")
     if args.record_audio_timeout <= 0.0:
@@ -1208,6 +2925,14 @@ if __name__ == '__main__':
             raise ValueError("--inspire-dg2-bridge-port must be greater than zero.")
         if args.inspire_dg2_state_hz <= 0.0 or args.inspire_dg2_tactile_hz <= 0.0:
             raise ValueError("--inspire-dg2-state-hz and --inspire-dg2-tactile-hz must be greater than zero.")
+        if args.inspire_dg2_thumb_curl_gain < 0.0 or args.inspire_dg2_right_thumb_curl_gain < 0.0:
+            raise ValueError("--inspire-dg2-thumb-curl-gain and --inspire-dg2-right-thumb-curl-gain must be non-negative.")
+        if not 0.0 <= args.inspire_dg2_thumb_curl_strength <= 1.0:
+            raise ValueError("--inspire-dg2-thumb-curl-strength must be between 0 and 1.")
+        if not 0.0 <= args.inspire_dg2_thumb_curl_threshold <= 0.95:
+            raise ValueError("--inspire-dg2-thumb-curl-threshold must be between 0 and 0.95.")
+        if args.inspire_dg2_thumb_curl_log_rate < 0.0:
+            raise ValueError("--inspire-dg2-thumb-curl-log-rate must be non-negative.")
     if args.enable_waist_follow_neck:
         if not args.enable_neck:
             raise ValueError("--enable-waist-follow-neck requires --enable-neck.")
@@ -1247,6 +2972,8 @@ if __name__ == '__main__':
     if args.hand_only:
         args.disable_arm = True
         args.disable_body = True
+    if args.disable_arm_tracking and args.disable_arm:
+        raise ValueError("--disable-arm-tracking requires the arm controller for the c/r sync flow; do not combine it with --disable-arm or --hand-only.")
     preserve_zero_ready_mode = args.disable_arm
     rh5dg2_enabled_indices = _parse_int_list(args.rh5dg2_enabled_indices)
     if args.rh5dg2_pitch_only:
@@ -1267,11 +2994,12 @@ if __name__ == '__main__':
         if args.hand_debug_rate == 1.0:
             args.hand_debug_rate = 0.5
     logger_mp.debug(f"args: {args}")
-    if args.hand_only or args.disable_arm or args.disable_body:
+    if args.hand_only or args.disable_arm or args.disable_arm_tracking or args.disable_body:
         logger_mp.warning(
-            "[teleop safety mode] hand_only=%s disable_arm=%s disable_body=%s motion_requested=%s",
+            "[teleop safety mode] hand_only=%s disable_arm=%s disable_arm_tracking=%s disable_body=%s motion_requested=%s",
             args.hand_only,
             args.disable_arm,
+            args.disable_arm_tracking,
             args.disable_body,
             args.motion,
         )
@@ -1288,18 +3016,25 @@ if __name__ == '__main__':
         logger_mp.warning("body control: %s", "OFF" if args.disable_body else "ON")
         logger_mp.warning("gain: %.3f", args.rh5dg2_gain)
         logger_mp.warning("active hand: %s", args.rh5dg2_active_hand)
+        logger_mp.warning("lock spread joints: %s", args.rh5dg2_lock_spread_joints)
         logger_mp.warning(
-            "curl scale: global=%.3f index=%.3f",
+            "curl scale: global=%.3f index=%.3f middle=%.3f ring=%.3f little=%.3f thumb=%.3f thumb_threshold=%.3f",
             args.rh5dg2_curl_scale,
             args.rh5dg2_index_curl_scale,
+            args.rh5dg2_middle_curl_scale,
+            args.rh5dg2_ring_curl_scale,
+            args.rh5dg2_little_curl_scale,
+            args.rh5dg2_thumb_curl_scale,
+            args.rh5dg2_thumb_curl_threshold,
         )
         logger_mp.warning(
-            "thumb: enabled=%s source=%s scales={10: %.3f, 11: %.3f, 12: %.3f}",
+            "thumb: enabled=%s source=%s scales={10: %.3f, 11: %.3f, 12: %.3f} right_close_gain=%.3f",
             args.rh5dg2_enable_thumb,
             args.rh5dg2_thumb_source,
             args.rh5dg2_thumb10_scale,
             args.rh5dg2_thumb11_scale,
             args.rh5dg2_thumb12_scale,
+            args.rh5dg2_right_thumb_close_gain,
         )
         logger_mp.warning(
             "restore: repeat=%s interval=%.3f settle=%.3f",
@@ -1315,6 +3050,7 @@ if __name__ == '__main__':
     arm_ctrl = None
     arm_ik = None
     hand_ctrl = None
+    comm_logger = None
     img_client = None
     tv_wrapper = None
     ipc_server = None
@@ -1329,6 +3065,12 @@ if __name__ == '__main__':
     rh56f1_tactile_reader = None
     rh5dg2_tactile_udp = None
     rh5dg2_tactile_heat_mappers = {}
+    manus_haptic_mapper = None
+    manus_haptic_sender = None
+    manus_haptics_active = False
+    manus_haptic_last_log = 0.0
+    manus_haptic_last_warning = 0.0
+    joint_temperature_last_log = 0.0
     audio_udp_receiver = None
     episode_audio_recorder = None
     loop_robot = None
@@ -1349,11 +3091,16 @@ if __name__ == '__main__':
                 pitch_limit=args.neck_pitch_limit,
                 smoothing_alpha=args.neck_smoothing_alpha,
                 max_step=args.neck_max_step,
+                command_deadband=args.neck_command_deadband,
             )
             logger_mp.info(
                 f"[teleop neck] enabled target={args.neck_host or args.img_server_ip}:{args.neck_port} "
                 f"yaw_limit={args.neck_yaw_limit:.3f} pitch_limit={args.neck_pitch_limit:.3f} "
-                f"alpha={args.neck_smoothing_alpha:.3f} max_step={args.neck_max_step:.3f}"
+                f"alpha={args.neck_smoothing_alpha:.3f} max_step={args.neck_max_step:.3f} "
+                f"deadband={args.neck_command_deadband:.3f} "
+                f"input_source={args.neck_input_source} "
+                f"vive_yaw_sign={args.vive_head_neck_yaw_sign:.0f} "
+                f"vive_pitch_sign={args.vive_head_neck_pitch_sign:.0f}"
             )
         # actual neck yaw,pitch feedback (UDP from zed_pantilt). Independent of
         # --enable-neck: the pan/tilt process may run standalone on the robot, and
@@ -1382,6 +3129,33 @@ if __name__ == '__main__':
             except OSError as e:
                 rh5dg2_tactile_udp = None
                 logger_mp.warning(f"[RH5DG2 tactile UDP] disabled: {e}")
+
+        if args.enable_manus_haptics:
+            manus_haptic_mapper = ManusNormalForceMapper(
+                baseline_seconds=args.manus_haptic_baseline_seconds,
+                ema_alpha=args.manus_haptic_ema_alpha,
+                deadband=args.manus_haptic_deadband,
+                normal_max=args.manus_haptic_normal_max,
+                gamma=args.manus_haptic_gamma,
+            )
+            manus_haptic_sender = ManusHapticUDPSender(
+                host=args.manus_haptic_host,
+                port=args.manus_haptic_port,
+                send_hz=args.manus_haptic_hz,
+            )
+            manus_haptic_sender.stop(force=True)
+            logger_mp.info(
+                "[MANUS haptics] enabled target=udp://%s:%s hz=%.2f "
+                "baseline=%.3fs alpha=%.3f deadband=%.3f normal_max=%.3f gamma=%.3f",
+                args.manus_haptic_host,
+                args.manus_haptic_port,
+                args.manus_haptic_hz,
+                args.manus_haptic_baseline_seconds,
+                args.manus_haptic_ema_alpha,
+                args.manus_haptic_deadband,
+                args.manus_haptic_normal_max,
+                args.manus_haptic_gamma,
+            )
 
         if args.enable_rh5dg2_tactile_vr_overlay:
             if args.input_mode != "hand":
@@ -1619,12 +3393,37 @@ if __name__ == '__main__':
                                      zmq=viewer_zmq,
                                      webrtc=viewer_webrtc,
                                      webrtc_url=webrtc_offer_url,
-                                     arm_reference_mode=args.arm_reference_mode,
-                                     arm_yaw_compensation_sign=args.arm_yaw_compensation_sign,
+                                     arm_reference_mode="head_yaw",
                                      tracking_timeout=args.arm_lost_timeout,
                                      session_timeout=max(2.0, args.arm_lost_timeout * 4.0),
                                      )
-        logger_mp.info(f"[teleop arm reference] mode={args.arm_reference_mode} yaw_sign={args.arm_yaw_compensation_sign:+.0f}")
+
+        VIVE_MANUS_READER = ViveManusInfoReader(
+            left_tracker_name=args.left_tracker_name,
+            right_tracker_name=args.right_tracker_name,
+            head_tracker_name=args.head_tracker_name,
+            libsurvive_tracking_frame=args.libsurvive_tracking_frame,
+            manus_topics=args.manus_topics,
+            manus_msg_type=args.manus_msg_type,
+            manus_transport=args.manus_transport,
+            manus_udp_host=args.manus_udp_host,
+            manus_udp_port=args.manus_udp_port,
+            vive_transport=args.vive_transport,
+            vive_udp_host=args.vive_udp_host,
+            vive_udp_port=args.vive_udp_port,
+            stale_timeout=args.ros_stale_timeout,
+            manus_hand_transform=args.manus_hand_transform,
+        )
+        logger_mp.info(
+            "[Vive/Manus] reader initialized: left_tracker=%s right_tracker=%s head_tracker=%s "
+            "vive_transport=%s manus_transport=%s manus_topics=%s",
+            args.left_tracker_name,
+            args.right_tracker_name,
+            args.head_tracker_name,
+            args.vive_transport,
+            args.manus_transport,
+            args.manus_topics,
+        )
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if preserve_zero_ready_mode:
@@ -1650,10 +3449,10 @@ if __name__ == '__main__':
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "H1_2":
-            arm_ik = H1_2_ArmIK()
+            arm_ik = H1_2_ArmIK(scale_input_poses=False)
             arm_ctrl = H1_2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "H1":
-            arm_ik = H1_ArmIK()
+            arm_ik = H1_ArmIK(scale_input_poses=False)
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
         elif args.arm == "H2":
             arm_ik = H2_ArmIK()
@@ -1729,11 +3528,18 @@ if __name__ == '__main__':
                                               restore_settle_s=args.rh5dg2_restore_settle,
                                               curl_scale=args.rh5dg2_curl_scale,
                                               index_curl_scale=args.rh5dg2_index_curl_scale,
+                                              middle_curl_scale=args.rh5dg2_middle_curl_scale,
+                                              ring_curl_scale=args.rh5dg2_ring_curl_scale,
+                                              little_curl_scale=args.rh5dg2_little_curl_scale,
+                                              thumb_curl_scale=args.rh5dg2_thumb_curl_scale,
+                                              thumb_curl_threshold=args.rh5dg2_thumb_curl_threshold,
                                               enable_thumb=args.rh5dg2_enable_thumb,
                                               thumb_source=args.rh5dg2_thumb_source,
                                               thumb10_scale=args.rh5dg2_thumb10_scale,
                                               thumb11_scale=args.rh5dg2_thumb11_scale,
                                               thumb12_scale=args.rh5dg2_thumb12_scale,
+                                              right_thumb_close_gain=args.rh5dg2_right_thumb_close_gain,
+                                              lock_spread_joints=args.rh5dg2_lock_spread_joints,
                                               retarget_mode=args.rh5dg2_retarget_mode)
         elif args.ee == "rh5dg2_ftp":
             from teleop.robot_control.robot_hand_RH5DG2 import RH5DG2_Controller_FTP, RH5DG2_Num_Motors
@@ -1780,6 +3586,11 @@ if __name__ == '__main__':
                 network_interface=args.network_interface,
                 fast_mode=args.rh5dg2_fast_mode,
                 retarget_mode=args.rh5dg2_retarget_mode,
+                thumb_curl_gain=args.inspire_dg2_thumb_curl_gain,
+                right_thumb_curl_gain=args.inspire_dg2_right_thumb_curl_gain,
+                thumb_curl_threshold=args.inspire_dg2_thumb_curl_threshold,
+                thumb_curl_strength=args.inspire_dg2_thumb_curl_strength,
+                thumb_curl_log_rate=args.inspire_dg2_thumb_curl_log_rate,
             )
         elif args.ee == "rh56f1":
             from teleop.robot_control.robot_hand_RH56F1 import (
@@ -1862,6 +3673,14 @@ if __name__ == '__main__':
                 f"right_port={args.inspire_dg2_right_port} right_id={args.inspire_dg2_right_id} "
                 "scope=hand_landmarks_only arm_wrist_pose_uses_arm_sensitivity=True"
             )
+            logger_mp.info(
+                "[teleop InspireDG2 thumb] curl_gain=%.3f right_gain=%.3f threshold=%.3f strength=%.3f log_rate=%.3f",
+                args.inspire_dg2_thumb_curl_gain,
+                args.inspire_dg2_right_thumb_curl_gain,
+                args.inspire_dg2_thumb_curl_threshold,
+                args.inspire_dg2_thumb_curl_strength,
+                args.inspire_dg2_thumb_curl_log_rate,
+            )
         if args.ee == "rh56f1":
             logger_mp.info(
                 f"[teleop hand side mapping] ee={args.ee} "
@@ -1884,6 +3703,30 @@ if __name__ == '__main__':
             loop_ee_state_array = dual_hand_state_array
             loop_ee_action_array = dual_hand_action_array
             loop_ee_lock = dual_hand_data_lock
+
+        # per-run communication / action / state log (JSONL)
+        if args.comm_log:
+            comm_log_dir = args.comm_log_dir or os.path.join(current_dir, "logs", "comm_state")
+            try:
+                comm_logger = CommStateLogger(
+                    comm_log_dir,
+                    meta={
+                        "script": os.path.basename(__file__),
+                        "arm": args.arm,
+                        "ee": args.ee,
+                        "frequency": args.frequency,
+                        "sim": bool(args.sim),
+                        "motion": bool(args.motion),
+                        "cmd_topic": "rt/arm_sdk" if args.motion else "rt/lowcmd",
+                        "hostname": socket.gethostname(),
+                        "argv": sys.argv[1:],
+                    },
+                    arm_ctrl=arm_ctrl,
+                    temperature_interval=args.comm_log_temp_interval,
+                )
+            except Exception as exc:
+                logger_mp.error("[comm log] failed to open log, continuing without it: %s", exc)
+                comm_logger = None
 
         # affinity mode (if you dont know what it is, then you probably don't need it)
         if args.affinity:
@@ -1934,6 +3777,7 @@ if __name__ == '__main__':
                     "frequency": args.frequency,
                     "network_interface": args.network_interface,
                     "motion": args.motion,
+                    "start_sync_delay": args.start_sync_delay,
                 },
                 "body_state": {
                     "enabled": args.record_body_state,
@@ -1976,11 +3820,32 @@ if __name__ == '__main__':
                         "ema_alpha": args.rh5dg2_tactile_vr_ema_alpha,
                     },
                 },
+                "manus_haptics": {
+                    "enabled": args.enable_manus_haptics,
+                    "target_host": args.manus_haptic_host,
+                    "target_port": args.manus_haptic_port,
+                    "hz": args.manus_haptic_hz,
+                    "baseline_seconds": args.manus_haptic_baseline_seconds,
+                    "ema_alpha": args.manus_haptic_ema_alpha,
+                    "deadband": args.manus_haptic_deadband,
+                    "normal_max": args.manus_haptic_normal_max,
+                    "gamma": args.manus_haptic_gamma,
+                    "finger_order": ["thumb", "index", "middle", "ring", "little"],
+                },
                 "neck": {
                     "enabled": args.enable_neck,
+                    "input_source": args.neck_input_source,
                     "command_host": args.neck_host or args.img_server_ip,
                     "command_port": args.neck_port,
                     "feedback_port": args.neck_feedback_port,
+                    "command_deadband": args.neck_command_deadband,
+                    "vive_head_axis_mapping": {
+                        "yaw": "tracker_euler_y",
+                        "pitch": "tracker_euler_x",
+                        "roll": "ignored",
+                        "yaw_sign": args.vive_head_neck_yaw_sign,
+                        "pitch_sign": args.vive_head_neck_pitch_sign,
+                    },
                 },
             }
             if args.enable_audio:
@@ -2046,11 +3911,6 @@ if __name__ == '__main__':
                 args.ee,
                 args.frequency,
                 arm=args.arm,
-                source_key=args.loop_source_key,
-                action_space=args.loop_action_space,
-                robot_type=args.loop_robot_type,
-                gripper_type=args.loop_gripper_type,
-                finger_type=args.loop_finger_type,
                 head_dim=2 if (neck_ctrl is not None or neck_feedback is not None) else 0,
                 body_dim=len(loop_body_probe),
                 raw_head_dim=2 if neck_ctrl is not None else 0,
@@ -2079,7 +3939,9 @@ if __name__ == '__main__':
             logger_mp.info(f"[loop] streaming robot state + tactile + cameras to Config Loop at {args.loop_addr}")
 
         logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        logger_mp.info(f"🟢  Press [r] to start syncing the robot with your movements after {START_SYNC_DELAY:.1f}s.")
+        logger_mp.info("🟣  Press [p] while running to PAUSE teleop and return the arms to the ready pose; press [r] to re-sync and resume.")
+        logger_mp.info("🟠  Press [c] in attention pose to calibrate Vive tracker frame; [r] pressed during calibration is queued and syncs automatically once calibration completes.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         elif args.screen_record:
@@ -2092,8 +3954,31 @@ if __name__ == '__main__':
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
         logger_mp.info(f"[teleop ready state] READY={READY} START={START} STOP={STOP} disable_arm={args.disable_arm}")
+        prestart_neck_loop_count = 0
+        neck_log_last_ts = 0.0
+        neck_log_interval = 1.0 / args.neck_log_rate if args.neck_log_rate > 0 else None
         while not START and not STOP: # wait for start or stop signal.
+            prestart_neck_loop_count += 1
             time.sleep(0.033)
+            joint_temperature_last_log = _maybe_log_arm_joint_temperatures(
+                args, arm_ctrl, joint_temperature_last_log
+            )
+            tele_data = tv_wrapper.get_tele_data()
+            maybe_print_tracker_position(tele_data=tele_data)
+            maybe_calibrate_tracker_frame_and_pause(tele_data=tele_data)
+            maybe_start_delayed_sync(arm_ik=arm_ik, arm_ctrl=arm_ctrl)
+            if NECK_CAMERA_SYNC_ACTIVE:
+                _, neck_log_last_ts = _update_neck_control(
+                    args,
+                    neck_ctrl,
+                    neck_feedback,
+                    tele_data,
+                    arm_ctrl,
+                    prestart_neck_loop_count,
+                    neck_log_last_ts,
+                    neck_log_interval,
+                    allow_waist=False,
+                )
             # feed Config Loop cameras during the pre-start wait too, so the Loop
             # previews go READY before [r] is pressed (camera frames only; the
             # robot-step source stays silent until tracking actually starts).
@@ -2128,8 +4013,13 @@ if __name__ == '__main__':
                 else:
                     logger_mp.warning(f"[teleop camera prestart] no {selected_camera_name} frame received for XR display. {prestart_debug}")
 
+        maybe_print_tracker_position(tele_data=tv_wrapper.get_tele_data())
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
-        logger_mp.info(f"[teleop ready state] READY={READY} START={START} STOP={STOP} disable_arm={args.disable_arm}")
+        logger_mp.info(
+            f"[teleop ready state] READY={READY} START={START} STOP={STOP} "
+            f"disable_arm={args.disable_arm} disable_arm_tracking={args.disable_arm_tracking}"
+        )
+        arm_tracking_hold_q = None
         if args.disable_arm:
             logger_mp.warning("[teleop arm disabled reason] --disable-arm set; IK/control publish will be skipped.")
         else:
@@ -2141,6 +4031,8 @@ if __name__ == '__main__':
                 _seed_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
                 if _seed_q.size and np.isfinite(_seed_q).all():
                     arm_ctrl.ctrl_dual_arm(_seed_q, np.zeros_like(_seed_q))
+                    if args.disable_arm_tracking:
+                        arm_tracking_hold_q = _seed_q.copy()
             except Exception as _seed_exc:
                 logger_mp.debug("[teleop arm startup] q_target seed skipped: %s", _seed_exc)
             logger_mp.info(
@@ -2148,6 +4040,11 @@ if __name__ == '__main__':
                 f"startup_duration={args.arm_startup_duration:.3f}s "
                 f"startup_max_step={args.arm_startup_max_step:.4f}rad"
             )
+            if args.disable_arm_tracking:
+                logger_mp.warning(
+                    "[teleop arm tracking] OFF: arms will hold the start pose; "
+                    "Vive c/r calibration, Manus hand control, and tactile feedback remain active."
+                )
 
         head_img = None
         left_wrist_img = None
@@ -2177,7 +4074,7 @@ if __name__ == '__main__':
             f"enabled={arm_sensitivity_config.get('enabled', False)} sim={args.sim}"
         )
         logger_mp.info(
-            f"[teleop arm tracking fsm] enabled={args.arm_standby_on_tracking_loss} "
+            f"[teleop arm tracking fsm] enabled={args.arm_standby_on_tracking_loss and not args.disable_arm_tracking} "
             f"lost_timeout={args.arm_lost_timeout:.3f}s found_confirm={args.arm_found_confirm:.3f}s "
             f"standby_action={args.arm_standby_action} max_frame_jump={args.arm_max_frame_jump:.3f}m"
         )
@@ -2195,6 +4092,9 @@ if __name__ == '__main__':
         while not STOP:
             loop_count += 1
             start_time = time.time()
+            joint_temperature_last_log = _maybe_log_arm_joint_temperatures(
+                args, arm_ctrl, joint_temperature_last_log
+            )
             neck_record = None
             left_wrist_bgr = None
             right_wrist_bgr = None
@@ -2285,14 +4185,6 @@ if __name__ == '__main__':
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
-                        waist_source = "keyboard" if WAIST_KEY_ENABLED else ("follow_neck" if args.enable_waist_follow_neck else "fixed")
-                        waist_state = _waist_state_snapshot(WAIST_YAW_REL, waist_source)
-                        recorder.update_info({"waist_state": waist_state})
-                        logger_mp.info(
-                            "[teleop record] waist_state source=%s commanded=%s deg",
-                            waist_state["source"],
-                            waist_state["commanded_relative_deg"],
-                        )
                         if depth_worker is not None:
                             recorder.save_depth_info(depth_worker.estimator.intrinsics())
                         try:
@@ -2384,18 +4276,63 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            arm_tracking_ready = bool(
-                getattr(tele_data, "tracking_active", True)
-                and getattr(tele_data, "head_pose_is_valid", True)
-                and getattr(tele_data, "left_arm_is_valid", True)
-                and getattr(tele_data, "right_arm_is_valid", True)
-                # fixed arm-reference mode: hold arms until the frozen reference
-                # anchor has been captured from a settled immersive frame.
-                and getattr(tele_data, "arm_anchor_ready", True)
-            )
+            maybe_start_delayed_sync(arm_ik=arm_ik, arm_ctrl=arm_ctrl)
+            _apply_vive_manus_input(tele_data)
+            if not START or CALIBRATE_TRACKER_FRAME:
+                if manus_haptic_sender is not None:
+                    try:
+                        manus_haptic_sender.stop()
+                    except OSError as exc:
+                        now = time.monotonic()
+                        if now - manus_haptic_last_warning >= 2.0:
+                            logger_mp.warning("[MANUS haptics] failed to send stop command: %s", exc)
+                            manus_haptic_last_warning = now
+                    manus_haptics_active = False
+                arm_last_good_left_pose = None
+                arm_last_good_right_pose = None
+                arm_sensitivity_state.clear()
+                arm_tracking_hold_q = None
+                tracking_start_time = time.time()
+                if PAUSE_TO_READY and not args.disable_arm and arm_ctrl is not None:
+                    # [p] pause: ease the arms back to the ready pose while teleop is suspended.
+                    try:
+                        pause_current_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
+                        if pause_current_q.size and np.isfinite(pause_current_q).all():
+                            pause_ready_q = _make_arm_ready_q(pause_current_q)
+                            pause_max_step = max(0.0, args.arm_startup_max_step)
+                            pause_target_q = pause_current_q + np.clip(
+                                pause_ready_q - pause_current_q, -pause_max_step, pause_max_step
+                            )
+                            arm_ctrl.ctrl_dual_arm(pause_target_q, np.zeros_like(pause_target_q))
+                    except Exception as exc:
+                        if loop_count % 30 == 0:
+                            logger_mp.warning("[teleop pause] ready pose command skipped: %s", exc)
+                    _safe_enter_hand_standby_open(hand_ctrl)
+                    if loop_count % 100 == 0:
+                        logger_mp.info("[teleop pause] paused at ready pose. Press [r] to re-sync and resume.")
+                current_time = time.time()
+                time_elapsed = current_time - start_time
+                sleep_time = max(0, (1 / args.frequency) - time_elapsed)
+                time.sleep(sleep_time)
+                logger_mp.debug(f"main process sleep: {sleep_time}")
+                continue
+            if VIVE_MANUS_READER is not None:
+                arm_tracking_ready = bool(getattr(tele_data, "arm_motion_data_ready", False))
+            else:
+                arm_tracking_ready = bool(
+                    getattr(tele_data, "tracking_active", True)
+                    and getattr(tele_data, "head_pose_is_valid", True)
+                    and getattr(tele_data, "left_arm_is_valid", True)
+                    and getattr(tele_data, "right_arm_is_valid", True)
+                )
             raw_arm_tracking_ready = arm_tracking_ready
             now = time.time()
-            if args.arm_standby_on_tracking_loss and not args.disable_arm and arm_ctrl is not None:
+            if (
+                args.arm_standby_on_tracking_loss
+                and not args.disable_arm
+                and not args.disable_arm_tracking
+                and arm_ctrl is not None
+            ):
                 if raw_arm_tracking_ready:
                     arm_lost_since = None
                     if arm_fsm == "STANDBY":
@@ -2412,6 +4349,8 @@ if __name__ == '__main__':
                             arm_ctrl.speed_gradual_max()
                             _safe_enter_hand_auto(hand_ctrl)
                             logger_mp.warning("[teleop arm tracking fsm] Tracking restored -> ACTIVE")
+                            if comm_logger is not None:
+                                comm_logger.log_event("arm_fsm", state="ACTIVE", loop=loop_count)
                     else:
                         arm_found_since = None
                 else:
@@ -2423,15 +4362,9 @@ if __name__ == '__main__':
                         arm_last_good_left_pose = None
                         arm_last_good_right_pose = None
                         arm_sensitivity_state.clear()
-                        # Drop the fixed arm reference anchor so it is re-captured from
-                        # the operator's stance when tracking returns (handles AVP
-                        # re-centering / operator drift during the standby period).
-                        # Resetting here (not on the STANDBY->ACTIVE transition) matters:
-                        # arm_anchor_ready gates that transition, so resetting on
-                        # restore would immediately bounce the FSM back to STANDBY.
-                        if hasattr(tv_wrapper, "reset_arm_reference_anchor"):
-                            tv_wrapper.reset_arm_reference_anchor()
                         _safe_enter_hand_standby_open(hand_ctrl)
+                        if comm_logger is not None:
+                            comm_logger.log_event("arm_fsm", state="STANDBY", loop=loop_count)
                         logger_mp.warning(
                             "[teleop arm tracking fsm] Tracking lost -> STANDBY "
                             "head_valid=%s left_arm_valid=%s right_arm_valid=%s",
@@ -2445,6 +4378,55 @@ if __name__ == '__main__':
                 latest_tactiles = rh5dg2_tactile_udp.read_latest()
             if not latest_tactiles and hand_ctrl is not None and hasattr(hand_ctrl, "read_latest_tactile"):
                 latest_tactiles = hand_ctrl.read_latest_tactile()
+            if manus_haptic_sender is not None and manus_haptic_mapper is not None:
+                haptic_motion_ready = (
+                    bool(getattr(tele_data, "hand_motion_data_ready", False))
+                    if args.disable_arm_tracking
+                    else arm_tracking_ready
+                )
+                haptic_ready = bool(
+                    haptic_motion_ready
+                    and latest_tactiles
+                    and not latest_tactiles.get("_stale", False)
+                )
+                try:
+                    if haptic_ready:
+                        if not manus_haptics_active:
+                            manus_haptic_mapper.reset()
+                            manus_haptics_active = True
+                        stale_sides = latest_tactiles.get("_stale_sides", ())
+                        for stale_side in stale_sides:
+                            manus_haptic_mapper.reset(str(stale_side).removesuffix("_ee"))
+                        haptic_powers = manus_haptic_mapper.update(
+                            latest_tactiles,
+                            stale_sides=stale_sides,
+                        )
+                        manus_haptic_sender.send(haptic_powers)
+                        if args.manus_haptic_debug_rate > 0.0:
+                            now = time.monotonic()
+                            if now - manus_haptic_last_log >= 1.0 / args.manus_haptic_debug_rate:
+                                manus_haptic_last_log = now
+                                force_debug = manus_haptic_mapper.debug_snapshot()
+                                logger_mp.info(
+                                    "[MANUS raw normal force] finger_order=%s left=%s right=%s stale_sides=%s",
+                                    ["thumb", "index", "middle", "ring", "little"],
+                                    np.round(force_debug["left"]["raw_normal"], 1).tolist(),
+                                    np.round(force_debug["right"]["raw_normal"], 1).tolist(),
+                                    list(stale_sides),
+                                )
+                    else:
+                        manus_haptic_sender.stop()
+                        manus_haptics_active = False
+                except (OSError, ValueError) as exc:
+                    now = time.monotonic()
+                    if now - manus_haptic_last_warning >= 2.0:
+                        logger_mp.warning("[MANUS haptics] update skipped: %s", exc)
+                        manus_haptic_last_warning = now
+                    try:
+                        manus_haptic_sender.stop()
+                    except OSError:
+                        pass
+                    manus_haptics_active = False
             if rh5dg2_tactile_heat_mappers:
                 try:
                     if TACTILE_VR_OVERLAY_VISIBLE and latest_tactiles and not latest_tactiles.get("_stale", False):
@@ -2458,47 +4440,17 @@ if __name__ == '__main__':
                 except Exception as exc:
                     if loop_count % 30 == 0:
                         logger_mp.warning("[RH5DG2 tactile VR overlay] update skipped: %s", exc)
-            if neck_ctrl is not None and getattr(tele_data, "head_pose_is_valid", True):
-                try:
-                    neck_measured = neck_ctrl._extract_yaw_pitch(tele_data.head_pose)
-                    neck_command, neck_target = neck_ctrl.update(tele_data.head_pose)
-                    neck_actual = neck_feedback.read_latest() if neck_feedback is not None else None
-                    neck_record = {
-                        "raw_head_yaw_pitch": neck_measured.tolist(),
-                        "target_yaw_pitch": neck_target.tolist(),
-                        "command_yaw_pitch": neck_command.tolist(),
-                        "actual_yaw_pitch": None if neck_actual is None else neck_actual.get("yaw_pitch"),
-                        "actual_timestamp": None if neck_actual is None else neck_actual.get("timestamp"),
-                    }
-                    waist_command = None
-                    if args.enable_waist_follow_neck:
-                        waist_direction = -1.0 if args.waist_follow_neck_invert else 1.0
-                        waist_command = arm_ctrl.ctrl_waist_yaw(
-                            neck_command[0] * args.waist_yaw_gain * waist_direction,
-                            limit=args.waist_yaw_limit,
-                            velocity_limit=args.waist_yaw_velocity,
-                        )
-                    now = time.time()
-                    should_log_neck = neck_log_interval is not None and now - neck_log_last_ts >= neck_log_interval
-                    if should_log_neck:
-                        neck_log_last_ts = now
-                        waist_actual = None
-                        waist_error = None
-                        if waist_command is not None:
-                            waist_actual = arm_ctrl.get_waist_yaw_relative_position()
-                            waist_error = waist_command - waist_actual
-                        logger_mp.debug(
-                            f"[teleop neck] raw_head={np.round(neck_measured, 4).tolist()} "
-                            f"target={np.round(neck_target, 4).tolist()} "
-                            f"command={np.round(neck_command, 4).tolist()} "
-                            f"actual={None if neck_actual is None else np.round(neck_actual.get('yaw_pitch'), 4).tolist()} "
-                            f"waist_yaw={None if waist_command is None else round(waist_command, 4)} "
-                            f"waist_actual={None if waist_actual is None else round(waist_actual, 4)} "
-                            f"waist_error={None if waist_error is None else round(waist_error, 4)}"
-                        )
-                except (ValueError, OSError) as e:
-                    if loop_count % 30 == 0:
-                        logger_mp.warning(f"[teleop neck] command skipped: {e}")
+            neck_record, neck_log_last_ts = _update_neck_control(
+                args,
+                neck_ctrl,
+                neck_feedback,
+                tele_data,
+                arm_ctrl,
+                loop_count,
+                neck_log_last_ts,
+                neck_log_interval,
+                allow_waist=True,
+            )
 
             # keyboard-driven H1_2 waist yaw ([j]/[k]); independent of neck tracking
             if WAIST_KEY_ENABLED and arm_ctrl is not None and hasattr(arm_ctrl, "ctrl_waist_yaw"):
@@ -2513,7 +4465,7 @@ if __name__ == '__main__':
                         logger_mp.warning("[teleop waist keyboard] command skipped: %s", exc)
 
             # periodic current-waist-angle log
-            if loop_count % 50 == 0 and arm_ctrl is not None \
+            if args.log_waist_angle and loop_count % 50 == 0 and arm_ctrl is not None \
                and hasattr(arm_ctrl, "get_waist_yaw_relative_position") \
                and (WAIST_KEY_ENABLED or args.enable_waist_follow_neck):
                 try:
@@ -2535,6 +4487,7 @@ if __name__ == '__main__':
                 and raw_arm_tracking_ready
                 and arm_fsm == "ACTIVE"
                 and not args.disable_arm
+                and not args.disable_arm_tracking
             ):
                 (
                     left_wrist_pose,
@@ -2565,7 +4518,7 @@ if __name__ == '__main__':
                 right_wrist_pose,
                 arm_sensitivity_state,
                 arm_sensitivity_config,
-                enabled=not args.disable_arm and arm_tracking_ready,
+                enabled=not args.disable_arm and not args.disable_arm_tracking and arm_tracking_ready,
             )
             if loop_count % 50 == 0:
                 logger_mp.debug(
@@ -2610,6 +4563,9 @@ if __name__ == '__main__':
                 if should_hand_debug:
                     hand_debug_last_ts = now
                 hand_status = _hand_tracking_status(left_hand_pos, right_hand_pos)
+                raw_hand_tracking_ready = raw_arm_tracking_ready
+                if VIVE_MANUS_READER is not None:
+                    raw_hand_tracking_ready = bool(getattr(tele_data, "hand_motion_data_ready", False))
                 if should_hand_debug:
                     logger_mp.info(
                         f"[teleop hand input before write] ee={args.ee} input={args.input_mode} "
@@ -2619,13 +4575,16 @@ if __name__ == '__main__':
                     logger_mp.info(
                         "[teleop hand tracking status] "
                         f"hand_tracking_ready={hand_status['hand_tracking_ready']} "
+                        f"raw_hand_tracking_ready={raw_hand_tracking_ready} "
+                        f"raw_arm_tracking_ready={raw_arm_tracking_ready} "
                         f"left_allzero={hand_status['left_allzero']} "
                         f"right_allzero={hand_status['right_allzero']} "
                         f"left_valid_points={hand_status['left_valid_points']} "
                         f"right_valid_points={hand_status['right_valid_points']}"
                     )
-                hand_tracking_ready = hand_status["hand_tracking_ready"] and raw_arm_tracking_ready
+                hand_tracking_ready = hand_status["hand_tracking_ready"] and raw_hand_tracking_ready
                 if hand_tracking_ready:
+                    _safe_enter_hand_auto(hand_ctrl)
                     with left_hand_pos_array.get_lock():
                         left_hand_pos_array[:] = left_hand_pos.flatten()
                         left_shared_debug = np.array(left_hand_pos_array[:]).reshape(25, 3).copy() if should_hand_debug else None
@@ -2642,7 +4601,8 @@ if __name__ == '__main__':
                     if loop_count % 10 == 0:
                         logger_mp.warning(
                             "[teleop hand tracking hold] skipped invalid hand frame "
-                            "raw_arm_tracking_ready=%s hand_tracking_ready=%s",
+                            "raw_hand_tracking_ready=%s raw_arm_tracking_ready=%s hand_tracking_ready=%s",
+                            raw_hand_tracking_ready,
                             raw_arm_tracking_ready,
                             hand_status["hand_tracking_ready"],
                         )
@@ -2699,6 +4659,26 @@ if __name__ == '__main__':
                     logger_mp.warning(
                         f"[teleop arm disabled reason] loop={loop_count} reason=--disable-arm "
                         f"current_q={_fmt_vec_debug(current_lr_arm_q)}"
+                    )
+            elif args.disable_arm_tracking:
+                current_q = np.asarray(current_lr_arm_q, dtype=np.float64).reshape(-1)
+                if (
+                    arm_tracking_hold_q is None
+                    or arm_tracking_hold_q.shape != current_q.shape
+                    or not np.isfinite(arm_tracking_hold_q).all()
+                ):
+                    arm_tracking_hold_q = current_q.copy()
+                    logger_mp.warning(
+                        "[teleop arm tracking hold] captured fixed start pose target=%s",
+                        _fmt_vec_debug(arm_tracking_hold_q),
+                    )
+                sol_q = arm_tracking_hold_q.copy()
+                sol_tauff = np.zeros_like(sol_q)
+                if loop_count % 50 == 0:
+                    logger_mp.info(
+                        "[teleop arm tracking hold] Vive wrist IK skipped; fixed_target=%s current_q=%s",
+                        _fmt_vec_debug(sol_q),
+                        _fmt_vec_debug(current_q),
                     )
             elif arm_fsm == "STANDBY":
                 if args.arm_standby_action == "ready":
@@ -2792,6 +4772,30 @@ if __name__ == '__main__':
                         f"sim={args.sim} write_ok={arm_write_ok} topic=rt/lowcmd domain={1 if args.sim else 0} "
                         f"target={_fmt_vec_debug(sol_q)} tauff={_fmt_vec_debug(sol_tauff)}"
                     )
+
+            # per-cycle communication/action/state log (never breaks teleop)
+            if comm_logger is not None:
+                try:
+                    if loop_ee_lock is not None:
+                        with loop_ee_lock:
+                            _cl_hand_state = list(loop_ee_state_array)
+                            _cl_hand_action = list(loop_ee_action_array)
+                    else:
+                        _cl_hand_state = None
+                        _cl_hand_action = None
+                    comm_logger.log_cycle(
+                        loop_count,
+                        arm_q=current_lr_arm_q,
+                        arm_dq=current_lr_arm_dq,
+                        arm_action_q=sol_q,
+                        arm_action_tauff=sol_tauff,
+                        hand_state=_cl_hand_state,
+                        hand_action=_cl_hand_action,
+                        mode=arm_fsm,
+                    )
+                except Exception as exc:
+                    if loop_count % 200 == 0:
+                        logger_mp.warning("[comm log] cycle log failed: %s", exc)
 
             # stream robot state to Config Loop (non-blocking; never breaks teleop)
             if loop_robot is not None:
@@ -3075,6 +5079,13 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close recorder: {e}")
 
         try:
+            if comm_logger is not None:
+                comm_logger.close()
+                comm_logger = None
+        except Exception as e:
+            logger_mp.error(f"Failed to close comm/state logger: {e}")
+
+        try:
             if neck_ctrl is not None:
                 neck_ctrl.close()
         except Exception as e:
@@ -3091,6 +5102,12 @@ if __name__ == '__main__':
                 rh56f1_tactile_reader.stop()
         except Exception as e:
             logger_mp.error(f"Failed to stop RH56F1 tactile reader: {e}")
+
+        try:
+            if manus_haptic_sender is not None:
+                manus_haptic_sender.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to stop MANUS haptics: {e}")
 
         try:
             if rh5dg2_tactile_udp is not None:
@@ -3157,6 +5174,12 @@ if __name__ == '__main__':
                 loop_camera.close()
         except Exception as e:
             logger_mp.error(f"Failed to close Loop camera streamer: {e}")
+
+        try:
+            if VIVE_MANUS_READER is not None:
+                VIVE_MANUS_READER.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close Vive/Manus reader: {e}")
 
         try:
             if img_client is not None:

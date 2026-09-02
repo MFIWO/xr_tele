@@ -4,7 +4,7 @@ Runs the real LoopRobotStreamer + LoopCameraStreamer (same code the teleop loop
 uses), feeding synthetic joint state and a moving test-pattern image. Use it to
 verify, before touching the robot:
 
-  1. loop-sdk is installed and Loop's gRPC is reachable (fail-fast works).
+  1. The loop_porting_kit sidecar is running and Loop accepts the declared channels.
   2. The robot-state channels show up in the Loop UI.
   3. The camera decodes as a real image (NOT green noise) -- the #1 camera risk.
 
@@ -53,16 +53,33 @@ def _test_pattern(width: int, height: int, phase: float) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--loop-addr", default="localhost:50051")
+    parser.add_argument("--loop-addr", default="127.0.0.1:5590", help="Config Loop sidecar TCP host:port")
     parser.add_argument("--ee", default="dex3", help="EE type, to size the synthetic hand channels")
+    parser.add_argument("--arm", default="H1_2", help="Arm type used to choose the Loop robot root key")
     parser.add_argument("--frequency", type=float, default=30.0)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--seconds", type=float, default=60.0)
+    parser.add_argument("--loop-source-key", default="robot-step",
+                        help="robot source_key; match to the Cell Config robot source role")
+    parser.add_argument("--loop-action-space", default="target_joint_position")
+    parser.add_argument("--loop-robot-type", default=None, help="default: arm root key; '' to omit")
+    parser.add_argument("--loop-gripper-type", default=None, help="default: derived from --ee; '' to omit")
+    parser.add_argument("--loop-finger-type", default=None, help="default: derived from --ee; '' to omit")
     args = parser.parse_args()
 
-    robot = LoopRobotStreamer(args.loop_addr, args.ee, args.frequency)
-    robot.connect()  # fail-fast if Loop is down
+    robot = LoopRobotStreamer(
+        args.loop_addr,
+        args.ee,
+        args.frequency,
+        arm=args.arm,
+        source_key=args.loop_source_key,
+        action_space=args.loop_action_space,
+        robot_type=args.loop_robot_type,
+        gripper_type=args.loop_gripper_type,
+        finger_type=args.loop_finger_type,
+    )
+    robot.connect()
     camera = LoopCameraStreamer(args.loop_addr,
                                 _synthetic_camera_config(args.width, args.height, args.frequency))
     camera.connect()

@@ -115,6 +115,7 @@ _DG2_RAW_FROM_RETARGET = np.array(
     dtype=np.int64,
 )
 _DG2_PINCH_RAW_INDICES = (4, 9, 10, 11, 12)
+_DG2_THUMB_BEND_RAW_INDICES = (11, 12)
 _DG2_PINCH_CLOSE_TARGET = np.array(
     [1030, 1030, 1030, -150, 900, -150, 1150, 1150, 1150, 1050, 1140, 1220, 1520],
     dtype=np.float64,
@@ -596,6 +597,52 @@ def _apply_pinch_boost(cmd, hand_data):
     return np.rint(boosted).astype(np.int16)
 
 
+def _apply_thumb_curl_boost(
+    cmd,
+    hand_data,
+    side="right",
+    curl_gain=1.0,
+    threshold=0.12,
+    strength=0.0,
+    first_scale=1.0,
+    second_scale=1.0,
+    safe_limits=True,
+):
+    boosted = np.asarray(cmd, dtype=np.float64).copy()
+    raw_curl = _finger_curl_score(hand_data, "thumb")
+    curl_gain = float(np.clip(curl_gain, 0.0, 10.0))
+    threshold = float(np.clip(threshold, 0.0, 0.95))
+    strength = float(np.clip(strength, 0.0, 1.0))
+    scaled_curl = float(np.clip(raw_curl * curl_gain, 0.0, 1.0))
+    activation = float(np.clip((scaled_curl - threshold) / max(1.0 - threshold, 1e-6), 0.0, 1.0))
+    before = boosted[list(_DG2_THUMB_BEND_RAW_INDICES)].copy()
+
+    if activation > 0.0 and strength > 0.0:
+        for raw_idx, scale in zip(_DG2_THUMB_BEND_RAW_INDICES, (first_scale, second_scale)):
+            gain = float(np.clip(activation * strength * float(scale), 0.0, 1.0))
+            target = float(_DG2_ANGLE_CLOSED[raw_idx])
+            boosted[raw_idx] = boosted[raw_idx] + gain * (target - boosted[raw_idx])
+
+    boosted = np.clip(boosted, _DG2_ANGLE_MIN, _DG2_ANGLE_MAX)
+    if safe_limits:
+        boosted = np.clip(boosted, _DG2_SAFE_COMMAND_MIN, _DG2_SAFE_COMMAND_MAX)
+    after = boosted[list(_DG2_THUMB_BEND_RAW_INDICES)].copy()
+    return np.rint(boosted).astype(np.int16), {
+        "side": str(side),
+        "raw_curl": float(raw_curl),
+        "scaled_curl": scaled_curl,
+        "curl_gain": curl_gain,
+        "threshold": threshold,
+        "activation": activation,
+        "strength": strength,
+        "first_scale": float(first_scale),
+        "second_scale": float(second_scale),
+        "before": np.round(before, 4).tolist(),
+        "after": np.round(after, 4).tolist(),
+        "delta": np.round(after - before, 4).tolist(),
+    }
+
+
 def _apply_middle_curl_boost(cmd, hand_data):
     if not _env_flag("INSPIRE_DG2_ENABLE_MIDDLE_CURL_BOOST", False):
         return cmd
@@ -705,6 +752,13 @@ class InspireDG2_Controller:
         retarget_mode="config",
         safe_command_limits=True,
         use_inspire6dof=True,
+        thumb_curl_gain=1.0,
+        right_thumb_curl_gain=1.0,
+        thumb_curl_threshold=0.12,
+        thumb_curl_strength=0.0,
+        thumb_curl_first_scale=1.0,
+        thumb_curl_second_scale=1.0,
+        thumb_curl_log_rate=0.0,
     ):
         logger_mp.info("Initialize InspireDG2_Controller...")
         self.fps = float(fps)
@@ -728,6 +782,25 @@ class InspireDG2_Controller:
         self.retarget_mode = retarget_mode
         self.safe_command_limits = bool(safe_command_limits)
         self.use_inspire6dof = _env_flag("INSPIRE_DG2_USE_6DOF", use_inspire6dof)
+        self.thumb_curl_gain = float(np.clip(thumb_curl_gain, 0.0, 10.0))
+        self.right_thumb_curl_gain = float(np.clip(right_thumb_curl_gain, 0.0, 10.0))
+        self.thumb_curl_threshold = float(np.clip(thumb_curl_threshold, 0.0, 0.95))
+        self.thumb_curl_strength = float(np.clip(thumb_curl_strength, 0.0, 1.0))
+        self.thumb_curl_first_scale = float(np.clip(thumb_curl_first_scale, 0.0, 3.0))
+        self.thumb_curl_second_scale = float(np.clip(thumb_curl_second_scale, 0.0, 3.0))
+        self.thumb_curl_log_rate = max(float(thumb_curl_log_rate), 0.0)
+        self._last_thumb_curl_log_ts = {"left": 0.0, "right": 0.0}
+
+        logger_mp.info(
+            "[InspireDG2 thumb curl boost] gain=%.3f right_gain=%.3f threshold=%.3f strength=%.3f first_scale=%.3f second_scale=%.3f log_rate=%.3f",
+            self.thumb_curl_gain,
+            self.right_thumb_curl_gain,
+            self.thumb_curl_threshold,
+            self.thumb_curl_strength,
+            self.thumb_curl_first_scale,
+            self.thumb_curl_second_scale,
+            self.thumb_curl_log_rate,
+        )
 
         if self.use_inspire6dof:
             if not self.Unit_Test:
@@ -740,6 +813,11 @@ class InspireDG2_Controller:
                 fast_mode=self.fast_mode,
                 retarget_mode=self.retarget_mode,
             )
+
+        # Raw command override, used by the policy-inference path: [enabled, left*N, right*N].
+        # A trained policy predicts the same raw angleSet values this loop publishes, so it
+        # must bypass landmark retargeting and every curl/pinch heuristic applied after it.
+        self.raw_command_array = Array("d", 1 + 2 * InspireDG2_Num_Motors, lock=True)
 
         self.left_hand_state_array = Array("d", InspireDG2_Num_Motors, lock=True)
         self.right_hand_state_array = Array("d", InspireDG2_Num_Motors, lock=True)
@@ -769,6 +847,40 @@ class InspireDG2_Controller:
         self.hand_control_process = hand_control_worker
 
         logger_mp.info("Initialize InspireDG2_Controller OK!")
+
+    def set_raw_command(self, left_cmd, right_cmd):
+        """Publish these raw angleSet values instead of the retargeted command.
+
+        Both arrays are InspireDG2_Num_Motors long, in raw motor units. Stays in effect
+        until clear_raw_command(); the control loop keeps its own rate and DDS/serial
+        transport, so this only replaces where the numbers come from.
+        """
+        left = np.asarray(left_cmd, dtype=np.float64).reshape(-1)
+        right = np.asarray(right_cmd, dtype=np.float64).reshape(-1)
+        if left.size != InspireDG2_Num_Motors or right.size != InspireDG2_Num_Motors:
+            raise ValueError(
+                f"raw command needs {InspireDG2_Num_Motors} values per hand, "
+                f"got {left.size}/{right.size}"
+            )
+        if not np.isfinite(left).all() or not np.isfinite(right).all():
+            raise ValueError("raw command contains non-finite values")
+        with self.raw_command_array.get_lock():
+            self.raw_command_array[0] = 1.0
+            self.raw_command_array[1:1 + InspireDG2_Num_Motors] = left
+            self.raw_command_array[1 + InspireDG2_Num_Motors:] = right
+
+    def clear_raw_command(self):
+        """Hand control back to the landmark retargeting path."""
+        with self.raw_command_array.get_lock():
+            self.raw_command_array[0] = 0.0
+
+    def _read_raw_command(self):
+        with self.raw_command_array.get_lock():
+            if self.raw_command_array[0] < 0.5:
+                return None, None
+            left = np.array(self.raw_command_array[1:1 + InspireDG2_Num_Motors], dtype=np.float64)
+            right = np.array(self.raw_command_array[1 + InspireDG2_Num_Motors:], dtype=np.float64)
+        return left, right
 
     def _open_udp_socket(self):
         if self.simulation_mode:
@@ -967,6 +1079,30 @@ class InspireDG2_Controller:
             "left": {"port": self.left_port, "hand_id": self.left_hand_id},
             "right": {"port": self.right_port, "hand_id": self.right_hand_id},
         }
+
+    def _maybe_log_thumb_curl_debug(self, debug):
+        if self.thumb_curl_log_rate <= 0.0 or not debug:
+            return
+        side = debug.get("side", "unknown")
+        now = time.time()
+        interval = 1.0 / max(self.thumb_curl_log_rate, 1e-6)
+        last = self._last_thumb_curl_log_ts.get(side, 0.0)
+        if now - last < interval:
+            return
+        self._last_thumb_curl_log_ts[side] = now
+        logger_mp.info(
+            "[InspireDG2 thumb curl] side=%s raw=%.4f scaled=%.4f gain=%.3f threshold=%.3f activation=%.4f strength=%.3f before=%s after=%s delta=%s",
+            side,
+            debug["raw_curl"],
+            debug["scaled_curl"],
+            debug["curl_gain"],
+            debug["threshold"],
+            debug["activation"],
+            debug["strength"],
+            debug["before"],
+            debug["after"],
+            debug["delta"],
+        )
 
     def _retarget(self, left_hand_data, right_hand_data, left_q_target, right_q_target):
         if np.allclose(right_hand_data, 0.0, atol=1e-5) or np.allclose(left_hand_data, 0.0, atol=1e-5):
@@ -1180,6 +1316,30 @@ class InspireDG2_Controller:
                     )
                     left_cmd = _apply_pinch_boost(left_cmd, left_hand_data)
                     right_cmd = _apply_pinch_boost(right_cmd, right_hand_data)
+                    left_cmd, left_thumb_debug = _apply_thumb_curl_boost(
+                        left_cmd,
+                        left_hand_data,
+                        side="left",
+                        curl_gain=self.thumb_curl_gain,
+                        threshold=self.thumb_curl_threshold,
+                        strength=self.thumb_curl_strength,
+                        first_scale=self.thumb_curl_first_scale,
+                        second_scale=self.thumb_curl_second_scale,
+                        safe_limits=self.safe_command_limits,
+                    )
+                    right_cmd, right_thumb_debug = _apply_thumb_curl_boost(
+                        right_cmd,
+                        right_hand_data,
+                        side="right",
+                        curl_gain=self.thumb_curl_gain * self.right_thumb_curl_gain,
+                        threshold=self.thumb_curl_threshold,
+                        strength=self.thumb_curl_strength,
+                        first_scale=self.thumb_curl_first_scale,
+                        second_scale=self.thumb_curl_second_scale,
+                        safe_limits=self.safe_command_limits,
+                    )
+                    self._maybe_log_thumb_curl_debug(left_thumb_debug)
+                    self._maybe_log_thumb_curl_debug(right_thumb_debug)
                     left_cmd = _apply_middle_open_recovery(left_cmd, left_hand_data, side="left")
                     right_cmd = _apply_middle_open_recovery(right_cmd, right_hand_data, side="right")
                     left_cmd = _apply_middle_open_ratio_recovery(left_cmd, left_q_target, side="left")
@@ -1201,11 +1361,41 @@ class InspireDG2_Controller:
                     )
                     right_cmd = _apply_middle_curl_boost(right_cmd, right_hand_data)
                     right_cmd = _apply_pinch_boost(right_cmd, right_hand_data)
+                    left_cmd, left_thumb_debug = _apply_thumb_curl_boost(
+                        left_cmd,
+                        left_hand_data,
+                        side="left",
+                        curl_gain=self.thumb_curl_gain,
+                        threshold=self.thumb_curl_threshold,
+                        strength=self.thumb_curl_strength,
+                        first_scale=self.thumb_curl_first_scale,
+                        second_scale=self.thumb_curl_second_scale,
+                        safe_limits=self.safe_command_limits,
+                    )
+                    right_cmd, right_thumb_debug = _apply_thumb_curl_boost(
+                        right_cmd,
+                        right_hand_data,
+                        side="right",
+                        curl_gain=self.thumb_curl_gain * self.right_thumb_curl_gain,
+                        threshold=self.thumb_curl_threshold,
+                        strength=self.thumb_curl_strength,
+                        first_scale=self.thumb_curl_first_scale,
+                        second_scale=self.thumb_curl_second_scale,
+                        safe_limits=self.safe_command_limits,
+                    )
+                    self._maybe_log_thumb_curl_debug(left_thumb_debug)
+                    self._maybe_log_thumb_curl_debug(right_thumb_debug)
                     left_cmd = _apply_middle_open_recovery(left_cmd, left_hand_data, side="left")
                     right_cmd = _apply_middle_open_recovery(right_cmd, right_hand_data, side="right")
 
                 left_cmd = _lock_dg2_spread_joints(left_cmd, side="left")
                 right_cmd = _lock_dg2_spread_joints(right_cmd, side="right")
+
+                raw_left, raw_right = self._read_raw_command()
+                if raw_left is not None:
+                    # Policy inference: the action already is a raw angleSet, so it replaces
+                    # the retargeted command wholesale (spread lock included).
+                    left_cmd, right_cmd = raw_left, raw_right
 
                 now = time.time()
                 if self.transport == "dds":

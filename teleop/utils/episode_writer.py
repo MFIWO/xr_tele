@@ -191,6 +191,16 @@ class EpisodeWriter():
             self.rerun_logger.log_status("episode_active", 1.0)
         return True  # Return True if the episode is successfully created
         
+    def save_depth_info(self, info):
+        """Write depth camera intrinsics/units json into the episode's depths dir."""
+        try:
+            path = os.path.join(self.depth_dir, 'depth_info.json')
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(info, f, ensure_ascii=False, indent=4, default=_json_default)
+            logger_mp.info(f"==> Depth info saved: {path}")
+        except Exception as e:
+            logger_mp.warning("Failed to save depth info: %s", e)
+
     def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
         # Increment the item ID
         self.item_id += 1
@@ -250,11 +260,16 @@ class EpisodeWriter():
                     logger_mp.warning("Failed to save color image idx=%s key=%s", idx, color_key)
                 item_data['colors'][color_key] = os.path.join('colors', color_name)
 
-        # Save depths
+        # Save depths (16-bit maps -> lossless PNG; 8-bit falls back to jpg)
         if depths:
             for idx_depth, (depth_key, depth) in enumerate(depths.items()):
-                depth_name = f'{str(idx).zfill(6)}_{depth_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth):
+                depth_arr = np.asarray(depth)
+                ext = 'png' if depth_arr.dtype in (np.uint16, np.int32, np.float32) else 'jpg'
+                if depth_arr.dtype == np.float32:
+                    # store float depth as uint16 millimeters
+                    depth_arr = np.clip(depth_arr * 1000.0, 0, 65535).astype(np.uint16)
+                depth_name = f'{str(idx).zfill(6)}_{depth_key}.{ext}'
+                if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth_arr):
                     logger_mp.warning("Failed to save depth image idx=%s key=%s", idx, depth_key)
                 item_data['depths'][depth_key] = os.path.join('depths', depth_name)
 

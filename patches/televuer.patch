@@ -1,0 +1,964 @@
+diff --git a/src/televuer/televuer.py b/src/televuer/televuer.py
+index 9a5bde2..671a8bc 100644
+--- a/src/televuer/televuer.py
++++ b/src/televuer/televuer.py
+@@ -6,14 +6,31 @@ import asyncio
+ import threading
+ import cv2
+ import os
++import time
++import traceback
+ from pathlib import Path
+ from typing import Literal
+ 
+ 
++TACTILE_SITE_COUNT = 8
++TACTILE_SITE_STRIDE = 5
++TACTILE_SITE_LABELS = ("TH", "IN", "MI", "RI", "LI", "P-R", "P-M", "P-L")
++TACTILE_SIDE_NAMES = ("left", "right")
++TACTILE_SIDE_COUNT = len(TACTILE_SIDE_NAMES)
++TACTILE_SIDE_STRIDE = TACTILE_SITE_COUNT * TACTILE_SITE_STRIDE
++
++
++def _safe_print(*args, **kwargs):
++    try:
++        print(*args, **kwargs)
++    except BlockingIOError:
++        pass
++
++
+ class TeleVuer:
+     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=None, display_fps: float=30.0,
+                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
+-                       cert_file: str=None, key_file: str=None):
++                       cert_file: str=None, key_file: str=None, jpeg_quality: int=80):
+         """
+         TeleVuer class for OpenXR-based XR teleoperate applications.
+         This class handles the communication with the Vuer server and manages image and pose data.
+@@ -58,6 +75,7 @@ class TeleVuer:
+             raise ValueError("[TeleVuer] img_shape must be provided.")
+         self.img_shape = (img_shape[0], img_shape[1], 3)
+         self.display_fps = display_fps
++        self.jpeg_quality = int(jpeg_quality)
+         self.img_height = self.img_shape[0]
+         if self.binocular:
+             self.img_width  = self.img_shape[1] // 2
+@@ -88,7 +106,15 @@ class TeleVuer:
+                     cert_file = cert_file or str(current_module_dir / "cert.pem")
+                     key_file = key_file or str(current_module_dir / "key.pem")
+ 
+-        self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
++        self.viewer_host = "0.0.0.0"
++        self.viewer_port = 8012
++        self.vuer = Vuer(host=self.viewer_host, cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
++        _safe_print(
++            "[teleop viewer 8012] "
++            f"configured host={self.viewer_host} expected_port={self.viewer_port} "
++            f"cert={cert_file} key={key_file}",
++            flush=True,
++        )
+         self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
+         if self.use_hand_tracking:
+             self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
+@@ -99,6 +125,14 @@ class TeleVuer:
+         self.zmq = zmq
+         self.webrtc = webrtc
+         self.webrtc_url = webrtc_url
++        camera_mode = "webrtc" if self.webrtc else "zmq" if self.zmq else "none"
++        _safe_print(
++            "[teleop viewer stream bind] "
++            f"display_mode={self.display_mode} camera_mode={camera_mode} "
++            f"binocular={self.binocular} display_fps={self.display_fps:.1f} "
++            f"jpeg_quality={self.jpeg_quality} webrtc_url={self.webrtc_url}",
++            flush=True,
++        )
+ 
+         if self.display_mode == "immersive":
+             if self.webrtc:
+@@ -133,11 +167,15 @@ class TeleVuer:
+         else:
+             raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
+         
+-        self.vuer.spawn(start=False)(fn)
++        self.vuer.spawn(start=False)(self._with_tactile_overlay(fn))
+ 
+         self.head_pose_shared = Array('d', 16, lock=True)
+         self.left_arm_pose_shared = Array('d', 16, lock=True)
+         self.right_arm_pose_shared = Array('d', 16, lock=True)
++        self.camera_event_count_shared = Value('d', 0.0, lock=True)
++        self.last_camera_event_ts_shared = Value('d', 0.0, lock=True)
++        self.tracking_event_count_shared = Value('d', 0.0, lock=True)
++        self.last_tracking_event_ts_shared = Value('d', 0.0, lock=True)
+         if self.use_hand_tracking:
+             self.left_hand_position_shared = Array('d', 75, lock=True)
+             self.right_hand_position_shared = Array('d', 75, lock=True)
+@@ -172,17 +210,247 @@ class TeleVuer:
+             self.right_ctrl_aButton_shared = Value('b', False, lock=True)
+             self.right_ctrl_bButton_shared = Value('b', False, lock=True)
+ 
++        self.tactile_overlay_enabled_shared = Value('b', False, lock=True)
++        self.tactile_overlay_active_shared = Array('b', TACTILE_SIDE_COUNT, lock=True)
++        self.tactile_overlay_timestamp_shared = Array('d', TACTILE_SIDE_COUNT, lock=True)
++        self.tactile_overlay_values_shared = Array('d', TACTILE_SIDE_COUNT * TACTILE_SIDE_STRIDE, lock=True)
++
+         self.process = Process(target=self._vuer_run)
+         self.process.daemon = True
+         self.process.start()
++        _safe_print(
++            "[teleop viewer 8012] "
++            f"started pid={self.process.pid} host={self.viewer_host} expected_port={self.viewer_port}",
++            flush=True,
++        )
++
++    def _session_upsert(self, session, element, to):
++        try:
++            session.upsert(element, to=to)
++            return True
++        except (AssertionError, ConnectionError, BrokenPipeError) as exc:
++            _safe_print(
++                f"[teleop viewer 8012] session closed; stop image task: "
++                f"{exc.__class__.__name__}: {exc}",
++                flush=True,
++            )
++            return False
++
++    def _with_tactile_overlay(self, fn):
++        async def wrapped(session):
++            await fn(session)
++        return wrapped
++
++    @staticmethod
++    def _tactile_side_index(side_name):
++        side_name = str(side_name).lower()
++        if side_name.startswith("left"):
++            return 0
++        if side_name.startswith("right"):
++            return 1
++        return None
++
++    @staticmethod
++    def _flatten_tactile_view(tactile_view):
++        values = []
++        for item in tactile_view.get("fingers", []):
++            values.extend([
++                float(item.get("heat", 0.0)),
++                float(item.get("normal", 0.0)),
++                float(item.get("tangent", 0.0)),
++                float(item.get("direction_raw", 65535.0)),
++                1.0 if item.get("direction_valid", False) else 0.0,
++            ])
++        for item in tactile_view.get("palm", []):
++            values.extend([
++                float(item.get("heat", 0.0)),
++                float(item.get("normal", 0.0)),
++                float(item.get("tangent", 0.0)),
++                float(item.get("direction_raw", 65535.0)),
++                1.0 if item.get("direction_valid", False) else 0.0,
++            ])
++        while len(values) < TACTILE_SIDE_STRIDE:
++            values.extend([0.0, 0.0, 0.0, 65535.0, 0.0])
++        return values[:TACTILE_SIDE_STRIDE]
++
++    def set_tactile_overlay(self, tactile_view):
++        if tactile_view is None:
++            with self.tactile_overlay_values_shared.get_lock():
++                self.tactile_overlay_values_shared[:] = [0.0] * (TACTILE_SIDE_COUNT * TACTILE_SIDE_STRIDE)
++            with self.tactile_overlay_timestamp_shared.get_lock():
++                now = time.time()
++                for idx in range(TACTILE_SIDE_COUNT):
++                    self.tactile_overlay_timestamp_shared[idx] = now
++            with self.tactile_overlay_enabled_shared.get_lock():
++                self.tactile_overlay_enabled_shared.value = True
++            return
++
++        tactile_views = tactile_view if isinstance(tactile_view, (list, tuple)) else [tactile_view]
++        all_values = [0.0] * (TACTILE_SIDE_COUNT * TACTILE_SIDE_STRIDE)
++        active = [0] * TACTILE_SIDE_COUNT
++        timestamps = [0.0] * TACTILE_SIDE_COUNT
++        now = time.time()
++        for view in tactile_views:
++            if not isinstance(view, dict):
++                continue
++            side_idx = self._tactile_side_index(view.get("side", "right_ee"))
++            if side_idx is None:
++                continue
++            start = side_idx * TACTILE_SIDE_STRIDE
++            all_values[start:start + TACTILE_SIDE_STRIDE] = self._flatten_tactile_view(view)
++            active[side_idx] = 1
++            timestamps[side_idx] = now
++
++        with self.tactile_overlay_active_shared.get_lock():
++            self.tactile_overlay_active_shared[:] = active
++        with self.tactile_overlay_values_shared.get_lock():
++            self.tactile_overlay_values_shared[:] = all_values
++        with self.tactile_overlay_timestamp_shared.get_lock():
++            self.tactile_overlay_timestamp_shared[:] = timestamps
++        with self.tactile_overlay_enabled_shared.get_lock():
++            self.tactile_overlay_enabled_shared.value = True
++
++    def _tactile_hud_snapshots(self):
++        with self.tactile_overlay_enabled_shared.get_lock():
++            enabled = bool(self.tactile_overlay_enabled_shared.value)
++        if not enabled:
++            return []
++        with self.tactile_overlay_active_shared.get_lock():
++            active = list(self.tactile_overlay_active_shared[:])
++        with self.tactile_overlay_timestamp_shared.get_lock():
++            timestamps = list(self.tactile_overlay_timestamp_shared[:])
++        with self.tactile_overlay_values_shared.get_lock():
++            values = np.array(self.tactile_overlay_values_shared[:], dtype=np.float64).reshape(
++                TACTILE_SIDE_COUNT,
++                TACTILE_SITE_COUNT,
++                TACTILE_SITE_STRIDE,
++            )
++        now = time.time()
++        snapshots = []
++        for idx, side in enumerate(TACTILE_SIDE_NAMES):
++            if not active[idx]:
++                continue
++            side_values = values[idx].copy()
++            age = now - float(timestamps[idx]) if timestamps[idx] > 0.0 else 999.0
++            if age > 1.0:
++                side_values[:] = 0.0
++            snapshots.append({"side": side, "age": age, "values": side_values})
++        return snapshots
++
++    @staticmethod
++    def _heat_bgr(heat):
++        heat = float(np.clip(heat, 0.0, 1.0))
++        if heat <= 0.0:
++            return (32, 24, 18)
++        blue = int(230 - 210 * heat)
++        green = int(210 - 130 * heat)
++        red = int(70 + 185 * heat)
++        return (blue, green, red)
++
++    @staticmethod
++    def _fit_text_scale(text, max_width, base_scale=0.42, min_scale=0.25, thickness=1):
++        scale = float(base_scale)
++        while scale > min_scale:
++            width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
++            if width <= max_width:
++                return scale
++            scale -= 0.03
++        return min_scale
++
++    def _draw_tactile_hud_panel(self, image, snapshot, x0, y0, width, height):
++        overlay = image.copy()
++        cv2.rectangle(overlay, (x0, y0), (x0 + width, y0 + height), (18, 22, 26), -1)
++        cv2.addWeighted(overlay, 0.74, image, 0.26, 0.0, image)
++        cv2.rectangle(image, (x0, y0), (x0 + width, y0 + height), (70, 82, 92), 1)
++
++        side = snapshot["side"].upper()
++        title = f"RH5DG2 TACTILE {side}"
++        cv2.putText(image, title, (x0 + 10, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (235, 242, 245), 1, cv2.LINE_AA)
++
++        values = snapshot["values"]
++        max_heat = float(np.max(np.clip(values[:, 0], 0.0, 1.0))) if values.size else 0.0
++        age = snapshot["age"]
++        status = f"{max_heat * 100:03.0f}% {age:.1f}s"
++        status_scale = self._fit_text_scale(status, width - 170, base_scale=0.42)
++        cv2.putText(image, status, (x0 + width - 100, y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (160, 220, 235), 1, cv2.LINE_AA)
++
++        cell_gap = 4
++        cols = 4
++        rows = 2
++        cell_w = max(1, (width - 20 - cell_gap * (cols - 1)) // cols)
++        cell_h = max(1, (height - 36 - cell_gap * (rows - 1)) // rows)
++        start_y = y0 + 30
++        for idx in range(TACTILE_SITE_COUNT):
++            row = idx // cols
++            col = idx % cols
++            x = x0 + 10 + col * (cell_w + cell_gap)
++            y = start_y + row * (cell_h + cell_gap)
++            heat, normal, tangent, direction, direction_valid = values[idx]
++            heat = float(np.clip(heat, 0.0, 1.0))
++            color = self._heat_bgr(heat)
++            cv2.rectangle(image, (x, y), (x + cell_w, y + cell_h), (32, 38, 44), -1)
++            fill_h = int((cell_h - 2) * heat)
++            if fill_h > 0:
++                cv2.rectangle(image, (x + 1, y + cell_h - 1 - fill_h), (x + cell_w - 1, y + cell_h - 1), color, -1)
++            cv2.rectangle(image, (x, y), (x + cell_w, y + cell_h), (84, 96, 106), 1)
++
++            label = TACTILE_SITE_LABELS[idx]
++            cv2.putText(image, label, (x + 4, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (245, 248, 250), 1, cv2.LINE_AA)
++            heat_text = f"{heat * 100:.0f}"
++            cv2.putText(image, heat_text, (x + cell_w - 25, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (245, 248, 250), 1, cv2.LINE_AA)
++            nt_text = f"N{normal:.0f} T{tangent:.0f}"
++            nt_scale = self._fit_text_scale(nt_text, cell_w - 8, base_scale=0.34, min_scale=0.22)
++            cv2.putText(image, nt_text, (x + 4, y + cell_h - 7), cv2.FONT_HERSHEY_SIMPLEX, nt_scale, (225, 232, 235), 1, cv2.LINE_AA)
++
++            if heat >= 0.03 and tangent > 0.0 and direction_valid > 0.5 and 0.0 <= direction <= 359.0:
++                center = (x + cell_w // 2, y + cell_h // 2 + 2)
++                length = max(8, int(min(cell_w, cell_h) * 0.25))
++                rad = np.deg2rad(direction)
++                end = (
++                    int(center[0] + np.sin(rad) * length),
++                    int(center[1] - np.cos(rad) * length),
++                )
++                cv2.arrowedLine(image, center, end, (235, 195, 80), 1, cv2.LINE_AA, tipLength=0.35)
++
++    def _draw_tactile_hud(self, frame):
++        snapshots = self._tactile_hud_snapshots()
++        if not snapshots or cv2 is None:
++            return frame
++        out = frame.copy()
++        height, width = out.shape[:2]
++        eye_width = self.img_width if self.binocular and width >= self.img_width * 2 else width
++        panel_w = int(np.clip(eye_width * 0.30, 230, 330))
++        panel_h = int(np.clip(height * 0.23, 138, 190))
++        margin = max(12, int(min(eye_width, height) * 0.025))
++        center_gap = max(14, int(eye_width * 0.018))
++        bottom_margin = max(margin, int(height * 0.055))
++        eye_offsets = (0, eye_width) if self.binocular and width >= eye_width * 2 else (0,)
++        for snapshot in snapshots:
++            side = str(snapshot.get("side", "")).lower()
++            for offset in eye_offsets:
++                if side == "left":
++                    x0 = offset + eye_width // 2 - panel_w - center_gap // 2
++                else:
++                    x0 = offset + eye_width // 2 + center_gap // 2
++                x0 = int(np.clip(x0, offset + margin, offset + eye_width - panel_w - margin))
++                y0 = height - panel_h - bottom_margin
++                if x0 >= 0 and y0 >= 0 and x0 + panel_w < width and y0 + panel_h < height:
++                    self._draw_tactile_hud_panel(out, snapshot, x0, y0, panel_w, panel_h)
++        return out
+     
+     def _vuer_run(self):
+         try:
++            _safe_print(
++                "[teleop viewer 8012] "
++                f"child starting host={self.viewer_host} expected_port={self.viewer_port}",
++                flush=True,
++            )
+             self.vuer.run()
+         except KeyboardInterrupt:
+             pass
+         except Exception as e:
+-            print(f"Vuer encountered an error: {e}")
++            _safe_print(f"[teleop viewer 8012] Vuer encountered an error: {e}", flush=True)
++            _safe_print(traceback.format_exc(), flush=True)
+         finally:
+             if hasattr(self, "stop_writer_event"):
+                 self.stop_writer_event.set()
+@@ -194,17 +462,42 @@ class TeleVuer:
+             self.new_frame_event.clear()
+             if self.latest_frame is None:
+                 continue
+-            latest_frame = self.latest_frame
++            latest_frame = self._draw_tactile_hud(self.latest_frame)
+             latest_frame = cv2.cvtColor(latest_frame, cv2.COLOR_BGR2RGB)
++            if latest_frame.shape != self.img2display.shape:
++                _safe_print(
++                    "[TeleVuer] Warning: render frame shape mismatch "
++                    f"frame={latest_frame.shape} expected={self.img2display.shape}; skipping frame.",
++                    flush=True,
++                )
++                continue
+             self.img2display[:] = latest_frame
+     
+     def render_to_xr(self, image):
+         if self.webrtc or self.display_mode == "pass-through":
+-            print("[TeleVuer] Warning: render_to_xr is ignored when webrtc is enabled or pass_through is True.")
++            _safe_print("[TeleVuer] Warning: render_to_xr is ignored when webrtc is enabled or pass_through is True.")
+             return
+         self.latest_frame = image
+         self.new_frame_event.set()
+ 
++    def get_health_snapshot(self):
++        with self.camera_event_count_shared.get_lock():
++            camera_event_count = int(self.camera_event_count_shared.value)
++        with self.last_camera_event_ts_shared.get_lock():
++            last_camera_event_ts = float(self.last_camera_event_ts_shared.value)
++        with self.tracking_event_count_shared.get_lock():
++            tracking_event_count = int(self.tracking_event_count_shared.value)
++        with self.last_tracking_event_ts_shared.get_lock():
++            last_tracking_event_ts = float(self.last_tracking_event_ts_shared.value)
++        return {
++            "process_alive": bool(self.process.is_alive()),
++            "process_exitcode": self.process.exitcode,
++            "camera_event_count": camera_event_count,
++            "last_camera_event_ts": last_camera_event_ts,
++            "tracking_event_count": tracking_event_count,
++            "last_tracking_event_ts": last_tracking_event_ts,
++        }
++
+     def close(self):
+         self.process.terminate()
+         self.process.join(timeout=0.5)
+@@ -222,6 +515,11 @@ class TeleVuer:
+         try:
+             with self.head_pose_shared.get_lock():
+                 self.head_pose_shared[:] = event.value["camera"]["matrix"]
++            now = time.time()
++            with self.camera_event_count_shared.get_lock():
++                self.camera_event_count_shared.value += 1.0
++            with self.last_camera_event_ts_shared.get_lock():
++                self.last_camera_event_ts_shared.value = now
+         except:
+             pass
+ 
+@@ -233,6 +531,11 @@ class TeleVuer:
+                 self.left_arm_pose_shared[:] = event.value["left"]
+             with self.right_arm_pose_shared.get_lock():
+                 self.right_arm_pose_shared[:] = event.value["right"]
++            now = time.time()
++            with self.tracking_event_count_shared.get_lock():
++                self.tracking_event_count_shared.value += 1.0
++            with self.last_tracking_event_ts_shared.get_lock():
++                self.last_tracking_event_ts_shared.value = now
+             # ControllerState
+             left_controller = event.value["leftState"]
+             right_controller = event.value["rightState"]
+@@ -307,6 +610,11 @@ class TeleVuer:
+             extract_hand_poses(right_hand_data, self.right_arm_pose_shared, self.right_hand_position_shared, self.right_hand_orientation_shared)
+             extract_hands(left_hand, "left")
+             extract_hands(right_hand, "right")
++            now = time.time()
++            with self.tracking_event_count_shared.get_lock():
++                self.tracking_event_count_shared.value += 1.0
++            with self.last_tracking_event_ts_shared.get_lock():
++                self.last_tracking_event_ts_shared.value = now
+ 
+         except:
+             pass
+@@ -334,7 +642,8 @@ class TeleVuer:
+                 to="bgChildren",
+             )
+         while True:
+-            session.upsert(
++            if not self._session_upsert(
++                session,
+                 [
+                     ImageBackground(
+                         self.img2display[:, :self.img_width],
+@@ -346,7 +655,7 @@ class TeleVuer:
+                         # Note that these two masks are associated with left eye’s camera and the right eye’s camera.
+                         layers=1,
+                         format="jpeg",
+-                        quality=80,
++                        quality=self.jpeg_quality,
+                         key="background-left",
+                         interpolate=True,
+                     ),
+@@ -357,13 +666,14 @@ class TeleVuer:
+                         distanceToCamera=1,
+                         layers=2,
+                         format="jpeg",
+-                        quality=80,
++                        quality=self.jpeg_quality,
+                         key="background-right",
+                         interpolate=True,
+                     ),
+                 ],
+                 to="bgChildren",
+-            )
++            ):
++                return
+             # 'jpeg' encoding should give you about 30fps with a 16ms wait in-between.
+             await asyncio.sleep(1.0 / self.display_fps)
+ 
+@@ -390,7 +700,8 @@ class TeleVuer:
+             )
+ 
+         while True:
+-            session.upsert(
++            if not self._session_upsert(
++                session,
+                 [
+                     ImageBackground(
+                         self.img2display,
+@@ -398,13 +709,14 @@ class TeleVuer:
+                         height=1,
+                         distanceToCamera=1,
+                         format="jpeg",
+-                        quality=80,
++                        quality=self.jpeg_quality,
+                         key="background-mono",
+                         interpolate=True,
+                     ),
+                 ],
+                 to="bgChildren",
+-            )
++            ):
++                return
+             await asyncio.sleep(1.0 / self.display_fps)
+ 
+     async def main_image_binocular_webrtc(self, session):
+@@ -429,19 +741,21 @@ class TeleVuer:
+                 to="bgChildren",
+             )
+ 
++        if not self._session_upsert(
++            session,
++            WebRTCStereoVideoPlane(
++                src=self.webrtc_url,
++                iceServer=None,
++                iceServers=[],
++                key="video-quad",
++                aspect=self.aspect_ratio,
++                height=7,
++                layout="stereo-left-right",
++            ),
++            to="bgChildren",
++        ):
++            return
+         while True:
+-            session.upsert(
+-                WebRTCStereoVideoPlane(
+-                    src=self.webrtc_url,
+-                    iceServer=None,
+-                    iceServers=[], 
+-                    key="video-quad",
+-                    aspect=self.aspect_ratio,
+-                    height = 7,
+-                    layout="stereo-left-right"
+-                ),
+-                to="bgChildren",
+-            )
+             await asyncio.sleep(1.0 / self.display_fps)
+ 
+     async def main_image_monocular_webrtc(self, session):
+@@ -466,18 +780,20 @@ class TeleVuer:
+                 to="bgChildren",
+             )
+ 
++        if not self._session_upsert(
++            session,
++            WebRTCVideoPlane(
++                src=self.webrtc_url,
++                iceServer=None,
++                iceServers=[],
++                key="video-quad",
++                aspect=self.aspect_ratio,
++                height=7,
++            ),
++            to="bgChildren",
++        ):
++            return
+         while True:
+-            session.upsert(
+-                WebRTCVideoPlane(
+-                    src=self.webrtc_url,
+-                    iceServer=None,
+-                    iceServers=[],
+-                    key="video-quad",
+-                    aspect=self.aspect_ratio,
+-                    height = 7,
+-                ),
+-                to="bgChildren",
+-            )
+             await asyncio.sleep(1.0 / self.display_fps)
+ 
+     ## ego MODE
+@@ -503,7 +819,8 @@ class TeleVuer:
+                 to="bgChildren",
+             )
+         while True:
+-            session.upsert(
++            if not self._session_upsert(
++                session,
+                 [
+                     ImageBackground(
+                         self.img2display[:, :self.img_width],
+@@ -515,7 +832,7 @@ class TeleVuer:
+                         # Note that these two masks are associated with left eye’s camera and the right eye’s camera.
+                         layers=1,
+                         format="jpeg",
+-                        quality=80,
++                        quality=self.jpeg_quality,
+                         key="background-left",
+                         interpolate=True,
+                     ),
+@@ -526,13 +843,14 @@ class TeleVuer:
+                         distanceToCamera=2,
+                         layers=2,
+                         format="jpeg",
+-                        quality=80,
++                        quality=self.jpeg_quality,
+                         key="background-right",
+                         interpolate=True,
+                     ),
+                 ],
+                 to="bgChildren",
+-            )
++            ):
++                return
+             # 'jpeg' encoding should give you about 30fps with a 16ms wait in-between.
+             await asyncio.sleep(1.0 / self.display_fps)
+ 
+@@ -559,7 +877,8 @@ class TeleVuer:
+             )
+ 
+         while True:
+-            session.upsert(
++            if not self._session_upsert(
++                session,
+                 [
+                     ImageBackground(
+                         self.img2display,
+@@ -567,13 +886,14 @@ class TeleVuer:
+                         height=0.75,
+                         distanceToCamera=2,
+                         format="jpeg",
+-                        quality=80,
++                        quality=self.jpeg_quality,
+                         key="background-mono",
+                         interpolate=True,
+                     ),
+                 ],
+                 to="bgChildren",
+-            )
++            ):
++                return
+             await asyncio.sleep(1.0 / self.display_fps)
+ 
+     async def main_image_binocular_webrtc_ego(self, session):
+@@ -598,19 +918,21 @@ class TeleVuer:
+                 to="bgChildren",
+             )
+ 
++        if not self._session_upsert(
++            session,
++            WebRTCStereoVideoPlane(
++                src=self.webrtc_url,
++                iceServer=None,
++                iceServers=[],
++                key="video-quad",
++                aspect=self.aspect_ratio,
++                height=3,
++                layout="stereo-left-right",
++            ),
++            to="bgChildren",
++        ):
++            return
+         while True:
+-            session.upsert(
+-                WebRTCStereoVideoPlane(
+-                    src=self.webrtc_url,
+-                    iceServer=None,
+-                    iceServers=[], 
+-                    key="video-quad",
+-                    aspect=self.aspect_ratio,
+-                    height=3,
+-                    layout="stereo-left-right"
+-                ),
+-                to="bgChildren",
+-            )
+             await asyncio.sleep(1.0 / self.display_fps)
+ 
+     async def main_image_monocular_webrtc_ego(self, session):
+@@ -635,18 +957,20 @@ class TeleVuer:
+                 to="bgChildren",
+             )
+ 
++        if not self._session_upsert(
++            session,
++            WebRTCVideoPlane(
++                src=self.webrtc_url,
++                iceServer=None,
++                iceServers=[],
++                key="video-quad",
++                aspect=self.aspect_ratio,
++                height=3,
++            ),
++            to="bgChildren",
++        ):
++            return
+         while True:
+-            session.upsert(
+-                WebRTCVideoPlane(
+-                    src=self.webrtc_url,
+-                    iceServer=None,
+-                    iceServers=[],
+-                    key="video-quad",
+-                    aspect=self.aspect_ratio,
+-                    height=3,
+-                ),
+-                to="bgChildren",
+-            )
+             await asyncio.sleep(1.0 / self.display_fps)
+ 
+     ## pass-through MODE
+@@ -862,4 +1186,4 @@ class TeleVuer:
+     def right_ctrl_bButton(self):
+         """bool, right controller 'B' button pressed."""
+         with self.right_ctrl_bButton_shared.get_lock():
+-            return self.right_ctrl_bButton_shared.value
+\ No newline at end of file
++            return self.right_ctrl_bButton_shared.value
+diff --git a/src/televuer/tv_wrapper.py b/src/televuer/tv_wrapper.py
+index 3177215..1f95dae 100644
+--- a/src/televuer/tv_wrapper.py
++++ b/src/televuer/tv_wrapper.py
+@@ -1,4 +1,5 @@
+ import numpy as np
++import time
+ from .televuer import TeleVuer
+ from dataclasses import dataclass, field
+ from typing import Literal
+@@ -143,6 +144,15 @@ class TeleData:
+     head_pose: np.ndarray                  # (4,4) SE(3) pose of head matrix
+     left_wrist_pose: np.ndarray            # (4,4) SE(3) pose of left wrist of arm
+     right_wrist_pose: np.ndarray           # (4,4) SE(3) pose of right wrist of arm
++    head_pose_is_valid: bool = False
++    left_arm_is_valid: bool = False
++    right_arm_is_valid: bool = False
++    tracking_active: bool = False
++    session_alive: bool = False
++    # "fixed" arm-reference mode only: False until the frozen reference anchor has
++    # been captured from a settled, fully-tracked immersive frame. Arm control
++    # should hold/standby while this is False. Always True in other modes.
++    arm_anchor_ready: bool = True
+     # hand tracking
+     # https://docs.vuer.ai/en/latest/examples/19_hand_tracking.html
+     # https://immersive-web.github.io/webxr-hand-input/
+@@ -195,7 +205,11 @@ class TeleData:
+ class TeleVuerWrapper:
+     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=(480, 1280), display_fps: float=30.0,
+                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
+-                       cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False):
++                       cert_file: str=None, key_file: str=None, return_hand_rot_data: bool=False,
++                       arm_reference_mode: Literal["fixed", "head", "head_yaw", "head_yaw_compensated"]="fixed",
++                       arm_yaw_compensation_sign: float=1.0, jpeg_quality: int=80,
++                       tracking_timeout: float=1.0, session_timeout: float=2.0,
++                       arm_anchor_settle_s: float=1.0):
+         """
+         TeleVuerWrapper is a wrapper for the TeleVuer class, which handles XR device's data suit for robot control.
+         It initializes the TeleVuer instance with the specified parameters and provides a method to get motion state data.
+@@ -235,9 +249,97 @@ class TeleVuerWrapper:
+         """
+         self.use_hand_tracking = use_hand_tracking
+         self.return_hand_rot_data = return_hand_rot_data
++        self.arm_reference_mode = arm_reference_mode
++        self._head_yaw_zero = None
++        # "fixed" mode: world->reference transform captured once (initial head yaw +
++        # position). After capture, head motion has zero influence on the arm IK
++        # targets; the head pose only drives the neck. The anchor is only captured
++        # after the capture conditions (valid head pose, fresh camera events, hands
++        # tracked in-session) have held continuously for arm_anchor_settle_s — the
++        # head_pose shared state can briefly hold a stale pre-XR browser camera pose
++        # right after the immersive session starts, so an instant capture races it.
++        self._arm_ref_world_to_ref = None
++        self._anchor_ok_since = None
++        self.arm_anchor_settle_s = float(arm_anchor_settle_s)
++        self.arm_yaw_compensation_sign = 1.0 if float(arm_yaw_compensation_sign) >= 0.0 else -1.0
++        self.tracking_timeout = float(tracking_timeout)
++        self.session_timeout = float(session_timeout)
+         self.tvuer = TeleVuer(use_hand_tracking=use_hand_tracking, binocular=binocular, img_shape=img_shape, display_fps=display_fps,
+                               display_mode=display_mode, zmq=zmq, webrtc=webrtc, webrtc_url=webrtc_url, 
+-                              cert_file=cert_file, key_file=key_file)
++                              cert_file=cert_file, key_file=key_file, jpeg_quality=jpeg_quality)
++
++    def _head_yaw(self, world_head_pose):
++        return np.arctan2(world_head_pose[1, 0], world_head_pose[0, 0])
++
++    def _yaw_rotation(self, yaw):
++        cos_yaw = np.cos(yaw)
++        sin_yaw = np.sin(yaw)
++        return np.array([
++            [cos_yaw, -sin_yaw, 0.0],
++            [sin_yaw, cos_yaw, 0.0],
++            [0.0, 0.0, 1.0],
++        ])
++
++    def _relative_head_yaw(self, world_head_pose, head_pose_is_valid=True):
++        yaw = self._head_yaw(world_head_pose)
++        if self._head_yaw_zero is None and head_pose_is_valid:
++            self._head_yaw_zero = yaw
++        if self._head_yaw_zero is None:
++            return 0.0
++        return np.arctan2(np.sin(yaw - self._head_yaw_zero), np.cos(yaw - self._head_yaw_zero))
++
++    def reset_arm_reference_anchor(self):
++        """Drop the frozen 'fixed'-mode anchor so it is re-captured after the capture
++        conditions have been continuously satisfied for arm_anchor_settle_s again."""
++        self._arm_ref_world_to_ref = None
++        self._anchor_ok_since = None
++
++    def _update_fixed_anchor(self, world_head_pose, conditions_ok, now):
++        """Advance the 'fixed'-mode anchor capture state machine. Returns True when
++        the anchor is available (arm targets are trustworthy), False while waiting."""
++        if self.arm_reference_mode != "fixed":
++            return True
++        if self._arm_ref_world_to_ref is not None:
++            return True
++        if not conditions_ok:
++            self._anchor_ok_since = None
++            return False
++        if self._anchor_ok_since is None:
++            self._anchor_ok_since = now
++        if now - self._anchor_ok_since < self.arm_anchor_settle_s:
++            return False
++        world_ref_pose = np.eye(4)
++        world_ref_pose[:3, :3] = self._yaw_rotation(self._head_yaw(world_head_pose))
++        world_ref_pose[:3, 3] = world_head_pose[:3, 3]
++        self._arm_ref_world_to_ref = fast_mat_inv(world_ref_pose)
++        return True
++
++    def _world_to_arm_reference(self, world_head_pose):
++        if self.arm_reference_mode == "fixed":
++            if self._arm_ref_world_to_ref is not None:
++                return self._arm_ref_world_to_ref
++            # Anchor not captured yet: fall back to the translation-only reference
++            # below. Arm control is expected to hold while arm_anchor_ready is False.
++        if self.arm_reference_mode == "head_yaw":
++            yaw = self._head_yaw(world_head_pose)
++            world_ref_pose = np.eye(4)
++            world_ref_pose[:3, :3] = self._yaw_rotation(yaw)
++            world_ref_pose[:3, 3] = world_head_pose[:3, 3]
++            return fast_mat_inv(world_ref_pose)
++
++        world_to_ref = np.eye(4)
++        world_to_ref[:3, 3] = -world_head_pose[:3, 3]
++        return world_to_ref
++
++    def _compensate_head_yaw_in_arm_pose(self, arm_pose, world_head_pose, head_pose_is_valid=True):
++        if self.arm_reference_mode != "head_yaw_compensated":
++            return arm_pose
++        yaw_delta = self.arm_yaw_compensation_sign * self._relative_head_yaw(world_head_pose, head_pose_is_valid)
++        yaw_rot = self._yaw_rotation(yaw_delta)
++        compensated = arm_pose.copy()
++        compensated[:3, :3] = yaw_rot @ compensated[:3, :3]
++        compensated[:3, 3] = yaw_rot @ compensated[:3, 3]
++        return compensated
+         
+     def get_tele_data(self):
+         """
+@@ -259,6 +361,23 @@ class TeleVuerWrapper:
+ 
+         # TeleVuer (Vuer) obtains all raw data under the (basis) OpenXR Convention.
+         Bxr_world_head, head_pose_is_valid = safe_mat_update(CONST_HEAD_POSE, self.tvuer.head_pose)
++        health = self.tvuer.get_health_snapshot() if hasattr(self.tvuer, "get_health_snapshot") else {}
++        now = time.time()
++        last_tracking_event_ts = float(health.get("last_tracking_event_ts", 0.0) or 0.0)
++        last_camera_event_ts = float(health.get("last_camera_event_ts", 0.0) or 0.0)
++        process_alive = bool(health.get("process_alive", True))
++        tracking_active = bool(
++            process_alive
++            and last_tracking_event_ts > 0.0
++            and now - last_tracking_event_ts <= self.tracking_timeout
++        )
++        session_alive = bool(
++            process_alive
++            and (
++                last_camera_event_ts <= 0.0
++                or now - last_camera_event_ts <= self.session_timeout
++            )
++        )
+ 
+         # hand tracking
+         if self.use_hand_tracking:
+@@ -290,11 +409,30 @@ class TeleVuerWrapper:
+             left_IPunitree_Brobot_world_arm = left_IPxr_Brobot_world_arm @ (T_TO_UNITREE_HUMANOID_LEFT_ARM if left_arm_is_valid else np.eye(4))
+             right_IPunitree_Brobot_world_arm = right_IPxr_Brobot_world_arm @ (T_TO_UNITREE_HUMANOID_RIGHT_ARM if right_arm_is_valid else np.eye(4))
+ 
+-            # Transfer from WORLD to HEAD coordinate (translation adjustment only)
+-            left_IPunitree_Brobot_head_arm = left_IPunitree_Brobot_world_arm.copy()
+-            right_IPunitree_Brobot_head_arm = right_IPunitree_Brobot_world_arm.copy()
+-            left_IPunitree_Brobot_head_arm[0:3, 3]  = left_IPunitree_Brobot_head_arm[0:3, 3] - Brobot_world_head[0:3, 3]
+-            right_IPunitree_Brobot_head_arm[0:3, 3] = right_IPunitree_Brobot_world_arm[0:3, 3] - Brobot_world_head[0:3, 3]
++            # Fixed-mode anchor: only capture after a fully-tracked immersive state
++            # (valid head pose + fresh camera events + both hands tracked) has held
++            # for the settle window. Right after entering XR the head_pose shared
++            # state can still hold the pre-XR browser camera pose for a few frames,
++            # so an instant capture races it and freezes a bogus reference.
++            camera_fresh = bool(last_camera_event_ts > 0.0 and now - last_camera_event_ts <= 1.0)
++            anchor_conditions = bool(
++                head_pose_is_valid and camera_fresh and tracking_active
++                and left_arm_is_valid and right_arm_is_valid
++            )
++            arm_anchor_ready = self._update_fixed_anchor(Brobot_world_head, anchor_conditions, now)
++            world_to_arm_reference = self._world_to_arm_reference(Brobot_world_head)
++            left_IPunitree_Brobot_head_arm = world_to_arm_reference @ left_IPunitree_Brobot_world_arm
++            right_IPunitree_Brobot_head_arm = world_to_arm_reference @ right_IPunitree_Brobot_world_arm
++            left_IPunitree_Brobot_head_arm = self._compensate_head_yaw_in_arm_pose(
++                left_IPunitree_Brobot_head_arm,
++                Brobot_world_head,
++                head_pose_is_valid,
++            )
++            right_IPunitree_Brobot_head_arm = self._compensate_head_yaw_in_arm_pose(
++                right_IPunitree_Brobot_head_arm,
++                Brobot_world_head,
++                head_pose_is_valid,
++            )
+ 
+             # =====coordinate origin offset=====
+             # The origin of the coordinate for IK Solve is near the WAIST joint motor. You can use teleop/robot_control/robot_arm_ik.py Unit_Test to visualize it.
+@@ -367,6 +505,12 @@ class TeleVuerWrapper:
+                 head_pose=Brobot_world_head,
+                 left_wrist_pose=left_IPunitree_Brobot_wrist_arm,
+                 right_wrist_pose=right_IPunitree_Brobot_wrist_arm,
++                head_pose_is_valid=head_pose_is_valid,
++                left_arm_is_valid=left_arm_is_valid,
++                right_arm_is_valid=right_arm_is_valid,
++                tracking_active=tracking_active,
++                arm_anchor_ready=arm_anchor_ready,
++                session_alive=session_alive,
+                 left_hand_pos=left_IPunitree_Brobot_arm_hand_pos,
+                 right_hand_pos=right_IPunitree_Brobot_arm_hand_pos,
+                 left_hand_rot=left_Brobot_arm_hand_rot,
+@@ -391,11 +535,27 @@ class TeleVuerWrapper:
+             left_IPunitree_Brobot_world_arm  = T_ROBOT_OPENXR @ left_IPunitree_Bxr_world_arm @ T_OPENXR_ROBOT
+             right_IPunitree_Brobot_world_arm = T_ROBOT_OPENXR @ right_IPunitree_Bxr_world_arm @ T_OPENXR_ROBOT
+ 
+-            # Transfer from WORLD to HEAD coordinate (translation adjustment only)
+-            left_IPunitree_Brobot_head_arm = left_IPunitree_Brobot_world_arm.copy()
+-            right_IPunitree_Brobot_head_arm = right_IPunitree_Brobot_world_arm.copy()
+-            left_IPunitree_Brobot_head_arm[0:3, 3]  = left_IPunitree_Brobot_head_arm[0:3, 3] - Brobot_world_head[0:3, 3]
+-            right_IPunitree_Brobot_head_arm[0:3, 3] = right_IPunitree_Brobot_head_arm[0:3, 3] - Brobot_world_head[0:3, 3]
++            # Same anchor gating as the hand-tracking branch: settle window over a
++            # fully-tracked immersive state, never the pre-XR browser camera pose.
++            camera_fresh = bool(last_camera_event_ts > 0.0 and now - last_camera_event_ts <= 1.0)
++            anchor_conditions = bool(
++                head_pose_is_valid and camera_fresh and tracking_active
++                and left_arm_is_valid and right_arm_is_valid
++            )
++            arm_anchor_ready = self._update_fixed_anchor(Brobot_world_head, anchor_conditions, now)
++            world_to_arm_reference = self._world_to_arm_reference(Brobot_world_head)
++            left_IPunitree_Brobot_head_arm = world_to_arm_reference @ left_IPunitree_Brobot_world_arm
++            right_IPunitree_Brobot_head_arm = world_to_arm_reference @ right_IPunitree_Brobot_world_arm
++            left_IPunitree_Brobot_head_arm = self._compensate_head_yaw_in_arm_pose(
++                left_IPunitree_Brobot_head_arm,
++                Brobot_world_head,
++                head_pose_is_valid,
++            )
++            right_IPunitree_Brobot_head_arm = self._compensate_head_yaw_in_arm_pose(
++                right_IPunitree_Brobot_head_arm,
++                Brobot_world_head,
++                head_pose_is_valid,
++            )
+ 
+             # =====coordinate origin offset=====
+             # The origin of the coordinate for IK Solve is near the WAIST joint motor. You can use teleop/robot_control/robot_arm_ik.py Unit_Test to check it.
+@@ -413,6 +573,12 @@ class TeleVuerWrapper:
+                 head_pose=Brobot_world_head,
+                 left_wrist_pose=left_IPunitree_Brobot_wrist_arm,
+                 right_wrist_pose=right_IPunitree_Brobot_wrist_arm,
++                head_pose_is_valid=head_pose_is_valid,
++                left_arm_is_valid=left_arm_is_valid,
++                right_arm_is_valid=right_arm_is_valid,
++                tracking_active=tracking_active,
++                arm_anchor_ready=arm_anchor_ready,
++                session_alive=session_alive,
+                 left_ctrl_trigger=self.tvuer.left_ctrl_trigger,
+                 left_ctrl_triggerValue=10.0 - self.tvuer.left_ctrl_triggerValue * 10,
+                 left_ctrl_squeeze=self.tvuer.left_ctrl_squeeze,
+@@ -433,6 +599,13 @@ class TeleVuerWrapper:
+         
+     def render_to_xr(self, img):
+         self.tvuer.render_to_xr(img)
++
++    def set_tactile_overlay(self, tactile_view):
++        if hasattr(self.tvuer, "set_tactile_overlay"):
++            self.tvuer.set_tactile_overlay(tactile_view)
++
++    def get_health_snapshot(self):
++        return self.tvuer.get_health_snapshot()
+     
+     def close(self):
+-        self.tvuer.close()
+\ No newline at end of file
++        self.tvuer.close()
+
+

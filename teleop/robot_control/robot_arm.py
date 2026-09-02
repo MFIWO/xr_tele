@@ -17,6 +17,9 @@ logger_mp = logging_mp.getLogger(__name__)
 kTopicLowCommand_Debug  = "rt/lowcmd"
 kTopicLowCommand_Motion = "rt/arm_sdk"
 kTopicLowState = "rt/lowstate"
+DDS_LOWSTATE_STALE_TIMEOUT = 0.5
+DDS_WRITE_FAILURE_THRESHOLD = 3
+DDS_LOWCOMMAND_PUBLISH_GAP_THRESHOLD = 0.05
 
 G1_29_Num_Motors = 35
 G1_23_Num_Motors = 35
@@ -29,6 +32,114 @@ class MotorState:
     def __init__(self):
         self.q = None
         self.dq = None
+        self.temperature = None
+
+
+def _copy_motor_temperature(temperature):
+    """Detach a motor temperature value from the mutable DDS sample."""
+    if temperature is None:
+        return None
+    if isinstance(temperature, (list, tuple, np.ndarray)):
+        return tuple(int(value) for value in temperature)
+    return int(temperature)
+
+
+class ArmTemperatureReader:
+    def get_current_motor_temperatures(self):
+        """Return the latest lowstate temperature for every motor index.
+
+        HG robots expose two temperature readings per motor, while GO/H1
+        exposes one. Consequently each item is either an int or a tuple.
+        """
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is None:
+            return []
+        return [motor.temperature for motor in lowstate.motor_state]
+
+    def _update_lowstate_dds_health(self, received):
+        """Log lowstate loss/recovery without treating an empty poll as a loss."""
+        now = time.monotonic()
+        last_rx = getattr(self, "_dds_lowstate_last_rx", None)
+        stale = getattr(self, "_dds_lowstate_stale", False)
+
+        if received:
+            if last_rx is None:
+                logger_mp.info(
+                    "[DDS lowstate] CONNECTED controller=%s topic=%s",
+                    self.__class__.__name__,
+                    kTopicLowState,
+                )
+            elif stale:
+                logger_mp.warning(
+                    "[DDS lowstate] RECOVERED controller=%s topic=%s outage=%.3fs",
+                    self.__class__.__name__,
+                    kTopicLowState,
+                    now - last_rx,
+                )
+            self._dds_lowstate_last_rx = now
+            self._dds_lowstate_stale = False
+            return
+
+        if (
+            last_rx is not None
+            and not stale
+            and now - last_rx >= DDS_LOWSTATE_STALE_TIMEOUT
+        ):
+            self._dds_lowstate_stale = True
+            logger_mp.warning(
+                "[DDS lowstate] LOST controller=%s topic=%s no_data=%.3fs threshold=%.3fs",
+                self.__class__.__name__,
+                kTopicLowState,
+                now - last_rx,
+                DDS_LOWSTATE_STALE_TIMEOUT,
+            )
+
+    def _update_lowcmd_dds_health(self, write_ok, topic):
+        """Log consecutive DDS writer failures and the first successful recovery."""
+        now = time.monotonic()
+        last_attempt = getattr(self, "_dds_lowcmd_last_attempt", None)
+        if (
+            last_attempt is not None
+            and now - last_attempt >= DDS_LOWCOMMAND_PUBLISH_GAP_THRESHOLD
+        ):
+            logger_mp.warning(
+                "[DDS lowcmd] PUBLISH GAP controller=%s topic=%s gap=%.3fs threshold=%.3fs publishing=resumed",
+                self.__class__.__name__,
+                topic,
+                now - last_attempt,
+                DDS_LOWCOMMAND_PUBLISH_GAP_THRESHOLD,
+            )
+        self._dds_lowcmd_last_attempt = now
+
+        if write_ok is not False:
+            if getattr(self, "_dds_lowcmd_failed", False):
+                logger_mp.warning(
+                    "[DDS lowcmd] RECOVERED controller=%s topic=%s failures=%s outage=%.3fs",
+                    self.__class__.__name__,
+                    topic,
+                    getattr(self, "_dds_lowcmd_failure_count", 0),
+                    now - getattr(self, "_dds_lowcmd_failure_since", now),
+                )
+            self._dds_lowcmd_failure_count = 0
+            self._dds_lowcmd_failure_since = None
+            self._dds_lowcmd_failed = False
+            return
+
+        failure_count = getattr(self, "_dds_lowcmd_failure_count", 0) + 1
+        self._dds_lowcmd_failure_count = failure_count
+        if getattr(self, "_dds_lowcmd_failure_since", None) is None:
+            self._dds_lowcmd_failure_since = now
+        if (
+            failure_count >= DDS_WRITE_FAILURE_THRESHOLD
+            and not getattr(self, "_dds_lowcmd_failed", False)
+        ):
+            self._dds_lowcmd_failed = True
+            logger_mp.warning(
+                "[DDS lowcmd] WRITE FAILED controller=%s topic=%s consecutive_failures=%s",
+                self.__class__.__name__,
+                topic,
+                failure_count,
+            )
 
 class G1_29_LowState:
     def __init__(self):
@@ -64,7 +175,7 @@ class DataBuffer:
         with self.lock:
             self.data = data
 
-class G1_29_ArmController:
+class G1_29_ArmController(ArmTemperatureReader):
     def __init__(self, motion_mode = False, simulation_mode = False):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.q_target = np.zeros(14)
@@ -156,7 +267,11 @@ class G1_29_ArmController:
                 for id in range(G1_29_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                    lowstate.motor_state[id].temperature = _copy_motor_temperature(
+                        msg.motor_state[id].temperature
+                    )
                 self.lowstate_buffer.SetData(lowstate)
+            self._update_lowstate_dds_health(msg is not None)
             time.sleep(0.002)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
@@ -188,7 +303,11 @@ class G1_29_ArmController:
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            self._last_write_ok = self.lowcmd_publisher.Write(self.msg)
+            self._update_lowcmd_dds_health(
+                self._last_write_ok,
+                kTopicLowCommand_Motion if self.motion_mode else kTopicLowCommand_Debug,
+            )
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -351,7 +470,7 @@ class G1_29_JointIndex(IntEnum):
     kNotUsedJoint4 = 33
     kNotUsedJoint5 = 34
 
-class G1_23_ArmController:
+class G1_23_ArmController(ArmTemperatureReader):
     def __init__(self, motion_mode = False, simulation_mode = False):
         self.simulation_mode = simulation_mode
         self.motion_mode = motion_mode
@@ -442,7 +561,11 @@ class G1_23_ArmController:
                 for id in range(G1_23_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                    lowstate.motor_state[id].temperature = _copy_motor_temperature(
+                        msg.motor_state[id].temperature
+                    )
                 self.lowstate_buffer.SetData(lowstate)
+            self._update_lowstate_dds_health(msg is not None)
             time.sleep(0.002)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
@@ -474,7 +597,11 @@ class G1_23_ArmController:
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            self._last_write_ok = self.lowcmd_publisher.Write(self.msg)
+            self._update_lowcmd_dds_health(
+                self._last_write_ok,
+                kTopicLowCommand_Motion if self.motion_mode else kTopicLowCommand_Debug,
+            )
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -629,7 +756,7 @@ class G1_23_JointIndex(IntEnum):
     kNotUsedJoint4 = 33
     kNotUsedJoint5 = 34
 
-class H1_2_ArmController:
+class H1_2_ArmController(ArmTemperatureReader):
     def __init__(self, motion_mode = False, simulation_mode = False):
         self.simulation_mode = simulation_mode
         self.motion_mode = motion_mode
@@ -648,6 +775,10 @@ class H1_2_ArmController:
         self.kd_low = 3.0
         self.kp_wrist = 50.0
         self.kd_wrist = 2.0
+        # Dedicated waist-yaw stiffness: held stiffer than other high-gain joints so the
+        # reaction torque from arm swings deflects the torso less. kd bumped a bit for damping.
+        self.kp_waist = 600.0
+        self.kd_waist = 7.0
 
         self.all_motor_q = None
         self.arm_velocity_limit = 20.0
@@ -728,6 +859,13 @@ class H1_2_ArmController:
                     self.msg.motor_cmd[id].kp = self.kp_high
                     self.msg.motor_cmd[id].kd = self.kd_high
             self.msg.motor_cmd[id].q  = self.all_motor_q[id]
+        # Stiffen only the waist yaw so arm-motion reaction torque turns the torso less.
+        self.msg.motor_cmd[H1_2_JointIndex.kWaistYaw].kp = self.kp_waist
+        self.msg.motor_cmd[H1_2_JointIndex.kWaistYaw].kd = self.kd_waist
+        logger_mp.info(
+            "Waist yaw stiffened: kp=%.1f kd=%.1f (other high-gain joints kp=%.1f).",
+            self.kp_waist, self.kd_waist, self.kp_high,
+        )
         logger_mp.info("Lock OK!")
 
         # initialize publish thread
@@ -746,7 +884,11 @@ class H1_2_ArmController:
                 for id in range(H1_2_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                    lowstate.motor_state[id].temperature = _copy_motor_temperature(
+                        msg.motor_state[id].temperature
+                    )
                 self.lowstate_buffer.SetData(lowstate)
+            self._update_lowstate_dds_health(msg is not None)
             time.sleep(0.002)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
@@ -788,6 +930,10 @@ class H1_2_ArmController:
 
             self.msg.crc = self.crc.Crc(self.msg)
             self._last_write_ok = self.lowcmd_publisher.Write(self.msg)
+            self._update_lowcmd_dds_health(
+                self._last_write_ok,
+                kTopicLowCommand_Motion if self.motion_mode else kTopicLowCommand_Debug,
+            )
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -987,7 +1133,7 @@ class H1_2_JointIndex(IntEnum):
     kNotUsedJoint6 = 33
     kNotUsedJoint7 = 34
 
-class H1_ArmController:
+class H1_ArmController(ArmTemperatureReader):
     def __init__(self, simulation_mode = False):
         self.simulation_mode = simulation_mode
         
@@ -1065,7 +1211,11 @@ class H1_ArmController:
                 for id in range(H1_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                    lowstate.motor_state[id].temperature = _copy_motor_temperature(
+                        msg.motor_state[id].temperature
+                    )
                 self.lowstate_buffer.SetData(lowstate)
+            self._update_lowstate_dds_health(msg is not None)
             time.sleep(0.002)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
@@ -1094,7 +1244,8 @@ class H1_ArmController:
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]      
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            self._last_write_ok = self.lowcmd_publisher.Write(self.msg)
+            self._update_lowcmd_dds_health(self._last_write_ok, kTopicLowCommand_Debug)
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -1207,7 +1358,7 @@ class H1_JointIndex(IntEnum):
     kLeftShoulderYaw = 18
     kLeftElbow = 19
 
-class H2_ArmController:
+class H2_ArmController(ArmTemperatureReader):
     def __init__(self, motion_mode=False, simulation_mode=False):
         logger_mp.info("Initialize H2_ArmController...")
         self.q_target = np.zeros(14)
@@ -1298,7 +1449,11 @@ class H2_ArmController:
                 for id in range(35):
                     lowstate.motor_state[id].q = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                    lowstate.motor_state[id].temperature = _copy_motor_temperature(
+                        msg.motor_state[id].temperature
+                    )
                 self.lowstate_buffer.SetData(lowstate)
+            self._update_lowstate_dds_health(msg is not None)
             time.sleep(0.002)
 
     def clip_arm_q_target(self, target_q, velocity_limit):
@@ -1330,7 +1485,11 @@ class H2_ArmController:
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
             self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            self._last_write_ok = self.lowcmd_publisher.Write(self.msg)
+            self._update_lowcmd_dds_health(
+                self._last_write_ok,
+                kTopicLowCommand_Motion if self.motion_mode else kTopicLowCommand_Debug,
+            )
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time

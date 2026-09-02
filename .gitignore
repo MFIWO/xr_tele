@@ -22,6 +22,7 @@ __MACOSX/
 teleop/data/
 episode_0*
 .vscode/
+teleop/.claude/settings.local.json
 *.pkl
 # Large mesh / asset files
 *.stl
@@ -39,4 +40,8 @@ episode_0*
 __pycache__/
 *.pyc
 teleop/*.log
-teleop/*.log
+teleop/logs/
+teleop/utils/data/
+test_data*/
+*_bak.py
+*.bak.*

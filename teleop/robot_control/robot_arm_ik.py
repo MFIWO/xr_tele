@@ -590,11 +590,12 @@ class G1_23_ArmIK:
 
 
 class H1_2_ArmIK:
-    def __init__(self, Unit_Test = False, Visualization = False):
+    def __init__(self, Unit_Test = False, Visualization = False, scale_input_poses = True):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
         self.Unit_Test = Unit_Test
         self.Visualization = Visualization
+        self.scale_input_poses = bool(scale_input_poses)
 
         # fixed cache file path
         self.cache_path = "h1_2_model_cache.pkl"
@@ -838,7 +839,8 @@ class H1_2_ArmIK:
             self.init_data = current_lr_arm_motor_q
         self.opti.set_initial(self.var_q, self.init_data)
 
-        left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
+        if self.scale_input_poses:
+            left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
         if self.Visualization:
             self.vis.viewer['L_ee_target'].set_transform(left_wrist)   # for visualization
             self.vis.viewer['R_ee_target'].set_transform(right_wrist)  # for visualization
@@ -893,11 +895,12 @@ class H1_2_ArmIK:
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
 
 class H1_ArmIK:
-    def __init__(self, Unit_Test = False, Visualization = False):
+    def __init__(self, Unit_Test = False, Visualization = False, scale_input_poses = True):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
         self.Unit_Test = Unit_Test
         self.Visualization = Visualization
+        self.scale_input_poses = bool(scale_input_poses)
 
         # fixed cache file path
         self.cache_path = "h1_model_cache.pkl"
@@ -1145,7 +1148,8 @@ class H1_ArmIK:
             self.init_data = current_lr_arm_motor_q
         self.opti.set_initial(self.var_q, self.init_data)
 
-        left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
+        if self.scale_input_poses:
+            left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
         if self.Visualization:
             self.vis.viewer['L_ee_target'].set_transform(left_wrist)   # for visualization
             self.vis.viewer['R_ee_target'].set_transform(right_wrist)  # for visualization

@@ -1,3 +1,45 @@
+"""Open-loop replay of a LeRobot deploy-bundle episode on the H1-2.
+
+Copied from `teleop_hand_and_arm_policy_infer.py` — the robot bring-up, cameras,
+XR viewer, keyboard FSM, recording, rate limits and shutdown paths are unchanged.
+What differs is where the actions come from: instead of a remote policy server,
+the recorded `action` rows of a bundle episode parquet are stepped through on a
+wall clock at the episode's fps. There is no network dependency and no feedback:
+this is a pure open-loop trajectory replay, useful for verifying that the robot
+reproduces what an episode recorded (and that the deploy action layout is wired
+correctly) before pointing the real policy at it.
+
+Bundle episode layout (GR00T / LeRobot v2.0, see meta/modality.json)::
+
+    action[0:2]    head yaw, pitch (rad) — the pan/tilt neck command
+    action[2:9]    left arm joint positions (rad)
+    action[9:22]   left hand motor positions (Inspire DG2 raw units, 0..2040)
+    action[22:29]  right arm joint positions (rad)
+    action[29:42]  right hand motor positions
+
+Rows are remapped at load time into the internal POLICY_SLICES layout
+([left_arm, left_hand, right_arm, right_hand, head]) so everything downstream of
+pop_action() — arm/hand rate limiting, neck command path, recording — is
+byte-identical to the policy rollout script.
+
+Also accepted: loop_porting_kit sidecar recordings (a dir or parquet with
+per-part `h1_2.action.*.joint_position` columns, e.g. test_data/robot-h1_2.parquet).
+The same head(2)+arm(7)+ee(13) parts are stitched into the 42-dim layout; fps
+comes from teleop_session.json (fallback: recorded timestamps).
+
+Checklist before running:
+    - Same scene/robot start pose as the episode. [h] drives the robot to the
+      episode's first action frame (the default home pose); [r] starts the replay.
+    - E-stop within reach. Start with --dry-run, then --policy-arm-max-step small.
+
+Usage:
+    python teleop/teleop_hand_and_arm_lerobot_replay.py \
+        --ee inspire_dg2 --episode left-turn-signal --dry-run
+    python teleop/teleop_hand_and_arm_lerobot_replay.py \
+        --ee inspire_dg2 \
+        --episode /workspace/lerobot/deploy_bundle_car4task_100k/episodes/car-sunroof-onoff
+"""
+
 import time
 import argparse
 import copy
@@ -13,29 +55,36 @@ except ImportError:
     cv2 = None
 import numpy as np
 
-import os 
+import glob
+import os
 import sys
 import socket
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-sys.path.insert(0, parent_dir)
-sys.path.insert(0, os.path.join(current_dir, "televuer", "src"))
-sys.path.insert(0, os.path.join(current_dir, "teleimager", "src"))
+sys.path.append(parent_dir)
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
-from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController
-from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK
+from teleop.robot_control.robot_arm import (
+    G1_29_ArmController,
+    G1_29_JointArmIndex,
+    G1_23_ArmController,
+    G1_23_JointArmIndex,
+    H1_2_ArmController,
+    H1_2_JointArmIndex,
+    H1_ArmController,
+    H1_JointArmIndex,
+    H2_ArmController,
+    H2_JointArmIndex,
+)
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.audio_recorder import BackgroundAudioRecorder, AudioRecorderError
 from teleop.utils.ipc import IPC_Server
-from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
+from teleop.utils.motion_switcher import MotionSwitcher
 from teleop.utils.rh5dg2_tactile import RH5DG2TactileHeatMapper
 from teleop.neck_control import VisionProNeckController
 from sshkeyboard import listen_keyboard, stop_listening
-
-logger_mp.info("[teleop imports] televuer=%s", getattr(sys.modules.get("televuer"), "__file__", None))
 
 # for simulation
 from unitree_sdk2py.core.channel import ChannelPublisher
@@ -45,12 +94,102 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
     publisher.Write(msg)
     logger_mp.info(f"published reset category: {category}")
 
+
+START_SYNC_DELAY = 1.0
+START_SYNC_AT = None
+
+# Guards the [r]/[p] state transitions shared between the sshkeyboard listener
+# thread (on_press) and the main control loop (delayed start).
+STATE_LOCK = threading.Lock()
+
+
+def _maybe_start_delayed_run_locked():
+    """Fire the queued [r] once its delay elapsed. Returns True when START flips on."""
+    global START, START_SYNC_AT, PAUSE_TO_READY
+    if START_SYNC_AT is None:
+        return False
+    if STOP:
+        START_SYNC_AT = None
+        return False
+    if time.monotonic() < START_SYNC_AT:
+        return False
+    if START:
+        # A stale [r] raced with an already-running rollout; do not re-fire mid-run.
+        START_SYNC_AT = None
+        return False
+    START_SYNC_AT = None
+    START = True
+    PAUSE_TO_READY = False
+    logger_mp.info("[replay run] START: the recorded episode now drives arms/hands/neck. Press [p] to pause, [q] to quit.")
+    return True
+
+
+def maybe_start_delayed_run():
+    with STATE_LOCK:
+        return _maybe_start_delayed_run_locked()
+
+
+def _update_neck_from_action(
+    args,
+    neck_ctrl,
+    neck_feedback,
+    head_action,
+    arm_ctrl,
+    loop_count,
+    neck_log_last_ts,
+    neck_log_interval,
+    allow_waist=True,
+):
+    """Drive the pan/tilt neck from the policy's 2-dim head action.
+
+    The recorded `head` action channel is the yaw/pitch *command* the teleop run sent
+    over UDP, so the policy output goes straight back into the same command path — no
+    neutral offset, only the controller's clamp + rate limit.
+    """
+    if neck_ctrl is None or head_action is None:
+        return None, neck_log_last_ts
+    try:
+        neck_command, neck_target = neck_ctrl.command_absolute(head_action)
+        neck_actual = neck_feedback.read_latest() if neck_feedback is not None else None
+        neck_record = {
+            "raw_head_yaw_pitch": [float(head_action[0]), float(head_action[1])],
+            "target_yaw_pitch": neck_target.tolist(),
+            "command_yaw_pitch": neck_command.tolist(),
+            "actual_yaw_pitch": None if neck_actual is None else neck_actual.get("yaw_pitch"),
+            "actual_timestamp": None if neck_actual is None else neck_actual.get("timestamp"),
+        }
+        waist_command = None
+        if allow_waist and args.enable_waist_follow_neck and arm_ctrl is not None:
+            waist_direction = -1.0 if args.waist_follow_neck_invert else 1.0
+            waist_command = arm_ctrl.ctrl_waist_yaw(
+                neck_command[0] * args.waist_yaw_gain * waist_direction,
+                limit=args.waist_yaw_limit,
+                velocity_limit=args.waist_yaw_velocity,
+            )
+        now = time.time()
+        if neck_log_interval is not None and now - neck_log_last_ts >= neck_log_interval:
+            neck_log_last_ts = now
+            logger_mp.info(
+                f"[policy neck] action={np.round(head_action, 4).tolist()} "
+                f"target={np.round(neck_target, 4).tolist()} "
+                f"command={np.round(neck_command, 4).tolist()} "
+                f"actual={None if neck_actual is None else np.round(neck_actual.get('yaw_pitch'), 4).tolist()} "
+                f"waist_yaw={None if waist_command is None else round(waist_command, 4)}"
+            )
+        return neck_record, neck_log_last_ts
+    except (ValueError, OSError) as e:
+        if loop_count % 30 == 0:
+            logger_mp.warning(f"[policy neck] command skipped: {e}")
+        return None, neck_log_last_ts
+
 # state transition
 START          = False  # Enable to start robot following VR user motion
 STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+PAUSE_TO_READY = False  # True while teleop is paused by [p]; arms are driven back to the ready pose
+GO_HOME        = False  # True while [h] eases the arms/hands/neck to the home pose before a rollout
 TACTILE_VR_OVERLAY_VISIBLE = True  # Toggle RH5DG2 tactile overlay visibility in the XR viewer
 # waist keyboard control (H1_2 only): [j]/[k] nudge the waist yaw left/right during teleop
 WAIST_YAW_REL     = 0.0     # current relative waist-yaw target (rad, relative to startup home)
@@ -71,19 +210,60 @@ WAIST_KEY_INVERT  = False   # swap [j]/[k] direction; overwritten from args in m
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
+    with STATE_LOCK:
+        _on_press_locked(key)
+
+
+def _on_press_locked(key):
     global STOP, START, READY, RECORD_RUNNING, RECORD_TOGGLE, TACTILE_VR_OVERLAY_VISIBLE, WAIST_YAW_REL
+    global START_SYNC_AT, PAUSE_TO_READY, GO_HOME
     if key == 'r':
-        START = True
+        if START:
+            logger_mp.warning("[policy run] ignored [r]: the rollout is already running. Press [p] to pause, or [q] to quit.")
+            return
+        START = False
+        PAUSE_TO_READY = False
+        GO_HOME = False
+        START_SYNC_AT = time.monotonic() + START_SYNC_DELAY
+        logger_mp.info(
+            "[replay run] [r] pressed. The episode replay starts in %.1fs — stand clear and keep the E-stop in reach.",
+            START_SYNC_DELAY,
+        )
+    elif key == 'p':
+        if START:
+            # Pause the rollout: drive the arms back to the ready pose and wait for [r].
+            START = False
+            START_SYNC_AT = None
+            PAUSE_TO_READY = True
+            logger_mp.info(
+                "[policy pause] [p] pressed. Arms return to the ready pose and the policy is disengaged; "
+                "press [r] to resume."
+            )
+        else:
+            logger_mp.warning("[policy pause] ignored [p] because the rollout is not running. Press [r] to start.")
+    elif key == 'h':
+        # Send the robot to the home pose the episodes started from, before handing over
+        # to the policy: the first predicted chunk assumes that starting configuration.
+        if START:
+            logger_mp.warning("[policy home] ignored [h]: the rollout is running. Press [p] to pause first.")
+        else:
+            GO_HOME = True
+            PAUSE_TO_READY = False
+            START_SYNC_AT = None  # a queued [r] must not fire mid-homing
+            WAIST_YAW_REL = 0.0
+            logger_mp.info("[policy home] [h] pressed. Easing arms/hands/neck to the home pose; press [r] when it settles.")
     elif key == 'q':
         START = False
+        START_SYNC_AT = None
+        GO_HOME = False
         STOP = True
     elif key == 's':
         if START == True and (READY or RECORD_RUNNING):
             RECORD_TOGGLE = True
         elif START == True:
-            logger_mp.warning("[teleop record] ignored [s] because the previous episode is still saving. Please wait until READY.")
+            logger_mp.warning("[policy record] ignored [s] because the previous episode is still saving. Please wait until READY.")
         else:
-            logger_mp.warning("[teleop record] ignored [s] because teleop has not started. Press [r] first, then [s] to record.")
+            logger_mp.warning("[policy record] ignored [s] because the rollout has not started. Press [r] first, then [s] to record.")
     elif key == 't':
         TACTILE_VR_OVERLAY_VISIBLE = not TACTILE_VR_OVERLAY_VISIBLE
         logger_mp.info(
@@ -188,22 +368,9 @@ def _read_body_qpos(arm_ctrl, enabled=True):
         return []
     return qpos.tolist()
 
-def _waist_state_snapshot(commanded_rel_rad, source):
-    """Snapshot the H1_2 waist yaw COMMAND at record start so each episode's data.json records
-    the commanded waist angle it was collected at, in both degrees (human-readable) and radians.
-    commanded_rel_rad is the current [j]/[k] relative target (rad, relative to startup home);
-    it is 0.0 before any [j]/[k] press and updates as the keys nudge the waist."""
-    snap = {
-        "source": source,  # "keyboard" | "follow_neck" | "fixed"
-        "commanded_relative_deg": None,
-        "commanded_relative_rad": None,
-    }
-    if commanded_rel_rad is not None:
-        snap["commanded_relative_rad"] = round(float(commanded_rel_rad), 6)
-        snap["commanded_relative_deg"] = round(float(np.degrees(commanded_rel_rad)), 3)
-    return snap
-
 def _safe_render_to_xr(tv_wrapper, image, log_prefix):
+    if tv_wrapper is None:
+        return False
     try:
         tv_wrapper.render_to_xr(image)
         return True
@@ -266,6 +433,7 @@ class RH5DG2TactileUDPReceiver:
         self.lock = threading.Lock()
         self.latest = {}
         self.last_rx_time = 0.0
+        self.side_last_rx_time = {"left_ee": 0.0, "right_ee": 0.0}
         self.packets = 0
         self.errors = 0
         self.last_debug = 0.0
@@ -289,8 +457,31 @@ class RH5DG2TactileUDPReceiver:
                 if not isinstance(packet, dict):
                     raise ValueError("packet is not a JSON object")
                 with self.lock:
-                    self.latest = packet
-                    self.last_rx_time = time.time()
+                    now = time.time()
+                    side_updates = {}
+                    for side in ("left_ee", "right_ee"):
+                        if isinstance(packet.get(side), dict):
+                            side_updates[side] = packet[side]
+                    tactiles = packet.get("tactiles")
+                    if isinstance(tactiles, dict):
+                        for side in ("left_ee", "right_ee"):
+                            if isinstance(tactiles.get(side), dict):
+                                side_updates[side] = tactiles[side]
+                    if side_updates:
+                        merged = {
+                            key: value
+                            for key, value in self.latest.items()
+                            if key in ("left_ee", "right_ee")
+                        }
+                        merged.update(copy.deepcopy(side_updates))
+                        merged["timestamp"] = packet.get("timestamp", now)
+                        merged["source"] = packet.get("source", "rh5dg2_tactile_udp")
+                        self.latest = merged
+                        for side in side_updates:
+                            self.side_last_rx_time[side] = now
+                    else:
+                        self.latest = packet
+                    self.last_rx_time = now
                     self.packets += 1
             except Exception as exc:
                 with self.lock:
@@ -323,9 +514,16 @@ class RH5DG2TactileUDPReceiver:
                 return {}
             latest = copy.deepcopy(self.latest)
             age = now - self.last_rx_time
+            stale_sides = [
+                side
+                for side, stamp in self.side_last_rx_time.items()
+                if stamp > 0.0 and now - stamp > self.timeout
+            ]
         if age > self.timeout:
             latest["_stale"] = True
             latest["_age_sec"] = age
+        if stale_sides:
+            latest["_stale_sides"] = stale_sides
         return latest
 
     def close(self):
@@ -785,131 +983,15 @@ def _resolve_rh5dg2_tactile_vr_sides(raw):
             sides.append(side)
     return sides or ["right_ee"]
 
-def _axis_angle_from_matrix(rot):
-    rot = np.asarray(rot, dtype=np.float64).reshape(3, 3)
-    cos_angle = np.clip((np.trace(rot) - 1.0) * 0.5, -1.0, 1.0)
-    angle = float(np.arccos(cos_angle))
-    if angle < 1e-7:
-        return np.array([1.0, 0.0, 0.0], dtype=np.float64), 0.0
-    axis = np.array(
-        [
-            rot[2, 1] - rot[1, 2],
-            rot[0, 2] - rot[2, 0],
-            rot[1, 0] - rot[0, 1],
-        ],
-        dtype=np.float64,
-    ) / (2.0 * np.sin(angle))
-    return axis / max(np.linalg.norm(axis), 1e-9), angle
-
-def _matrix_from_axis_angle(axis, angle):
-    axis = np.asarray(axis, dtype=np.float64).reshape(3)
-    axis = axis / max(np.linalg.norm(axis), 1e-9)
-    x, y, z = axis
-    c = np.cos(angle)
-    s = np.sin(angle)
-    t = 1.0 - c
-    return np.array(
-        [
-            [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
-            [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
-            [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
-        ],
-        dtype=np.float64,
-    )
-
-def _resolve_arm_sensitivity_args(args):
-    explicit = any(
-        value is not None
-        for value in (
-            args.arm_pos_gain_x,
-            args.arm_pos_gain_y,
-            args.arm_pos_gain_z,
-            args.arm_rot_gain,
-            args.arm_max_delta,
-            args.arm_smoothing_alpha,
-        )
-    )
-    if not explicit:
-        return {
-            "enabled": False,
-            "pos_gain": np.ones(3, dtype=np.float64),
-            "rot_gain": 1.0,
-            "max_delta": float("inf"),
-            "smoothing_alpha": 1.0,
-        }
-    sim_gain = 1.6 if args.sim else 1.0
-    sim_z_gain = 1.9 if args.sim else 1.0
-    return {
-        "enabled": True,
-        "pos_gain": np.array(
-            [
-                args.arm_pos_gain_x if args.arm_pos_gain_x is not None else sim_gain,
-                args.arm_pos_gain_y if args.arm_pos_gain_y is not None else sim_gain,
-                args.arm_pos_gain_z if args.arm_pos_gain_z is not None else sim_z_gain,
-            ],
-            dtype=np.float64,
-        ),
-        "rot_gain": float(args.arm_rot_gain if args.arm_rot_gain is not None else (1.15 if args.sim else 1.0)),
-        "max_delta": float(args.arm_max_delta if args.arm_max_delta is not None else (0.85 if args.sim else 0.45)),
-        "smoothing_alpha": float(
-            args.arm_smoothing_alpha if args.arm_smoothing_alpha is not None else (0.85 if args.sim else 0.65)
-        ),
-    }
-
-def _apply_arm_sensitivity(left_pose, right_pose, state, config, enabled=True):
-    def convert(side, pose):
-        arr = np.asarray(pose, dtype=np.float64)
-        if not enabled or not config.get("enabled", False) or arr.shape != (4, 4) or not np.isfinite(arr).all():
-            return pose, None
-
-        base_key = f"{side}_base"
-        smooth_key = f"{side}_smooth"
-        if base_key not in state:
-            state[base_key] = arr.copy()
-            state[smooth_key] = arr.copy()
-
-        base = state[base_key]
-        human_delta = arr[:3, 3] - base[:3, 3]
-        scaled_delta = human_delta * config["pos_gain"]
-        clamped_delta = np.clip(scaled_delta, -config["max_delta"], config["max_delta"])
-
-        rel_rot = base[:3, :3].T @ arr[:3, :3]
-        axis, angle = _axis_angle_from_matrix(rel_rot)
-        gained_rot = base[:3, :3] @ _matrix_from_axis_angle(axis, angle * config["rot_gain"])
-
-        target = arr.copy()
-        target[:3, 3] = base[:3, 3] + clamped_delta
-        target[:3, :3] = gained_rot
-
-        alpha = float(np.clip(config["smoothing_alpha"], 0.0, 1.0))
-        prev = state[smooth_key]
-        final = target.copy()
-        final[:3, 3] = prev[:3, 3] + alpha * (target[:3, 3] - prev[:3, 3])
-        state[smooth_key] = final.copy()
-        debug = {
-            "human_delta": human_delta,
-            "scaled_delta": scaled_delta,
-            "clamped_delta": clamped_delta,
-            "final_pos": final[:3, 3].copy(),
-        }
-        return final, debug
-
-    left_adjusted, left_debug = convert("left", left_pose)
-    right_adjusted, right_debug = convert("right", right_pose)
-    return left_adjusted, right_adjusted, left_debug, right_debug
-
-def _fmt_arm_sensitivity_debug(side, debug):
-    if debug is None:
-        return f"{side}=unavailable"
-    return (
-        f"{side}:human_delta={np.round(debug['human_delta'], 4).tolist()},"
-        f"scaled_delta={np.round(debug['scaled_delta'], 4).tolist()},"
-        f"clamped_delta={np.round(debug['clamped_delta'], 4).tolist()},"
-        f"final_pos={np.round(debug['final_pos'], 4).tolist()}"
-    )
+# Home/ready arm target for [h]/[p]. None -> built-in fallback (zeros + elbows at -0.3);
+# set from --policy-home-q so [h] can go to the pose the episodes were actually recorded from.
+POLICY_HOME_ARM_Q = None
 
 def _make_arm_ready_q(current_q):
-    q = np.zeros_like(np.asarray(current_q, dtype=np.float64).reshape(-1))
+    q_now = np.asarray(current_q, dtype=np.float64).reshape(-1)
+    if POLICY_HOME_ARM_Q is not None and POLICY_HOME_ARM_Q.size == q_now.size:
+        return POLICY_HOME_ARM_Q.copy()
+    q = np.zeros_like(q_now)
     if q.size == 0:
         return q
     half = q.size // 2
@@ -917,6 +999,138 @@ def _make_arm_ready_q(current_q):
         q[3] = -0.3
         q[half + 3] = -0.3
     return q
+
+
+def _resolve_policy_home_q(raw):
+    """Resolve --policy-home-q into a 14-dim arm target (left 7 + right 7, radians).
+
+    Accepts: 14 comma-separated floats; a recorded episode `data.json` (or its episode
+    directory) — takes the first frame's left_arm/right_arm qpos; or a LeRobot dataset
+    root — takes the first 14 dims of `observation.state` in the first data parquet.
+    Returns None when raw is empty (keep the built-in fallback pose)."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    text = str(raw).strip()
+
+    try:
+        parsed = _parse_float_list(text)
+    except ValueError:
+        parsed = None  # not a number list -> treat as a path below
+    if parsed is not None:
+        if len(parsed) != 14:
+            raise ValueError(f"--policy-home-q expects 14 comma-separated values, got {len(parsed)}.")
+        return np.asarray(parsed, dtype=np.float64)
+
+    path = os.path.expanduser(text)
+    if os.path.isdir(path):
+        episode_json = os.path.join(path, "data.json")
+        if os.path.isfile(episode_json):
+            path = episode_json
+        else:
+            # LeRobot dataset root: read the first row of the first data parquet.
+            parquets = sorted(glob.glob(os.path.join(path, "data", "**", "*.parquet"), recursive=True))
+            if not parquets:
+                raise ValueError(f"--policy-home-q: no data.json or data/**/*.parquet under {path}")
+            import pandas as pd  # optional dep; only needed for the dataset-root form
+            row = pd.read_parquet(parquets[0], columns=["observation.state"]).iloc[0]
+            state = np.asarray(row["observation.state"], dtype=np.float64).reshape(-1)
+            if state.size < 14:
+                raise ValueError(f"--policy-home-q: observation.state has {state.size} dims, expected >= 14.")
+            return state[:14]
+    if not os.path.isfile(path):
+        raise ValueError(f"--policy-home-q: {text} is neither 14 floats nor an existing path.")
+    with open(path) as f:
+        episode = json.load(f)
+    frames = episode["data"] if isinstance(episode, dict) else episode
+    first = frames[0]["states"]
+    home = np.asarray(
+        list(first["left_arm"]["qpos"]) + list(first["right_arm"]["qpos"]), dtype=np.float64
+    )
+    if home.size != 14:
+        raise ValueError(f"--policy-home-q: first frame arm qpos has {home.size} dims, expected 14.")
+    return home
+
+def _step_arms_toward_ready(arm_ctrl, current_q, max_step, tolerance=0.05, cmd_q=None, meas_margin=0.15,
+                            gravity_comp=None):
+    """Advance the *commanded* arm target one control tick toward the ready pose, clamped
+    to `max_step` per joint, and return (reached, cmd_q). Pass the returned cmd_q back in
+    on the next tick: integrating the command (like _smooth_arm_go_home) instead of
+    stepping from the measured q avoids the stall where gravity droop keeps the measured
+    position a few hundredths of a radian behind every command, so "measured + max_step"
+    never actually rises above the pose the arm is already holding. `meas_margin` bounds
+    the command to the measured pose (like the rollout's _policy_arm_target) so a stuck
+    or lagging arm can never wind up a large PD error; the margin is well above gravity
+    droop, so it does not reintroduce the stall. `reached` is judged against the measured
+    q so the caller only reports home once the robot got there."""
+    q_meas = np.asarray(current_q, dtype=np.float64).reshape(-1)
+    if q_meas.size == 0 or not np.isfinite(q_meas).all():
+        return False, cmd_q
+    if cmd_q is None or np.asarray(cmd_q).size != q_meas.size:
+        cmd_q = q_meas.copy()
+    target = _make_arm_ready_q(q_meas)
+    cmd_q = cmd_q + np.clip(target - cmd_q, -max_step, max_step)
+    if meas_margin > 0.0:
+        cmd_q = np.clip(cmd_q, q_meas - meas_margin, q_meas + meas_margin)
+    tauff = gravity_comp.tau(cmd_q) if gravity_comp is not None else np.zeros_like(cmd_q)
+    arm_ctrl.ctrl_dual_arm(cmd_q, tauff)
+    reached = bool(np.max(np.abs(target - cmd_q)) <= 1e-9 and np.max(np.abs(target - q_meas)) <= tolerance)
+    return reached, cmd_q
+
+
+def _go_home_tick(args, arm_ctrl, hand_ctrl, neck_ctrl, neck_feedback,
+                  loop_count, neck_log_last_ts, neck_log_interval, current_arm_q=None,
+                  cmd_q=None, gravity_comp=None):
+    """One control tick of the [h] home move: ease the arms toward the ready pose, drop the
+    hand override back to the controller's open baseline, centre the neck and unwind the
+    waist. Shared by the pre-[r] wait loop and the disengaged branch of the control loop so
+    [h] behaves the same before the first rollout and after a [p] pause. Pass the returned
+    cmd_q back in each tick (reset it to None when the move starts). Returns
+    (home_reached, neck_log_last_ts, cmd_q)."""
+    if args.dry_run:
+        logger_mp.info("[policy home] --dry-run: nothing published; treat the robot as already home.")
+        return True, neck_log_last_ts, cmd_q
+
+    home_reached = True
+    if not args.disable_arm and arm_ctrl is not None:
+        try:
+            if current_arm_q is None:
+                current_arm_q = arm_ctrl.get_current_dual_arm_q()
+            home_reached, cmd_q = _step_arms_toward_ready(
+                arm_ctrl, current_arm_q, max(0.0, args.policy_arm_startup_max_step), cmd_q=cmd_q,
+                meas_margin=getattr(args, "policy_arm_meas_margin", 0.15),
+                gravity_comp=gravity_comp,
+            )
+        except Exception as exc:
+            home_reached = False
+            if loop_count % 30 == 0:
+                logger_mp.warning("[policy home] arm command skipped: %s", exc)
+    if not args.disable_hand and hand_ctrl is not None:
+        hand_ctrl.clear_raw_command()
+    if args.enable_neck and neck_ctrl is not None:
+        _, neck_log_last_ts = _update_neck_from_action(
+            args,
+            neck_ctrl,
+            neck_feedback,
+            np.zeros(2, dtype=np.float64),
+            arm_ctrl,
+            loop_count,
+            neck_log_last_ts,
+            neck_log_interval,
+            allow_waist=False,
+        )
+    # The [j]/[k] waist block only runs while engaged, so unwind the waist here instead.
+    if arm_ctrl is not None and hasattr(arm_ctrl, "ctrl_waist_yaw"):
+        try:
+            arm_ctrl.ctrl_waist_yaw(
+                0.0,
+                limit=args.waist_yaw_limit,
+                velocity_limit=args.waist_yaw_velocity,
+            )
+        except Exception as exc:
+            if loop_count % 30 == 0:
+                logger_mp.warning("[policy home] waist command skipped: %s", exc)
+    return home_reached, neck_log_last_ts, cmd_q
+
 
 def _smooth_arm_go_home(arm_ctrl, duration=3.0, frequency=100.0, velocity_cap=3.0):
     """Gradually lower both arms (and the H1_2 waist) from the current pose to the
@@ -975,57 +1189,486 @@ def _smooth_arm_go_home(arm_ctrl, duration=3.0, frequency=100.0, velocity_cap=3.
         time.sleep(dt)
     return True
 
-def _safe_enter_hand_standby_open(hand_ctrl):
-    if hand_ctrl is not None and hasattr(hand_ctrl, "enter_standby_open"):
-        try:
-            hand_ctrl.enter_standby_open()
-            return True
-        except Exception as exc:
-            logger_mp.debug("[teleop hand standby] enter_standby_open failed: %s", exc)
-    return False
+_ARM_JOINT_INDEX_BY_MODEL = {
+    "G1_29": G1_29_JointArmIndex,
+    "G1_23": G1_23_JointArmIndex,
+    "H1_2": H1_2_JointArmIndex,
+    "H1": H1_JointArmIndex,
+    "H2": H2_JointArmIndex,
+}
 
-def _safe_enter_hand_auto(hand_ctrl):
-    if hand_ctrl is not None and hasattr(hand_ctrl, "enter_auto"):
-        try:
-            hand_ctrl.enter_auto()
-            return True
-        except Exception as exc:
-            logger_mp.debug("[teleop hand standby] enter_auto failed: %s", exc)
-    return False
 
-def _apply_pose_jump_filter(left_pose, right_pose, last_left, last_right, max_frame_jump):
-    left = np.asarray(left_pose, dtype=np.float64).copy()
-    right = np.asarray(right_pose, dtype=np.float64).copy()
-    if left.shape != (4, 4) or right.shape != (4, 4):
-        return left_pose, right_pose, last_left, last_right, None, None
-    if last_left is None or last_right is None:
-        return left, right, left.copy(), right.copy(), 0.0, 0.0
+def _format_motor_temperature(value):
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return "[" + ",".join(str(int(item)) for item in value) + "]"
+    return str(int(value))
 
-    left_jump = float(np.linalg.norm(left[:3, 3] - last_left[:3, 3]))
-    right_jump = float(np.linalg.norm(right[:3, 3] - last_right[:3, 3]))
-    if left_jump > max_frame_jump:
-        left = last_left.copy()
+
+def _maybe_log_arm_joint_temperatures(args, arm_ctrl, last_log_time):
+    """Log the latest DDS arm-joint temperatures without another DDS reader."""
+    interval = max(0.0, float(args.joint_temperature_interval))
+    now = time.monotonic()
+    if interval <= 0.0 or arm_ctrl is None or now - last_log_time < interval:
+        return last_log_time
+
+    try:
+        temperatures = arm_ctrl.get_current_motor_temperatures()
+        joint_indices = _ARM_JOINT_INDEX_BY_MODEL[args.arm]
+        left = []
+        right = []
+        for joint in joint_indices:
+            value = temperatures[joint.value]
+            if value is None:
+                continue
+            item = f"{joint.name}={_format_motor_temperature(value)}"
+            (left if joint.name.startswith("kLeft") else right).append(item)
+        logger_mp.info(
+            "[arm joint temperature °C] robot=%s left={%s} right={%s}",
+            args.arm,
+            " ".join(left),
+            " ".join(right),
+        )
+    except Exception as exc:
+        logger_mp.warning("[arm joint temperature] read skipped: %s", exc)
+    return now
+
+# ---------------------------------------------------------------------------
+# Policy inference: observation assembly and action execution
+# ---------------------------------------------------------------------------
+# The layout below is the contract with the training dataset. It is produced by
+# lerobot/examples/port_datasets/port_h1_2_loop_kit.py from the loop_porting_kit
+# recordings, so changing anything here silently feeds the policy a permuted vector.
+POLICY_ARM_DIM = 7
+POLICY_EE_DIM = 13                 # Inspire DG2 motor channels, raw units
+POLICY_HEAD_DIM = 2
+POLICY_VECTOR_DIM = 2 * POLICY_ARM_DIM + 2 * POLICY_EE_DIM + POLICY_HEAD_DIM  # 42
+POLICY_SLICES = {
+    "left_arm":   slice(0, 7),
+    "left_hand":  slice(7, 20),
+    "right_arm":  slice(20, 27),
+    "right_hand": slice(27, 40),
+    "head":       slice(40, 42),
+}
+# --ee values whose action channel is 13 raw DG2 motor targets per hand.
+POLICY_SUPPORTED_EE = ("inspire_dg2", "rh5dg2_dfx")
+DG2_RAW_MIN = 0.0
+DG2_RAW_MAX = 2040.0
+
+# ---------------------------------------------------------------------------
+# LeRobot deploy-bundle episode loading
+# ---------------------------------------------------------------------------
+DEFAULT_BUNDLE_ROOT = os.environ.get("LEROBOT_BUNDLE_ROOT", "")
+
+# Bundle-side column layouts (fallbacks when meta/modality.json is missing).
+# action: [head(2), left_arm(7), left_ee(13), right_arm(7), right_ee(13)]
+BUNDLE_ACTION_SLICES = {
+    "head":      slice(0, 2),
+    "left_arm":  slice(2, 9),
+    "left_hand": slice(9, 22),
+    "right_arm": slice(22, 29),
+    "right_hand": slice(29, 42),
+}
+# observation.state: head(0:2) + body(2:37, arms at 15:29) + left_ee(37:50) + right_ee(50:63)
+BUNDLE_STATE_SLICES = {
+    "head":      slice(0, 2),
+    "left_arm":  slice(15, 22),
+    "left_hand": slice(37, 50),
+    "right_arm": slice(22, 29),
+    "right_hand": slice(50, 63),
+}
+
+
+def _resolve_existing_path(path):
+    """Resolve a path, including an optional host-to-container workspace mapping."""
+    candidates = [path]
+    host_workspace = os.environ.get("XR_TELEOP_HOST_WORKSPACE", "").rstrip("/")
+    container_workspace = os.environ.get("XR_TELEOP_CONTAINER_WORKSPACE", "/workspace").rstrip("/")
+    if host_workspace and path.startswith(f"{host_workspace}/"):
+        candidates.append(path.replace(f"{host_workspace}/", f"{container_workspace}/", 1))
+    elif host_workspace and path.startswith(f"{container_workspace}/"):
+        candidates.append(path.replace(f"{container_workspace}/", f"{host_workspace}/", 1))
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _resolve_replay_episode(episode_arg, bundle_root, episode_index):
+    """Resolve --episode into (parquet_path, task_dir).
+
+    Accepts a direct .parquet file, a bundle task directory (with data/ + meta/),
+    or a bare task name looked up under <bundle_root>/episodes/."""
+    text = os.path.expanduser(str(episode_arg).strip())
+    path = _resolve_existing_path(text)
+    if path is None:
+        root = _resolve_existing_path(os.path.expanduser(bundle_root))
+        if root is None:
+            raise ValueError(f"--bundle-root not found: {bundle_root}")
+        path = os.path.join(root, "episodes", text)
+        if not os.path.exists(path):
+            available = sorted(os.listdir(os.path.join(root, "episodes"))) \
+                if os.path.isdir(os.path.join(root, "episodes")) else []
+            raise ValueError(
+                f"--episode {episode_arg!r} is neither an existing path nor a task under "
+                f"{root}/episodes (available: {available})"
+            )
+    if os.path.isfile(path):
+        if not path.endswith(".parquet"):
+            raise ValueError(f"--episode file must be a .parquet, got {path}")
+        task_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+        return path, (task_dir if os.path.isdir(os.path.join(task_dir, "meta")) else None)
+    # loop_porting_kit sidecar episode dir: robot-*.parquet + teleop_session.json at top level.
+    sidecar = sorted(glob.glob(os.path.join(path, "robot-*.parquet")))
+    if sidecar:
+        return sidecar[0], path
+    parquets = sorted(glob.glob(os.path.join(path, "data", "**", "*.parquet"), recursive=True))
+    if not parquets:
+        raise ValueError(f"--episode: no data/**/*.parquet under {path}")
+    if not 0 <= episode_index < len(parquets):
+        raise ValueError(
+            f"--episode-index {episode_index} out of range: {path} has {len(parquets)} episode(s)."
+        )
+    return parquets[episode_index], path
+
+
+def _load_parquet_column(parquet_path, column):
+    """Read one list-typed column as an (n, dim) float array. pyarrow first (the tv
+    env has it), pandas as fallback."""
+    try:
+        import pyarrow.parquet as pq
+        table = pq.read_table(parquet_path, columns=[column])
+        rows = table.column(column).to_pylist()
+    except ImportError:
+        import pandas as pd
+        rows = pd.read_parquet(parquet_path, columns=[column])[column].tolist()
+    return np.stack([np.asarray(row, dtype=np.float64) for row in rows])
+
+
+def _bundle_slices_from_modality(task_dir, source):
+    """Column slices for the requested source, from meta/modality.json when present."""
+    fallback = BUNDLE_ACTION_SLICES if source == "action" else BUNDLE_STATE_SLICES
+    if task_dir is None:
+        return fallback
+    modality_path = os.path.join(task_dir, "meta", "modality.json")
+    if not os.path.isfile(modality_path):
+        return fallback
+    with open(modality_path) as f:
+        modality = json.load(f)
+    section = modality.get(source if source == "action" else "state", {})
+
+    def _sl(*keys):
+        for key in keys:
+            entry = section.get(key)
+            if isinstance(entry, dict) and "start" in entry and "end" in entry:
+                return slice(int(entry["start"]), int(entry["end"]))
+        return None
+
+    if source == "action":
+        mapped = {
+            "head":       _sl("h1_2.action.head.joint_position"),
+            "left_arm":   _sl("h1_2.action.left_arm.joint_position"),
+            "left_hand":  _sl("h1_2.action.left_ee.joint_position"),
+            "right_arm":  _sl("h1_2.action.right_arm.joint_position"),
+            "right_hand": _sl("h1_2.action.right_ee.joint_position"),
+        }
     else:
-        last_left = left.copy()
-    if right_jump > max_frame_jump:
-        right = last_right.copy()
-    else:
-        last_right = right.copy()
-    return left, right, last_left, last_right, left_jump, right_jump
+        mapped = {
+            "head":       _sl("h1_2.observation.head.joint_position"),
+            "left_arm":   _sl("left_arm"),
+            "left_hand":  _sl("h1_2.observation.left_ee.joint_position"),
+            "right_arm":  _sl("right_arm"),
+            "right_hand": _sl("h1_2.observation.right_ee.joint_position"),
+        }
+    if any(v is None for v in mapped.values()):
+        logger_mp.warning(
+            "[replay load] %s: incomplete %s layout in modality.json; using the built-in fallback.",
+            modality_path, source,
+        )
+        return fallback
+    return mapped
+
+
+def _remap_bundle_rows(rows, bundle_slices):
+    """(n, *) bundle rows -> (n, 42) in the internal POLICY_SLICES layout."""
+    remapped = np.zeros((rows.shape[0], POLICY_VECTOR_DIM), dtype=np.float64)
+    for name, dst in POLICY_SLICES.items():
+        src = bundle_slices[name]
+        if src.stop - src.start != dst.stop - dst.start:
+            raise ValueError(
+                f"bundle slice {name}={src} does not match the {dst.stop - dst.start}-dim command layout."
+            )
+        remapped[:, dst] = rows[:, src]
+    if not np.isfinite(remapped).all():
+        raise ValueError("episode contains non-finite action values.")
+    return remapped
+
+
+def _load_replay_meta(task_dir, episode_index):
+    """(fps, task_string) from meta/info.json + meta/episodes.jsonl, with fallbacks."""
+    fps, task = None, None
+    if task_dir is not None:
+        info_path = os.path.join(task_dir, "meta", "info.json")
+        if os.path.isfile(info_path):
+            with open(info_path) as f:
+                fps = json.load(f).get("fps")
+        episodes_path = os.path.join(task_dir, "meta", "episodes.jsonl")
+        if os.path.isfile(episodes_path):
+            with open(episodes_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    if entry.get("episode_index") == episode_index:
+                        tasks = entry.get("tasks") or []
+                        task = tasks[0] if tasks else None
+                        break
+    return fps, task
+
+
+def _parquet_columns(parquet_path):
+    try:
+        import pyarrow.parquet as pq
+        return set(pq.ParquetFile(parquet_path).schema_arrow.names)
+    except ImportError:
+        import pandas as pd
+        return set(pd.read_parquet(parquet_path).columns)
+
+
+def _detect_replay_format(parquet_path):
+    """"bundle" = LeRobot deploy bundle (single 42-dim "action" column),
+    "sidecar" = loop_porting_kit recording (per-part "h1_2.action.*" columns)."""
+    columns = _parquet_columns(parquet_path)
+    if "action" in columns:
+        return "bundle"
+    if any(name.startswith("h1_2.action.") for name in columns):
+        return "sidecar"
+    raise ValueError(
+        f"{parquet_path}: neither an 'action' column (deploy bundle) nor "
+        f"'h1_2.action.*' columns (teleop sidecar recording) found."
+    )
+
+
+def _load_sidecar_episode(parquet_path, source):
+    """Load a loop_porting_kit sidecar recording (robot-h1_2.parquet) as
+    (actions_(n,42), fps, task_label). Columns are already split per part, so they
+    map straight into the POLICY_SLICES layout; ee columns hold raw DG2 targets."""
+    prefix = "h1_2.action." if source == "action" else "h1_2.observation."
+    part_columns = {
+        "head":       prefix + "head.joint_position",
+        "left_arm":   prefix + "left_arm.joint_position",
+        "left_hand":  prefix + "left_ee.joint_position",
+        "right_arm":  prefix + "right_arm.joint_position",
+        "right_hand": prefix + "right_ee.joint_position",
+    }
+    parts = {name: _load_parquet_column(parquet_path, col) for name, col in part_columns.items()}
+    n = parts["left_arm"].shape[0]
+    actions = np.zeros((n, POLICY_VECTOR_DIM), dtype=np.float64)
+    for name, dst in POLICY_SLICES.items():
+        rows = parts[name]
+        if rows.shape != (n, dst.stop - dst.start):
+            raise ValueError(
+                f"{parquet_path}: column {part_columns[name]} has shape {rows.shape}, "
+                f"expected ({n}, {dst.stop - dst.start})."
+            )
+        actions[:, dst] = rows
+    if not np.isfinite(actions).all():
+        raise ValueError("episode contains non-finite action values.")
+
+    fps, task = None, None
+    session_path = os.path.join(os.path.dirname(parquet_path), "teleop_session.json")
+    if os.path.isfile(session_path):
+        with open(session_path) as f:
+            session = json.load(f)
+        fps = (session.get("session", {}).get("recording", {})
+               .get("control", {}).get("frequency"))
+        task = session.get("episode_dir")
+    if fps is None:
+        # Fall back to the recorded timestamps.
+        stamps = _load_parquet_column(parquet_path, "timestamp_us")
+        stamps = np.asarray(stamps, dtype=np.float64).reshape(-1)
+        if stamps.size >= 2:
+            dt = np.median(np.diff(stamps)) / 1e6
+            if dt > 0:
+                fps = 1.0 / dt
+    return actions, fps, task
+
+
+class _ArmGravityComp:
+    """Gravity-compensation feedforward for the replayed arm targets.
+
+    The recording-time teleop sends tau_ff from the IK's reduced pinocchio model
+    (pin.rnea) alongside every position target; replaying the recorded q with
+    tau=0 leaves the PD loop fighting gravity alone, so the arms ride visibly
+    lower than the recording. This rebuilds the same reduced model (cached pickle
+    when available) and computes the pure gravity term rnea(q, 0, 0) per tick."""
+
+    _IK_BY_ARM = {
+        "G1_29": "G1_29_ArmIK",
+        "G1_23": "G1_23_ArmIK",
+        "H1_2": "H1_2_ArmIK",
+        "H1": "H1_ArmIK",
+        "H2": "H2_ArmIK",
+    }
+
+    def __init__(self, arm_type, expected_dim):
+        import pinocchio as pin
+        from teleop.robot_control import robot_arm_ik
+        self._pin = pin
+        ik = getattr(robot_arm_ik, self._IK_BY_ARM[arm_type])(Unit_Test=False, Visualization=False)
+        self._model = ik.reduced_robot.model
+        self._data = ik.reduced_robot.data
+        if self._model.nq != expected_dim:
+            raise ValueError(
+                f"reduced model nq={self._model.nq} does not match the "
+                f"{expected_dim}-dim dual-arm command."
+            )
+        self._zeros = np.zeros(self._model.nv)
+
+    def tau(self, q):
+        return np.asarray(
+            self._pin.rnea(self._model, self._data, np.asarray(q, dtype=np.float64),
+                           self._zeros, self._zeros)
+        ).copy()
+
+
+class LeRobotEpisodeReplayer:
+    """Feeds recorded 42-dim actions to the control loop through the same
+    pop_action()/reset()/stats() surface PolicyBridgeClient exposed, so the rollout
+    loop is unchanged: [r] starts the replay clock, each control tick pops the frame
+    whose timestamp has come up, and the arm/hand rate limiters downstream still
+    bound every step. reset() rewinds to frame 0 (called while disengaged, so every
+    [r] replays from the beginning)."""
+
+    def __init__(self, actions, fps, speed=1.0, repeat=1, finish_mode="hold", label=""):
+        self.actions = np.asarray(actions, dtype=np.float64)
+        self.fps = float(fps)
+        self.speed = float(speed)
+        self.repeat = int(repeat)
+        self.finish_mode = finish_mode
+        self.label = label
+        self.n = int(self.actions.shape[0])
+        self.duration_s = self.n / self.fps / max(self.speed, 1e-9)
+        self._t0 = None
+        self._cycle = 0
+        self._last_index = -1
+        self.finished = False
+
+    def pop_action(self):
+        if self.n == 0:
+            return None
+        now = time.monotonic()
+        if self._t0 is None:
+            self._t0 = now
+            logger_mp.info(
+                "[replay] engaged: %s frames=%s fps=%.1f speed=%.2f repeat=%s (~%.1fs per pass)",
+                self.label, self.n, self.fps, self.speed, self.repeat, self.duration_s,
+            )
+        total = int((now - self._t0) * self.fps * self.speed)
+        cycle, index = divmod(total, self.n)
+        if cycle >= self.repeat:
+            self.finished = True
+            self._last_index = self.n - 1
+            return self.actions[-1].copy() if self.finish_mode == "hold" else None
+        if cycle != self._cycle:
+            logger_mp.info("[replay] pass %s/%s finished; restarting from frame 0.", cycle, self.repeat)
+        self._cycle = cycle
+        self._last_index = index
+        return self.actions[index].copy()
+
+    def reset(self):
+        self._t0 = None
+        self._cycle = 0
+        self._last_index = -1
+        self.finished = False
+
+    def stats(self):
+        return {
+            "frame": self._last_index,
+            "frames": self.n,
+            "cycle": self._cycle,
+            "repeat": self.repeat,
+            "finished": self.finished,
+            "fps": self.fps,
+            "speed": self.speed,
+        }
+
+
+def _split_policy_action(action):
+    """42-dim action -> {left_arm, left_hand, right_arm, right_hand, head}."""
+    vec = np.asarray(action, dtype=np.float64).reshape(-1)
+    return {name: vec[sl].copy() for name, sl in POLICY_SLICES.items()}
+
+
+def _policy_arm_target(last_cmd, current_q, action_parts, max_step, meas_margin=0.15):
+    """Rate-limited 14-dim arm target, integrated from the last *commanded* pose (like
+    _policy_hand_target). Basing each step on the measured pose instead lets gravity
+    droop drag the whole rollout a tracking-error below the recorded trajectory — the
+    arms dip at [r] and hover low. The measured-pose clamp keeps the command within
+    `meas_margin` rad of the real arms so the PD loop can never wind up a large error."""
+    current = np.asarray(current_q, dtype=np.float64).reshape(-1)
+    target = np.concatenate((action_parts["left_arm"], action_parts["right_arm"]))
+    if current.size != target.size or not np.isfinite(current).all():
+        return None
+    base = np.asarray(last_cmd, dtype=np.float64).reshape(-1) if last_cmd is not None else current
+    if base.size != target.size or not np.isfinite(base).all():
+        base = current
+    cmd = target if max_step <= 0.0 else base + np.clip(target - base, -max_step, max_step)
+    if meas_margin > 0.0:
+        cmd = np.clip(cmd, current - meas_margin, current + meas_margin)
+    return cmd
+
+
+def _policy_hand_target(last_cmd, action_slice, max_step):
+    """Rate-limited raw DG2 target. Based on the last command, not the measured
+    angle: the fingers lag the command by a lot and would stall the ramp."""
+    target = np.clip(np.asarray(action_slice, dtype=np.float64), DG2_RAW_MIN, DG2_RAW_MAX)
+    if last_cmd is None or max_step <= 0.0:
+        return target
+    return np.clip(last_cmd + np.clip(target - last_cmd, -max_step, max_step), DG2_RAW_MIN, DG2_RAW_MAX)
+
+
+def _read_neck_yaw_pitch(neck_feedback, latched):
+    """Actual pan/tilt angles for observation.state[40:42], latched across gaps."""
+    if neck_feedback is None:
+        return latched
+    sample = neck_feedback.read_latest()
+    if sample is None or sample.get("yaw_pitch") is None:
+        return latched
+    return [float(v) for v in sample["yaw_pitch"][:2]]
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
     parser.add_argument('--frequency', type = float, default = 20.0, help = 'control and record \'s frequency')
-    parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='H1_2', help='Select arm controller')
-    parser.add_argument('--arm-reference-mode', type=str, choices=['fixed', 'head_yaw_compensated', 'head', 'head_yaw'], default='fixed', help='XR wrist reference mode for arm IK. fixed (default) freezes the reference frame (initial head yaw + position) at tracking start so head motion never affects the arm targets; head subtracts the LIVE head position (head rotation still shifts targets by the device arc); head_yaw_compensated rotates targets WITH the head yaw (broken: raw wrist poses are already world-frame); head_yaw is the legacy live-head-yaw mode (arms rotate opposite to the head).')
-    parser.add_argument('--arm-yaw-compensation-sign', type=float, choices=[-1.0, 1.0], default=1.0, help='Yaw compensation direction for --arm-reference-mode head_yaw_compensated.')
-    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco'], default='rh5dg2_dfx', help='Select end effector controller')
+    parser.add_argument('--joint-temperature-interval', type=float, default=0.0, help='Seconds between arm-joint temperature logs from rt/lowstate. Set a positive value to enable (default: disabled).')
+    parser.add_argument('--ee', type=str, choices=['inspire_dg2', 'rh5dg2_dfx'], default='inspire_dg2', help='End effector controller. Only the 13-channel Inspire DG2 hands match the trained action layout.')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--viewer-host-ip', type=str, default=None, help='Host IP advertised to the XR browser for the HTTPS/WSS viewer. If omitted, infer it from the route to --img-server-ip.')
-    parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
+    parser.add_argument('--network-interface', type=str, default='enp44s0', help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
+    # LeRobot deploy-bundle episode replay (open loop; no policy server involved)
+    parser.add_argument('--episode', type=str, required=True, help='Episode to replay: a bundle task name (e.g. left-turn-signal), a bundle task directory (with data/ + meta/), a direct episode .parquet file, or a teleop sidecar recording dir/parquet (robot-h1_2.parquet + teleop_session.json).')
+    parser.add_argument('--bundle-root', type=str, default=DEFAULT_BUNDLE_ROOT, help='Deploy bundle root used to resolve a bare --episode task name under <bundle-root>/episodes/. Defaults to LEROBOT_BUNDLE_ROOT.')
+    parser.add_argument('--episode-index', type=int, default=0, help='Episode index within the task directory when it holds more than one parquet.')
+    parser.add_argument('--replay-source', type=str, choices=['action', 'state'], default='action', help="Which recorded channel to replay: the commanded 'action' (default) or the measured observation 'state' remapped into the command layout.")
+    parser.add_argument('--replay-speed', type=float, default=1.0, help='Replay time scale. 0.5 replays at half speed.')
+    parser.add_argument('--replay-fps', type=float, default=0.0, help='Override the episode frame rate. 0 reads fps from meta/info.json (fallback 20).')
+    parser.add_argument('--replay-repeat', type=int, default=1, help='How many times to play the episode per [r].')
+    parser.add_argument('--replay-finish', type=str, choices=['hold', 'pause', 'stop'], default='hold', help='What to do when the replay ends: hold the final pose, auto-[p] pause back to the ready pose, or stop the program.')
+    parser.add_argument('--policy-action-timeout', type=float, default=0.5, help='Seconds without a usable action before the robot holds its current pose.')
+    parser.add_argument('--policy-arm-max-step', type=float, default=0.05, help='Max per-joint arm target change per control frame in radians. At 20Hz, 0.05 caps the arms at 1 rad/s.')
+    parser.add_argument('--no-arm-gravity-comp', action='store_true', help='Send zero torque feedforward with the arm targets instead of the rnea gravity term. The recording teleop always sends gravity compensation, so disabling this makes the replayed arms sag below the recorded pose; only useful for A/B testing.')
+    parser.add_argument('--policy-arm-meas-margin', type=float, default=0.15, help='Max radians the arm command may lead the measured pose, for the replay and the [h] home ramp. Keeps a stuck arm from winding up PD error; the recorded teleop lead peaks at ~0.13 rad, so raise this if the replayed arms ride visibly lower than the recording.')
+    parser.add_argument('--policy-arm-startup-max-step', type=float, default=0.02, help='Tighter arm step limit during --policy-arm-startup-duration after [r].')
+    parser.add_argument('--policy-home-q', type=str, default=None, help='Arm home pose for [h]/[p]: 14 comma-separated radians (left 7 + right 7), a recorded episode data.json (or its episode directory), or a LeRobot dataset root. Default: the first frame of the replayed episode.')
+    parser.add_argument('--policy-arm-startup-duration', type=float, default=2.0, help='Seconds of extra-small arm steps right after the policy engages.')
+    parser.add_argument('--policy-hand-max-step', type=float, default=250.0, help='Max per-actuator hand target change per control frame in raw DG2 units.')
+    parser.add_argument('--policy-log-rate', type=float, default=1.0, help='Replay step debug log rate in Hz. Set 0 to disable.')
+    parser.add_argument('--dry-run', action='store_true', help='Run the full replay loop but publish nothing to the arms, hands or neck.')
+    parser.add_argument('--start-sync-delay', type=float, default=START_SYNC_DELAY, help='Seconds to wait after pressing [r] before the replay starts.')
     parser.add_argument('--camera', '--viewer-camera', dest='camera', type=str, choices=['head', 'left_wrist', 'right_wrist', 'both', 'both_wrist', 'head_and_wrist', 'head_wrist', 'all'], default='head', help='Camera stream shown in the 8012 XR viewer. Use head_and_wrist to show the head view with both wrist cameras below it.')
     parser.add_argument('--viewer-camera-mode', type=str, choices=['auto', 'webrtc', 'zmq', 'none'], default='zmq', help='Select how the 8012 XR viewer receives the selected camera.')
     parser.add_argument('--viewer-display-fps', type=float, default=15.0, help='XR JPEG push rate for ZMQ camera mode. Lower this on congested Wi-Fi.')
@@ -1045,39 +1688,31 @@ if __name__ == '__main__':
     parser.add_argument('--inspire-dg2-transport', type=str, choices=['dds', 'serial'], default='dds', help='Inspire RH5DG2 transport. Use dds with rh5dg2_serial_dds_bridge.py on the robot PC.')
     parser.add_argument('--inspire-dg2-bridge-host', type=str, default=None, help='Reserved for legacy UDP bridge mode.')
     parser.add_argument('--inspire-dg2-bridge-port', type=int, default=9720, help='Reserved for legacy UDP bridge mode.')
-    parser.add_argument('--rh5dg2-log-throttle', type=float, default=1.0, help='RH5DG2 controller debug log rate in Hz.')
-    parser.add_argument('--rh5dg2-hand-swap', action='store_true', help='Enable RH5DG2-only left/right hand input swap for devices that report swapped hand labels.')
+    parser.add_argument('--inspire-dg2-thumb-curl-gain', type=float, default=1.0, help='Inspire DG2 thumb landmark curl gain before thresholding.')
+    parser.add_argument('--inspire-dg2-right-thumb-curl-gain', type=float, default=1.0, help='Extra Inspire DG2 right-thumb multiplier after --inspire-dg2-thumb-curl-gain.')
+    parser.add_argument('--inspire-dg2-thumb-curl-threshold', type=float, default=0.12, help='Inspire DG2 thumb curl deadzone before the thumb boost activates.')
+    parser.add_argument('--inspire-dg2-thumb-curl-strength', type=float, default=0.0, help='Inspire DG2 thumb boost strength toward the closed raw target.')
+    parser.add_argument('--inspire-dg2-thumb-curl-log-rate', type=float, default=0.0, help='Inspire DG2 thumb curl boost debug log rate in Hz. Set 0 to disable.')
+    parser.add_argument('--rh5dg2-log-throttle', type=float, default=0.0, help='RH5DG2 controller debug log rate in Hz. Set 0 to disable debug prints.')
     parser.add_argument('--rh5dg2-fast-mode', action=argparse.BooleanOptionalAction, default=True, help='Enable lower-latency RH5DG2 retarget settings.')
     parser.add_argument('--rh5dg2-retarget-mode', type=str, choices=['config', 'vector', 'dexpilot'], default='config', help='RH5DG2 retargeting mode. config uses assets/RH5DG2/RH5DG2.yml; dexpilot enables DexPilot without editing the YAML type.')
-    parser.add_argument('--rh56f1-retarget-mode', type=str, choices=['config', 'vector', 'dexpilot'], default='config', help='RH56F1 retargeting mode. config uses assets/RH56F1/RH56F1.yml; dexpilot enables DexPilot without editing the YAML type.')
-    parser.add_argument('--disable-hand-smoothing', action='store_true', help='Reserved flag for RH5DG2 hand path; current RH5DG2 path has no smoothing enabled.')
-    parser.add_argument('--arm-pos-gain-x', type=float, default=1, help='Arm wrist translation gain on X; sim default is higher than real.')
-    parser.add_argument('--arm-pos-gain-y', type=float, default=1, help='Arm wrist translation gain on Y; sim default is higher than real.')
-    parser.add_argument('--arm-pos-gain-z', type=float, default=1, help='Arm wrist translation gain on Z; sim default is higher than real.')
-    parser.add_argument('--arm-rot-gain', type=float, default=1, help='Arm wrist rotation gain.')
-    parser.add_argument('--arm-max-delta', type=float, default=1, help='Per-axis clamp for gain-scaled wrist translation delta.')
-    parser.add_argument('--arm-smoothing-alpha', type=float, default=1.0, help='Arm target smoothing alpha, where 1.0 means no translation lag.')
-    parser.add_argument('--arm-startup-duration', type=float, default=2.0, help='Seconds to apply extra-small arm q target clamp after teleop starts.')
-    parser.add_argument('--arm-startup-max-step', type=float, default=0.08, help='Max per-joint arm q target delta during startup clamp, in radians.')
-    parser.add_argument('--arm-standby-on-tracking-loss', action=argparse.BooleanOptionalAction, default=True, help='Enter arm standby when XR head/wrist tracking becomes invalid.')
-    parser.add_argument('--arm-lost-timeout', type=float, default=0.5, help='Seconds of invalid XR arm tracking before entering standby.')
-    parser.add_argument('--arm-found-confirm', type=float, default=0.5, help='Seconds of valid XR arm tracking required before leaving standby.')
-    parser.add_argument('--arm-standby-action', type=str, choices=['ready', 'hold'], default='ready', help='Arm target while XR tracking is lost: ready pose or current-pose hold.')
-    parser.add_argument('--arm-max-frame-jump', type=float, default=0.15, help='Reject valid XR wrist pose frames whose translation jumps more than this many meters from the last good pose. Set 0 to disable.')
+    parser.add_argument('--arm-lost-timeout', type=float, default=0.5, help='Seconds of XR session loss before the viewer reports tracking gone. Display only; the policy path does not depend on XR tracking.')
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--headless', action=argparse.BooleanOptionalAction, default=True, help='Enable headless mode and disable Rerun recording visualization by default. Use --no-headless to enable Rerun.')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
-    parser.add_argument('--disable-arm', action='store_true', help='Disable arm IK/control while keeping XR and hand paths alive.')
+    parser.add_argument('--viewer', action=argparse.BooleanOptionalAction, default=True, help='Start the XR viewer so an operator can watch the rollout. --no-viewer runs fully headless; camera frames still go to the policy.')
+    parser.add_argument('--disable-arm', action='store_true', help='Do not publish the arm part of the action; hands and neck still follow the policy.')
+    parser.add_argument('--disable-hand', action='store_true', help='Do not publish the hand part of the action; arms and neck still follow the policy.')
     parser.add_argument('--disable-body', action=argparse.BooleanOptionalAction, default=True, help='Disable high-level body/loco command publishing.')
-    parser.add_argument('--hand-only', action='store_true', help='Run XR input and end-effector hand control only; arm and body control stay off.')
-    parser.add_argument('--enable-neck', action=argparse.BooleanOptionalAction, default=True, help='Send Vision Pro head yaw/pitch to the external UDP neck controller.')
+    parser.add_argument('--enable-neck', action=argparse.BooleanOptionalAction, default=True, help='Send the policy head action to the external UDP neck controller.')
     parser.add_argument('--neck-host', type=str, default=None, help='External neck controller host. Defaults to --img-server-ip.')
     parser.add_argument('--neck-port', type=int, default=9091, help='External neck controller UDP command port.')
     parser.add_argument('--neck-yaw-limit', type=float, default=1.2, help='Absolute relative neck yaw command limit in radians.')
     parser.add_argument('--neck-pitch-limit', type=float, default=0.8, help='Absolute relative neck pitch command limit in radians.')
     parser.add_argument('--neck-smoothing-alpha', type=float, default=0.25, help='Neck command low-pass alpha from 0 to 1.')
     parser.add_argument('--neck-max-step', type=float, default=0.08, help='Maximum neck command change per control frame in radians.')
+    parser.add_argument('--neck-command-deadband', type=float, default=0.04, help='Minimum yaw/pitch command change in radians before sending a new neck UDP command. Set 0 to send every frame.')
     parser.add_argument('--neck-feedback-port', type=int, default=9093, help='UDP port that receives actual neck yaw,pitch feedback from the pan/tilt process.')
     parser.add_argument('--neck-log-rate', type=float, default=0.0, help='Neck debug log rate in Hz. Set 0 to disable periodic neck logs.')
     parser.add_argument('--enable-waist-follow-neck', action='store_true', help='Make the H1_2 waist yaw slowly follow the neck yaw command, including in --motion mode.')
@@ -1086,6 +1721,7 @@ if __name__ == '__main__':
     parser.add_argument('--waist-yaw-limit', type=float, default=0.2618, help='H1_2 relative waist-yaw limit in radians; default is about 15 degrees.')
     parser.add_argument('--waist-yaw-velocity', type=float, default=0.25, help='H1_2 waist-yaw velocity limit in radians per second.')
     parser.add_argument('--enable-waist-keyboard', action='store_true', help='Rotate the H1_2 waist yaw with the [j]/[k] keys during teleop (sshkeyboard mode). Reuses --waist-yaw-limit and --waist-yaw-velocity; mutually exclusive with --enable-waist-follow-neck.')
+    parser.add_argument('--log-waist-angle', action='store_true', help='Periodically log the current H1_2 waist angle (default: disabled).')
     parser.add_argument('--waist-keyboard-step', type=float, default=0.05, help='Radians the H1_2 waist yaw moves per [j]/[k] key press (default ~2.9 deg).')
     parser.add_argument('--waist-keyboard-invert', action='store_true', help='Swap the [j]/[k] waist rotation direction.')
     parser.add_argument('--skip-arm-go-home-on-exit', action='store_true', help='Do not command arm zero/home pose during shutdown.')
@@ -1098,16 +1734,23 @@ if __name__ == '__main__':
     parser.add_argument('--rh5dg2-gain', type=float, default=1.0, help='RH5DG2 safe raw command gain from baseline toward retarget target.')
     parser.add_argument('--rh5dg2-raw-close-direction', type=float, default=-1.0, help='RH5DG2 safe raw close direction; use -1 if raw pitch closes in the opposite direction.')
     parser.add_argument('--rh5dg2-safe-baseline', type=str, default='demo_open', help='RH5DG2 safe raw open baseline: demo_open, current, or 13 comma-separated angleSet values.')
+    parser.add_argument('--rh5dg2-lock-spread-joints', action=argparse.BooleanOptionalAction, default=True, help='Hold RH5DG2 spread raw actuators 3 and 5 at the safe baseline value.')
     parser.add_argument('--rh5dg2-restore-repeat', type=int, default=80, help='RH5DG2 init-pose restore publish count on exit.')
     parser.add_argument('--rh5dg2-restore-interval', type=float, default=0.1, help='RH5DG2 init-pose restore publish interval in seconds.')
     parser.add_argument('--rh5dg2-restore-settle', type=float, default=0.75, help='Extra wait after RH5DG2 init-pose restore publishes.')
     parser.add_argument('--rh5dg2-curl-scale', type=float, default=1.2, help='Global RH5DG2 landmark curl multiplier before clipping.')
-    parser.add_argument('--rh5dg2-index-curl-scale', type=float, default=1.8, help='Additional RH5DG2 index-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-index-curl-scale', type=float, default=1.2, help='Additional RH5DG2 index-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-middle-curl-scale', type=float, default=0.85, help='Additional RH5DG2 middle-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-ring-curl-scale', type=float, default=0.85, help='Additional RH5DG2 ring-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-little-curl-scale', type=float, default=0.85, help='Additional RH5DG2 little-finger curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-thumb-curl-scale', type=float, default=3.0, help='Additional RH5DG2 thumb landmark curl multiplier before clipping.')
+    parser.add_argument('--rh5dg2-thumb-curl-threshold', type=float, default=0.15, help='RH5DG2 thumb curl deadzone for curl-source thumb control; higher values make the thumb open more easily.')
     parser.add_argument('--rh5dg2-enable-thumb', action=argparse.BooleanOptionalAction, default=True, help='Enable RH5DG2 safe thumb actuators 10,11,12.')
-    parser.add_argument('--rh5dg2-thumb-source', type=str, choices=['curl', 'raw'], default='raw', help='RH5DG2 safe thumb close-ratio source.')
-    parser.add_argument('--rh5dg2-thumb10-scale', type=float, default=1.5, help='RH5DG2 thumb actuator 10 curl scale.')
+    parser.add_argument('--rh5dg2-thumb-source', type=str, choices=['curl', 'raw'], default='curl', help='RH5DG2 safe thumb close-ratio source.')
+    parser.add_argument('--rh5dg2-thumb10-scale', type=float, default=1.8, help='RH5DG2 thumb actuator 10 curl scale.')
     parser.add_argument('--rh5dg2-thumb11-scale', type=float, default=1.0, help='RH5DG2 thumb actuator 11 curl scale.')
-    parser.add_argument('--rh5dg2-thumb12-scale', type=float, default=1.5, help='RH5DG2 thumb actuator 12 curl scale.')
+    parser.add_argument('--rh5dg2-thumb12-scale', type=float, default=1.8, help='RH5DG2 thumb actuator 12 curl scale.')
+    parser.add_argument('--rh5dg2-right-thumb-close-gain', type=float, default=2.8, help='Extra close-ratio gain for the RH5DG2 right thumb after thumb source selection.')
     parser.add_argument('--rh56f1-tactile-port', type=str, default=None, help='Shortcut for a single RH56F1 tactile serial port; records as right_ee.')
     parser.add_argument('--rh56f1-tactile-left-port', type=str, default=None, help='RH56F1 left_ee tactile serial port.')
     parser.add_argument('--rh56f1-tactile-right-port', type=str, default=None, help='RH56F1 right_ee tactile serial port.')
@@ -1132,17 +1775,12 @@ if __name__ == '__main__':
     # Config Loop streaming (on by default; see teleop/utils/loop_streamer.py). The thin
     # client only ships frames to the loop_porting_kit sidecar over TCP and quietly drops
     # them when the sidecar is absent, so keeping it on costs nothing and needs no flag.
-    parser.add_argument('--loop', action='store_true', default=True, help='Stream robot state + cameras to the Config Loop sidecar (default: on)')
+    parser.add_argument('--loop', action='store_true', default=False, help='Stream robot state + cameras to the Config Loop sidecar. Off by default here: a rollout is not training data.')
     parser.add_argument('--no-loop', dest='loop', action='store_false', help='Disable Config Loop streaming')
     parser.add_argument('--loop-addr', type=str, default='127.0.0.1:5590', help='Config Loop sidecar TCP host:port')
     parser.add_argument('--loop-hand-name', type=str, default='rh5dg2', help='Config Loop source name for the separate RH5DG2 tactile stream.')
-    parser.add_argument('--loop-source-key', type=str, default='robot-step', help='Config Loop robot-state source_key; match this to the Cell Config robot source role.')
-    parser.add_argument('--loop-action-space', type=str, default='target_joint_position', help="Config Loop robot action_space label (Loop's SDK example uses 'target_joint_position').")
-    parser.add_argument('--loop-robot-type', type=str, default=None, help='Config Loop robot_type label to advertise (default: arm root key, e.g. g1/h1_2). Empty string to omit.')
-    parser.add_argument('--loop-gripper-type', type=str, default=None, help='Config Loop gripper_type label to advertise. Default: derived from --ee. Empty string to omit.')
-    parser.add_argument('--loop-finger-type', type=str, default=None, help='Config Loop finger_type label to advertise. Default: derived from --ee. Empty string to omit.')
     # record mode and task info
-    parser.add_argument('--record', action=argparse.BooleanOptionalAction, default=True, help='Enable data recording mode')
+    parser.add_argument('--record', action=argparse.BooleanOptionalAction, default=False, help='Record the rollout as an episode (same writer the teleop script uses). Off by default.')
     parser.add_argument('--screen-record', action='store_true', help='Record only the head camera view to MP4; toggle with s.')
     parser.add_argument('--screen-record-dir', type=str, default='./screen_records', help='Directory for head camera MP4 recordings.')
     parser.add_argument('--record-body-state', action=argparse.BooleanOptionalAction, default=True, help='Record full robot/body qpos from arm controller lowstate when available.')
@@ -1166,7 +1804,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
-    parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
+    parser.add_argument('--task-desc', type = str, default = 'distance:o', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
@@ -1174,12 +1812,92 @@ if __name__ == '__main__':
         raise ValueError("--viewer-display-fps must be greater than zero.")
     if not 1 <= args.viewer_jpeg_quality <= 100:
         raise ValueError("--viewer-jpeg-quality must be between 1 and 100.")
+    if args.replay_speed <= 0.0:
+        raise ValueError("--replay-speed must be greater than zero.")
+    if args.replay_repeat < 1:
+        raise ValueError("--replay-repeat must be 1 or greater.")
+    if args.replay_fps < 0.0:
+        raise ValueError("--replay-fps must be zero or greater.")
+    if args.episode_index < 0:
+        raise ValueError("--episode-index must be zero or greater.")
+    if args.policy_action_timeout <= 0.0:
+        raise ValueError("--policy-action-timeout must be greater than zero.")
+    if args.policy_arm_meas_margin < 0.0:
+        raise ValueError("--policy-arm-meas-margin must be zero or greater (0 disables the clamp).")
+    if args.policy_arm_max_step < 0.0 or args.policy_arm_startup_max_step < 0.0:
+        raise ValueError("--policy-arm-max-step and --policy-arm-startup-max-step must be zero or greater.")
+
+    # ---- load the episode up front: it also provides the default [h] home pose.
+    replay_parquet, replay_task_dir = _resolve_replay_episode(
+        args.episode, args.bundle_root, args.episode_index
+    )
+    replay_format = _detect_replay_format(replay_parquet)
+    if replay_format == "sidecar":
+        replay_actions, replay_meta_fps, replay_task_text = _load_sidecar_episode(
+            replay_parquet, args.replay_source
+        )
+    else:
+        replay_meta_fps, replay_task_text = _load_replay_meta(replay_task_dir, args.episode_index)
+        replay_column = "action" if args.replay_source == "action" else "observation.state"
+        replay_rows = _load_parquet_column(replay_parquet, replay_column)
+        replay_actions = _remap_bundle_rows(
+            replay_rows, _bundle_slices_from_modality(replay_task_dir, args.replay_source)
+        )
+    replay_fps = args.replay_fps or replay_meta_fps or 20.0
+    replay_feeder = LeRobotEpisodeReplayer(
+        replay_actions,
+        fps=replay_fps,
+        speed=args.replay_speed,
+        repeat=args.replay_repeat,
+        finish_mode=args.replay_finish,
+        label=os.path.basename(replay_task_dir or replay_parquet),
+    )
+    replay_finish_handled = False
+    logger_mp.info(
+        "[replay load] parquet=%s format=%s frames=%s fps=%.1f source=%s task=%r duration=%.1fs speed=%.2f repeat=%s finish=%s",
+        replay_parquet, replay_format, replay_feeder.n, replay_fps, args.replay_source, replay_task_text,
+        replay_feeder.n / replay_fps, args.replay_speed, args.replay_repeat, args.replay_finish,
+    )
+
+    POLICY_HOME_ARM_Q = _resolve_policy_home_q(args.policy_home_q)
+    if POLICY_HOME_ARM_Q is None:
+        # Default the [h] home pose to the episode's first frame so the replay starts
+        # from the configuration it was recorded from.
+        POLICY_HOME_ARM_Q = np.concatenate((
+            replay_actions[0, POLICY_SLICES["left_arm"]],
+            replay_actions[0, POLICY_SLICES["right_arm"]],
+        ))
+        home_source = "episode first frame"
+    else:
+        home_source = f"--policy-home-q ({args.policy_home_q})"
+    logger_mp.info(
+        "[replay home] home pose from %s:\n  left  %s\n  right %s",
+        home_source,
+        np.round(POLICY_HOME_ARM_Q[:7], 4).tolist(),
+        np.round(POLICY_HOME_ARM_Q[7:], 4).tolist(),
+    )
+    if args.policy_arm_startup_duration < 0.0:
+        raise ValueError("--policy-arm-startup-duration must be zero or greater.")
+    if args.policy_hand_max_step < 0.0:
+        raise ValueError("--policy-hand-max-step must be zero or greater.")
+    if args.policy_log_rate < 0.0:
+        raise ValueError("--policy-log-rate must be zero or greater.")
+    if args.ee not in POLICY_SUPPORTED_EE:
+        raise ValueError(
+            f"--ee {args.ee} has no 13-channel raw command path; the trained action layout "
+            f"needs one of {POLICY_SUPPORTED_EE}."
+        )
+    if args.start_sync_delay < 0.0:
+        raise ValueError("--start-sync-delay must be zero or greater.")
+    START_SYNC_DELAY = float(args.start_sync_delay)
     if not 0.0 <= args.neck_smoothing_alpha <= 1.0:
         raise ValueError("--neck-smoothing-alpha must be between 0 and 1.")
     if args.neck_yaw_limit <= 0.0 or args.neck_pitch_limit <= 0.0:
         raise ValueError("--neck-yaw-limit and --neck-pitch-limit must be greater than zero.")
     if args.neck_max_step < 0.0:
         raise ValueError("--neck-max-step must be zero or greater.")
+    if args.neck_command_deadband < 0.0:
+        raise ValueError("--neck-command-deadband must be zero or greater.")
     if args.neck_log_rate < 0.0:
         raise ValueError("--neck-log-rate must be zero or greater.")
     if args.record_audio_udp_port < 0:
@@ -1208,6 +1926,14 @@ if __name__ == '__main__':
             raise ValueError("--inspire-dg2-bridge-port must be greater than zero.")
         if args.inspire_dg2_state_hz <= 0.0 or args.inspire_dg2_tactile_hz <= 0.0:
             raise ValueError("--inspire-dg2-state-hz and --inspire-dg2-tactile-hz must be greater than zero.")
+        if args.inspire_dg2_thumb_curl_gain < 0.0 or args.inspire_dg2_right_thumb_curl_gain < 0.0:
+            raise ValueError("--inspire-dg2-thumb-curl-gain and --inspire-dg2-right-thumb-curl-gain must be non-negative.")
+        if not 0.0 <= args.inspire_dg2_thumb_curl_strength <= 1.0:
+            raise ValueError("--inspire-dg2-thumb-curl-strength must be between 0 and 1.")
+        if not 0.0 <= args.inspire_dg2_thumb_curl_threshold <= 0.95:
+            raise ValueError("--inspire-dg2-thumb-curl-threshold must be between 0 and 0.95.")
+        if args.inspire_dg2_thumb_curl_log_rate < 0.0:
+            raise ValueError("--inspire-dg2-thumb-curl-log-rate must be non-negative.")
     if args.enable_waist_follow_neck:
         if not args.enable_neck:
             raise ValueError("--enable-waist-follow-neck requires --enable-neck.")
@@ -1241,13 +1967,10 @@ if __name__ == '__main__':
         )
     if args.record and args.screen_record:
         raise ValueError("--record and --screen-record cannot be enabled together.")
-    if args.ee == "rh56f1" and args.arm != "H1_2":
-        raise ValueError("--ee rh56f1 currently supports the H1_2 arm path only; use --arm H1_2.")
     rh5dg2_safe_baseline = _resolve_rh5dg2_safe_baseline(args.rh5dg2_safe_baseline)
-    if args.hand_only:
-        args.disable_arm = True
-        args.disable_body = True
-    preserve_zero_ready_mode = args.disable_arm
+    # The arm controller is always needed: observation.state[0:7]/[20:27] are its measured
+    # joint angles, so --disable-arm only suppresses the command publish.
+    preserve_zero_ready_mode = False
     rh5dg2_enabled_indices = _parse_int_list(args.rh5dg2_enabled_indices)
     if args.rh5dg2_pitch_only:
         rh5dg2_enabled_indices = [0, 1, 2, 4, 6, 7, 8, 9]
@@ -1255,30 +1978,31 @@ if __name__ == '__main__':
         if rh5dg2_enabled_indices is None:
             rh5dg2_enabled_indices = [0, 1, 2, 4, 6, 7, 8, 9]
         rh5dg2_enabled_indices = sorted(set(rh5dg2_enabled_indices) | {10, 11, 12})
-    if (
-        args.ee in ("rh5dg2_dfx", "rh5dg2_ftp")
-        and not args.sim
-        and (args.hand_only or args.rh5dg2_pitch_only or rh5dg2_enabled_indices is not None)
-    ):
-        args.rh5dg2_safe_mode = True
     if args.rh5dg2_fast_mode:
         if args.rh5dg2_log_throttle == 1.0:
             args.rh5dg2_log_throttle = 2.0
         if args.hand_debug_rate == 1.0:
             args.hand_debug_rate = 0.5
     logger_mp.debug(f"args: {args}")
-    if args.hand_only or args.disable_arm or args.disable_body:
-        logger_mp.warning(
-            "[teleop safety mode] hand_only=%s disable_arm=%s disable_body=%s motion_requested=%s",
-            args.hand_only,
-            args.disable_arm,
-            args.disable_body,
-            args.motion,
-        )
+    logger_mp.warning(
+        "[policy safety mode] dry_run=%s disable_arm=%s disable_hand=%s enable_neck=%s disable_body=%s motion_requested=%s",
+        args.dry_run,
+        args.disable_arm,
+        args.disable_hand,
+        args.enable_neck,
+        args.disable_body,
+        args.motion,
+    )
     logger_mp.info(
-        "[teleop zero-ready policy] preserve_zero_ready_mode=%s reason=%s",
-        preserve_zero_ready_mode,
-        "arm disabled" if preserve_zero_ready_mode else "arm enabled; allow debug-mode handoff for arm teleop init",
+        "[policy action limits] arm_max_step=%.4f rad/frame (%.2f rad/s at %.1fHz) "
+        "startup=%.4f for %.1fs hand_max_step=%.1f raw/frame action_timeout=%.2fs",
+        args.policy_arm_max_step,
+        args.policy_arm_max_step * args.frequency,
+        args.frequency,
+        args.policy_arm_startup_max_step,
+        args.policy_arm_startup_duration,
+        args.policy_hand_max_step,
+        args.policy_action_timeout,
     )
     if args.ee in ("rh5dg2_dfx", "rh5dg2_ftp") and args.rh5dg2_safe_mode:
         logger_mp.warning("RH5DG2 SAFE MODE")
@@ -1288,18 +2012,25 @@ if __name__ == '__main__':
         logger_mp.warning("body control: %s", "OFF" if args.disable_body else "ON")
         logger_mp.warning("gain: %.3f", args.rh5dg2_gain)
         logger_mp.warning("active hand: %s", args.rh5dg2_active_hand)
+        logger_mp.warning("lock spread joints: %s", args.rh5dg2_lock_spread_joints)
         logger_mp.warning(
-            "curl scale: global=%.3f index=%.3f",
+            "curl scale: global=%.3f index=%.3f middle=%.3f ring=%.3f little=%.3f thumb=%.3f thumb_threshold=%.3f",
             args.rh5dg2_curl_scale,
             args.rh5dg2_index_curl_scale,
+            args.rh5dg2_middle_curl_scale,
+            args.rh5dg2_ring_curl_scale,
+            args.rh5dg2_little_curl_scale,
+            args.rh5dg2_thumb_curl_scale,
+            args.rh5dg2_thumb_curl_threshold,
         )
         logger_mp.warning(
-            "thumb: enabled=%s source=%s scales={10: %.3f, 11: %.3f, 12: %.3f}",
+            "thumb: enabled=%s source=%s scales={10: %.3f, 11: %.3f, 12: %.3f} right_close_gain=%.3f",
             args.rh5dg2_enable_thumb,
             args.rh5dg2_thumb_source,
             args.rh5dg2_thumb10_scale,
             args.rh5dg2_thumb11_scale,
             args.rh5dg2_thumb12_scale,
+            args.rh5dg2_right_thumb_close_gain,
         )
         logger_mp.warning(
             "restore: repeat=%s interval=%.3f settle=%.3f",
@@ -1313,7 +2044,7 @@ if __name__ == '__main__':
         )
 
     arm_ctrl = None
-    arm_ik = None
+    arm_gravity_comp = None
     hand_ctrl = None
     img_client = None
     tv_wrapper = None
@@ -1329,6 +2060,7 @@ if __name__ == '__main__':
     rh56f1_tactile_reader = None
     rh5dg2_tactile_udp = None
     rh5dg2_tactile_heat_mappers = {}
+    joint_temperature_last_log = 0.0
     audio_udp_receiver = None
     episode_audio_recorder = None
     loop_robot = None
@@ -1349,11 +2081,13 @@ if __name__ == '__main__':
                 pitch_limit=args.neck_pitch_limit,
                 smoothing_alpha=args.neck_smoothing_alpha,
                 max_step=args.neck_max_step,
+                command_deadband=args.neck_command_deadband,
             )
             logger_mp.info(
-                f"[teleop neck] enabled target={args.neck_host or args.img_server_ip}:{args.neck_port} "
+                f"[policy neck] enabled target={args.neck_host or args.img_server_ip}:{args.neck_port} "
                 f"yaw_limit={args.neck_yaw_limit:.3f} pitch_limit={args.neck_pitch_limit:.3f} "
-                f"alpha={args.neck_smoothing_alpha:.3f} max_step={args.neck_max_step:.3f}"
+                f"alpha={args.neck_smoothing_alpha:.3f} max_step={args.neck_max_step:.3f} "
+                f"deadband={args.neck_command_deadband:.3f} input_source=policy_action[40:42]"
             )
         # actual neck yaw,pitch feedback (UDP from zed_pantilt). Independent of
         # --enable-neck: the pan/tilt process may run standalone on the robot, and
@@ -1383,10 +2117,17 @@ if __name__ == '__main__':
                 rh5dg2_tactile_udp = None
                 logger_mp.warning(f"[RH5DG2 tactile UDP] disabled: {e}")
 
+        if abs(args.frequency - replay_fps * args.replay_speed) > 1e-6:
+            logger_mp.warning(
+                "[replay] control frequency %.1fHz != episode playback rate %.1fHz; "
+                "the replay clock is time-indexed so timing stays correct, but frames are "
+                "%s at this control rate.",
+                args.frequency, replay_fps * args.replay_speed,
+                "skipped" if args.frequency < replay_fps * args.replay_speed else "repeated",
+            )
+
         if args.enable_rh5dg2_tactile_vr_overlay:
-            if args.input_mode != "hand":
-                logger_mp.warning("[RH5DG2 tactile VR overlay] disabled: hand tracking input is required.")
-            elif rh5dg2_tactile_udp is None:
+            if rh5dg2_tactile_udp is None:
                 logger_mp.warning("[RH5DG2 tactile VR overlay] disabled: --rh5dg2-tactile-udp-port is not active.")
             else:
                 rh5dg2_tactile_vr_sides = _resolve_rh5dg2_tactile_vr_sides(args.rh5dg2_tactile_vr_side)
@@ -1609,101 +2350,64 @@ if __name__ == '__main__':
                 f"zmq={args.img_server_ip}:{selected_zmq_port if viewer_zmq else None}"
             )
 
-        # televuer_wrapper: obtain hand pose data from the XR device and transmit the selected camera image to the XR device.
-        tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
-                                     binocular=selected_camera_config['binocular'],
-                                     img_shape=selected_img_shape,
-                                     display_fps=args.viewer_display_fps,
-                                     jpeg_quality=args.viewer_jpeg_quality,
-                                     display_mode=args.display_mode,
-                                     zmq=viewer_zmq,
-                                     webrtc=viewer_webrtc,
-                                     webrtc_url=webrtc_offer_url,
-                                     arm_reference_mode=args.arm_reference_mode,
-                                     arm_yaw_compensation_sign=args.arm_yaw_compensation_sign,
-                                     tracking_timeout=args.arm_lost_timeout,
-                                     session_timeout=max(2.0, args.arm_lost_timeout * 4.0),
-                                     )
-        logger_mp.info(f"[teleop arm reference] mode={args.arm_reference_mode} yaw_sign={args.arm_yaw_compensation_sign:+.0f}")
-        
+        # televuer_wrapper: purely a monitor here — the policy never reads XR input, but an
+        # operator watching the rollout through the headset is worth the extra process.
+        if args.viewer:
+            tv_wrapper = TeleVuerWrapper(use_hand_tracking=False,
+                                         binocular=selected_camera_config['binocular'],
+                                         img_shape=selected_img_shape,
+                                         display_fps=args.viewer_display_fps,
+                                         jpeg_quality=args.viewer_jpeg_quality,
+                                         display_mode=args.display_mode,
+                                         zmq=viewer_zmq,
+                                         webrtc=viewer_webrtc,
+                                         webrtc_url=webrtc_offer_url,
+                                         arm_reference_mode="head_yaw",
+                                         tracking_timeout=args.arm_lost_timeout,
+                                         session_timeout=max(2.0, args.arm_lost_timeout * 4.0),
+                                         )
+        else:
+            xr_need_local_img = False
+            logger_mp.info("[policy viewer] --no-viewer: XR display is off; camera frames still feed the policy.")
+
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
-        if preserve_zero_ready_mode:
-            motion_switcher = None
-            logger_mp.warning(
-                "[teleop body control] OFF: skip MotionSwitcher.Enter_Debug_Mode because arm control is disabled."
-            )
-        elif args.motion:
-            if args.input_mode == "controller":
-                loco_wrapper = LocoClientWrapper()
+        if args.motion:
+            pass
         else:
             motion_switcher = MotionSwitcher()
             status, result = motion_switcher.Enter_Debug_Mode()
             logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
 
-        # arm
-        if args.disable_arm:
-            logger_mp.warning("[teleop arm control] OFF: arm controller and IK are not initialized.")
-        elif args.arm == "G1_29":
-            arm_ik = G1_29_ArmIK()
+        # arm — always constructed: observation.state needs the measured joint angles even
+        # when --disable-arm suppresses the command publish.
+        if args.arm == "G1_29":
             arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "G1_23":
-            arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "H1_2":
-            arm_ik = H1_2_ArmIK()
             arm_ctrl = H1_2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "H1":
-            arm_ik = H1_ArmIK()
             arm_ctrl = H1_ArmController(simulation_mode=args.sim)
         elif args.arm == "H2":
-            arm_ik = H2_ArmIK()
             arm_ctrl = H2_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
 
+        # Gravity feedforward for the replayed targets, matching what the
+        # recording teleop sent with every ctrl_dual_arm() call.
+        arm_gravity_comp = None
+        if arm_ctrl is not None and not args.disable_arm and not args.no_arm_gravity_comp:
+            try:
+                arm_dim = len(arm_ctrl.get_current_dual_arm_q())
+                arm_gravity_comp = _ArmGravityComp(args.arm, arm_dim)
+                logger_mp.info("[replay gravity] rnea gravity feedforward enabled (%s, %s joints).",
+                               args.arm, arm_dim)
+            except Exception as exc:
+                logger_mp.warning(
+                    "[replay gravity] could not build the gravity model (%s); arm targets will be "
+                    "sent with zero tau and may sag below the recorded pose.", exc,
+                )
+
         # end-effector
-        if args.ee == "dex3":
-            from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
-            dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
-            hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                          dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
-        elif args.ee == "dex1":
-            from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
-            left_gripper_value = Value('d', 0.0, lock=True)        # [input]
-            right_gripper_value = Value('d', 0.0, lock=True)       # [input]
-            dual_gripper_data_lock = Lock()
-            dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
-            dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
-            gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
-                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim)
-        elif args.ee == "inspire_dfx":
-            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX, Inspire_Num_Motors
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', Inspire_Num_Motors * 2, lock = False)   # [output] current left, right hand state data.
-            dual_hand_action_array = Array('d', Inspire_Num_Motors * 2, lock = False)  # [output] current left, right hand action data.
-            hand_ctrl = Inspire_Controller_DFX(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
-        elif args.ee == "inspire_ftp":
-            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_FTP, Inspire_Num_Motors
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', Inspire_Num_Motors * 2, lock = False)   # [output] current left, right hand state data.
-            dual_hand_action_array = Array('d', Inspire_Num_Motors * 2, lock = False)  # [output] current left, right hand action data.
-            hand_ctrl = Inspire_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
-        elif args.ee == "brainco":
-            from teleop.robot_control.robot_hand_brainco import Brainco_Controller, brainco_Num_Motors
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', brainco_Num_Motors * 2, lock = False)   # [output] current left, right hand state data.
-            dual_hand_action_array = Array('d', brainco_Num_Motors * 2, lock = False)  # [output] current left, right hand action data.
-            hand_ctrl = Brainco_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                           dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
-        elif args.ee == "rh5dg2_dfx":
+        if args.ee == "rh5dg2_dfx":
             from teleop.robot_control.robot_hand_RH5DG2 import RH5DG2_Controller_DFX, RH5DG2_Num_Motors
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
             right_hand_pos_array = Array('d', 75, lock = True)     # [input]
@@ -1729,27 +2433,19 @@ if __name__ == '__main__':
                                               restore_settle_s=args.rh5dg2_restore_settle,
                                               curl_scale=args.rh5dg2_curl_scale,
                                               index_curl_scale=args.rh5dg2_index_curl_scale,
+                                              middle_curl_scale=args.rh5dg2_middle_curl_scale,
+                                              ring_curl_scale=args.rh5dg2_ring_curl_scale,
+                                              little_curl_scale=args.rh5dg2_little_curl_scale,
+                                              thumb_curl_scale=args.rh5dg2_thumb_curl_scale,
+                                              thumb_curl_threshold=args.rh5dg2_thumb_curl_threshold,
                                               enable_thumb=args.rh5dg2_enable_thumb,
                                               thumb_source=args.rh5dg2_thumb_source,
                                               thumb10_scale=args.rh5dg2_thumb10_scale,
                                               thumb11_scale=args.rh5dg2_thumb11_scale,
                                               thumb12_scale=args.rh5dg2_thumb12_scale,
+                                              right_thumb_close_gain=args.rh5dg2_right_thumb_close_gain,
+                                              lock_spread_joints=args.rh5dg2_lock_spread_joints,
                                               retarget_mode=args.rh5dg2_retarget_mode)
-        elif args.ee == "rh5dg2_ftp":
-            from teleop.robot_control.robot_hand_RH5DG2 import RH5DG2_Controller_FTP, RH5DG2_Num_Motors
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            hand_input_timestamp = Value('d', 0.0, lock=True)
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', RH5DG2_Num_Motors * 2, lock = False)
-            dual_hand_action_array = Array('d', RH5DG2_Num_Motors * 2, lock = False)
-            hand_ctrl = RH5DG2_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock,
-                                               dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim,
-                                               network_interface=args.network_interface, fps=args.hand_control_hz,
-                                               input_timestamp_value=hand_input_timestamp,
-                                               log_throttle_s=args.rh5dg2_log_throttle,
-                                               fast_mode=args.rh5dg2_fast_mode,
-                                               retarget_mode=args.rh5dg2_retarget_mode)
         elif args.ee == "inspire_dg2":
             from teleop.robot_control.robot_hand_inspire_dg2 import InspireDG2_Controller, InspireDG2_Num_Motors
 
@@ -1780,45 +2476,12 @@ if __name__ == '__main__':
                 network_interface=args.network_interface,
                 fast_mode=args.rh5dg2_fast_mode,
                 retarget_mode=args.rh5dg2_retarget_mode,
+                thumb_curl_gain=args.inspire_dg2_thumb_curl_gain,
+                right_thumb_curl_gain=args.inspire_dg2_right_thumb_curl_gain,
+                thumb_curl_threshold=args.inspire_dg2_thumb_curl_threshold,
+                thumb_curl_strength=args.inspire_dg2_thumb_curl_strength,
+                thumb_curl_log_rate=args.inspire_dg2_thumb_curl_log_rate,
             )
-        elif args.ee == "rh56f1":
-            from teleop.robot_control.robot_hand_RH56F1 import (
-                RH56F1_Controller,
-                RH56F1_Num_Retarget_Joints,
-                RH56F1TactileReader,
-            )
-            rh56f1_record_motors = RH56F1_Num_Retarget_Joints
-            left_hand_pos_array = Array('d', 75, lock=True)
-            right_hand_pos_array = Array('d', 75, lock=True)
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', rh56f1_record_motors * 2, lock=False)
-            dual_hand_action_array = Array('d', rh56f1_record_motors * 2, lock=False)
-            hand_ctrl = RH56F1_Controller(
-                left_hand_pos_array,
-                right_hand_pos_array,
-                dual_hand_data_lock,
-                dual_hand_state_array,
-                dual_hand_action_array,
-                fps=args.hand_control_hz,
-                simulation_mode=args.sim,
-                network_interface=args.network_interface,
-                retarget_mode=args.rh56f1_retarget_mode,
-            )
-            if args.rh56f1_tactile_left_port or args.rh56f1_tactile_right_port:
-                rh56f1_tactile_reader = RH56F1TactileReader(
-                    left_port=args.rh56f1_tactile_left_port,
-                    right_port=args.rh56f1_tactile_right_port,
-                    baudrate=args.rh56f1_tactile_baudrate,
-                    hand_id=args.rh56f1_tactile_id,
-                    fps=args.rh56f1_tactile_hz,
-                    debug_rate=args.rh56f1_tactile_debug_rate,
-                )
-                logger_mp.info(
-                    "[teleop RH56F1 tactile] enabled left_port=%s right_port=%s hz=%.2f",
-                    args.rh56f1_tactile_left_port,
-                    args.rh56f1_tactile_right_port,
-                    args.rh56f1_tactile_hz,
-                )
         else:
             pass
 
@@ -1844,46 +2507,20 @@ if __name__ == '__main__':
                 args.rh56f1_tactile_hz,
             )
 
-        if args.ee in ["dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2", "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco"]:
-            logger_mp.info(f"[teleop ee] ee={args.ee} hand_controller={hand_ctrl.__class__.__name__}")
-        if args.ee in ("rh5dg2_dfx", "rh5dg2_ftp"):
-            logger_mp.info(
-                f"[teleop hand side mapping] ee={args.ee} "
-                f"rh5dg2_hand_swap={args.rh5dg2_hand_swap} "
-                f"rh5dg2_fast_mode={args.rh5dg2_fast_mode} "
-                f"rh5dg2_retarget_mode={args.rh5dg2_retarget_mode} "
-                "scope=hand_landmarks_only arm_wrist_pose_uses_arm_sensitivity=True"
+        logger_mp.info(f"[policy ee] ee={args.ee} hand_controller={hand_ctrl.__class__.__name__}")
+        if not hasattr(hand_ctrl, "set_raw_command"):
+            raise RuntimeError(
+                f"{hand_ctrl.__class__.__name__} has no set_raw_command(); the policy hand action "
+                "cannot bypass the landmark retargeting path."
             )
-        if args.ee == "inspire_dg2":
-            logger_mp.info(
-                f"[teleop hand side mapping] ee={args.ee} "
-                f"transport={args.inspire_dg2_transport} "
-                f"left_port={args.inspire_dg2_left_port} left_id={args.inspire_dg2_left_id} "
-                f"right_port={args.inspire_dg2_right_port} right_id={args.inspire_dg2_right_id} "
-                "scope=hand_landmarks_only arm_wrist_pose_uses_arm_sensitivity=True"
-            )
-        if args.ee == "rh56f1":
-            logger_mp.info(
-                f"[teleop hand side mapping] ee={args.ee} "
-                f"rh56f1_retarget_mode={args.rh56f1_retarget_mode} "
-                "scope=hand_landmarks_only arm_wrist_pose_uses_arm_sensitivity=True"
-            )
+        # Until the first action arrives the landmark arrays stay all-zero, so the hand
+        # controller reports "input not ready" and holds its open baseline. The raw
+        # override takes over from the first set_raw_command() call onwards.
 
-        # Unified EE handles for Config Loop streaming: point at whichever
-        # state/action arrays this --ee selection created (left+right concatenated),
-        # so the main loop reads the EE once regardless of hand/gripper type.
-        loop_ee_state_array = None
-        loop_ee_action_array = None
-        loop_ee_lock = None
-        if args.ee == "dex1":
-            loop_ee_state_array = dual_gripper_state_array
-            loop_ee_action_array = dual_gripper_action_array
-            loop_ee_lock = dual_gripper_data_lock
-        elif args.ee in ("dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2",
-                         "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco"):
-            loop_ee_state_array = dual_hand_state_array
-            loop_ee_action_array = dual_hand_action_array
-            loop_ee_lock = dual_hand_data_lock
+        # Unified EE handles for Config Loop streaming.
+        loop_ee_state_array = dual_hand_state_array
+        loop_ee_action_array = dual_hand_action_array
+        loop_ee_lock = dual_hand_data_lock
 
         # affinity mode (if you dont know what it is, then you probably don't need it)
         if args.affinity:
@@ -1917,12 +2554,11 @@ if __name__ == '__main__':
                 "robot": {
                     "arm": args.arm,
                     "end_effector": args.ee,
-                    "input_mode": args.input_mode,
+                    "input_mode": "replay",
                     "simulation": args.sim,
                     "disable_arm": args.disable_arm,
+                    "disable_hand": args.disable_hand,
                     "disable_body": args.disable_body,
-                    "hand_only": args.hand_only,
-                    "rh56f1_retarget_mode": args.rh56f1_retarget_mode,
                 },
                 "camera": {
                     "selected": args.camera,
@@ -1934,6 +2570,7 @@ if __name__ == '__main__':
                     "frequency": args.frequency,
                     "network_interface": args.network_interface,
                     "motion": args.motion,
+                    "start_sync_delay": args.start_sync_delay,
                 },
                 "body_state": {
                     "enabled": args.record_body_state,
@@ -1976,11 +2613,30 @@ if __name__ == '__main__':
                         "ema_alpha": args.rh5dg2_tactile_vr_ema_alpha,
                     },
                 },
+                "replay": {
+                    "parquet": replay_parquet,
+                    "format": replay_format,
+                    "task": replay_task_text,
+                    "source": args.replay_source,
+                    "frames": replay_feeder.n,
+                    "fps": replay_fps,
+                    "speed": args.replay_speed,
+                    "repeat": args.replay_repeat,
+                    "finish": args.replay_finish,
+                    "action_dim": POLICY_VECTOR_DIM,
+                    "arm_max_step": args.policy_arm_max_step,
+                    "hand_max_step": args.policy_hand_max_step,
+                    "action_timeout": args.policy_action_timeout,
+                    "gravity_comp": arm_gravity_comp is not None,
+                    "dry_run": args.dry_run,
+                },
                 "neck": {
                     "enabled": args.enable_neck,
+                    "input_source": "replay_action",
                     "command_host": args.neck_host or args.img_server_ip,
                     "command_port": args.neck_port,
                     "feedback_port": args.neck_feedback_port,
+                    "command_deadband": args.neck_command_deadband,
                 },
             }
             if args.enable_audio:
@@ -2046,11 +2702,6 @@ if __name__ == '__main__':
                 args.ee,
                 args.frequency,
                 arm=args.arm,
-                source_key=args.loop_source_key,
-                action_space=args.loop_action_space,
-                robot_type=args.loop_robot_type,
-                gripper_type=args.loop_gripper_type,
-                finger_type=args.loop_finger_type,
                 head_dim=2 if (neck_ctrl is not None or neck_feedback is not None) else 0,
                 body_dim=len(loop_body_probe),
                 raw_head_dim=2 if neck_ctrl is not None else 0,
@@ -2079,7 +2730,11 @@ if __name__ == '__main__':
             logger_mp.info(f"[loop] streaming robot state + tactile + cameras to Config Loop at {args.loop_addr}")
 
         logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        logger_mp.info(f"🟢  Press [r] to start the episode replay after {START_SYNC_DELAY:.1f}s.")
+        logger_mp.info("🟠  Press [h] BEFORE [r] to send the arms/hands/neck to the home pose the episodes started from.")
+        logger_mp.info("🟣  Press [p] while running to PAUSE the rollout and return the arms to the ready pose; press [r] to resume.")
+        if args.dry_run:
+            logger_mp.warning("🧪  --dry-run: actions are logged only. Nothing is published to arms, hands or neck.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         elif args.screen_record:
@@ -2091,9 +2746,36 @@ if __name__ == '__main__':
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
-        logger_mp.info(f"[teleop ready state] READY={READY} START={START} STOP={STOP} disable_arm={args.disable_arm}")
+        logger_mp.info(f"[policy ready state] READY={READY} START={START} STOP={STOP} disable_arm={args.disable_arm}")
+        prestart_loop_count = 0
+        home_cmd_q = None       # integrated arm command for the [h]/[p] home ramp
+        policy_arm_cmd_q = None  # integrated arm command for the policy rollout
+        neck_log_last_ts = 0.0
+        neck_log_interval = 1.0 / args.neck_log_rate if args.neck_log_rate > 0 else None
         while not START and not STOP: # wait for start or stop signal.
+            prestart_loop_count += 1
             time.sleep(0.033)
+            joint_temperature_last_log = _maybe_log_arm_joint_temperatures(
+                args, arm_ctrl, joint_temperature_last_log
+            )
+            if GO_HOME:
+                # [h] pressed before the first [r]: the control loop below has not started
+                # yet, so run the home move from here — otherwise [h] would only work after
+                # a [p] pause and the pre-rollout homing would silently do nothing.
+                home_reached, neck_log_last_ts, home_cmd_q = _go_home_tick(
+                    args, arm_ctrl, hand_ctrl, neck_ctrl, neck_feedback,
+                    prestart_loop_count, neck_log_last_ts, neck_log_interval,
+                    cmd_q=home_cmd_q, gravity_comp=arm_gravity_comp,
+                )
+                if home_reached:
+                    with STATE_LOCK:
+                        GO_HOME = False
+                    logger_mp.info("[policy home] home pose reached. Press [r] to start the policy.")
+                elif prestart_loop_count % 40 == 0:
+                    logger_mp.info("[policy home] easing to the home pose...")
+            else:
+                home_cmd_q = None  # restart the command ramp from the live pose on the next [h]
+            maybe_start_delayed_run()
             # feed Config Loop cameras during the pre-start wait too, so the Loop
             # previews go READY before [r] is pressed (camera frames only; the
             # robot-step source stays silent until tracking actually starts).
@@ -2128,25 +2810,34 @@ if __name__ == '__main__':
                 else:
                     logger_mp.warning(f"[teleop camera prestart] no {selected_camera_name} frame received for XR display. {prestart_debug}")
 
-        logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
-        logger_mp.info(f"[teleop ready state] READY={READY} START={START} STOP={STOP} disable_arm={args.disable_arm}")
+        logger_mp.info("---------------------🎬 episode replay 🎬-------------------------")
+        logger_mp.info(
+            f"[policy ready state] READY={READY} START={START} STOP={STOP} "
+            f"disable_arm={args.disable_arm} disable_hand={args.disable_hand} dry_run={args.dry_run}"
+        )
         if args.disable_arm:
-            logger_mp.warning("[teleop arm disabled reason] --disable-arm set; IK/control publish will be skipped.")
+            logger_mp.warning("[policy arm] OFF: --disable-arm set; the arm part of the action is not published.")
         else:
             arm_ctrl.speed_gradual_max()
-            # Seed the arm target with the current (ready) pose so START eases up from
-            # where the arms already are, instead of the arms first snapping toward the
-            # zeros/home target and dropping "as if torque off" before rising to the IK pose.
+            # Seed the arm target so the first action eases up from where the arms already
+            # are instead of snapping toward the zeros/home target. Prefer the held [h]
+            # home command over the measured pose: re-commanding the measured (gravity-
+            # drooped) q would visibly drop the arms the moment [r] is pressed.
             try:
-                _seed_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
-                if _seed_q.size and np.isfinite(_seed_q).all():
-                    arm_ctrl.ctrl_dual_arm(_seed_q, np.zeros_like(_seed_q))
+                _seed_q = home_cmd_q
+                if _seed_q is None:
+                    _seed_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
+                if _seed_q.size and np.isfinite(_seed_q).all() and not args.dry_run:
+                    _seed_tau = arm_gravity_comp.tau(_seed_q) if arm_gravity_comp is not None \
+                        else np.zeros_like(_seed_q)
+                    arm_ctrl.ctrl_dual_arm(_seed_q, _seed_tau)
+                    policy_arm_cmd_q = _seed_q.copy()
             except Exception as _seed_exc:
-                logger_mp.debug("[teleop arm startup] q_target seed skipped: %s", _seed_exc)
+                logger_mp.debug("[policy arm startup] q_target seed skipped: %s", _seed_exc)
             logger_mp.info(
-                f"[teleop arm startup safety] reset wrist base at START; "
-                f"startup_duration={args.arm_startup_duration:.3f}s "
-                f"startup_max_step={args.arm_startup_max_step:.4f}rad"
+                f"[policy arm startup safety] startup_duration={args.policy_arm_startup_duration:.3f}s "
+                f"startup_max_step={args.policy_arm_startup_max_step:.4f}rad "
+                f"steady_max_step={args.policy_arm_max_step:.4f}rad"
             )
 
         head_img = None
@@ -2156,33 +2847,18 @@ if __name__ == '__main__':
         right_wrist_bgr = None
         record_save_pending = False
         viewer_frame_count = 0
-        hand_input_count = 0
-        hand_input_rate_start = time.time()
-        hand_debug_last_ts = 0.0
-        hand_debug_interval = 1.0 / args.hand_debug_rate if args.hand_debug_rate > 0 else None
-        arm_sensitivity_config = _resolve_arm_sensitivity_args(args)
-        arm_sensitivity_state = {}
-        tracking_start_time = time.time()
-        arm_fsm = "ACTIVE"
-        arm_lost_since = None
-        arm_found_since = None
-        arm_last_good_left_pose = None
-        arm_last_good_right_pose = None
-        arm_standby_logged = False
-        logger_mp.info(
-            f"[teleop arm sensitivity config] pos_gain={np.round(arm_sensitivity_config['pos_gain'], 4).tolist()} "
-            f"rot_gain={arm_sensitivity_config['rot_gain']:.3f} "
-            f"max_delta={arm_sensitivity_config['max_delta']:.3f} "
-            f"smoothing_alpha={arm_sensitivity_config['smoothing_alpha']:.3f} "
-            f"enabled={arm_sensitivity_config.get('enabled', False)} sim={args.sim}"
-        )
-        logger_mp.info(
-            f"[teleop arm tracking fsm] enabled={args.arm_standby_on_tracking_loss} "
-            f"lost_timeout={args.arm_lost_timeout:.3f}s found_confirm={args.arm_found_confirm:.3f}s "
-            f"standby_action={args.arm_standby_action} max_frame_jump={args.arm_max_frame_jump:.3f}m"
-        )
+        # policy rollout state
+        policy_started_at = time.time()
+        policy_head_latched = [0.0, 0.0]
+        policy_last_left_hand_cmd = None
+        policy_last_right_hand_cmd = None
+        policy_last_action = None
+        policy_last_action_time = 0.0
+        policy_hold_logged = False
+        policy_log_interval = 1.0 / args.policy_log_rate if args.policy_log_rate > 0 else None
+        policy_log_last_ts = 0.0
 
-        # main loop. robot start to follow VR user's motion
+        # main loop. the robot now follows the policy's action chunks
         loop_count = 0
         neck_log_last_ts = 0.0
         neck_log_interval = 1.0 / args.neck_log_rate if args.neck_log_rate > 0 else None
@@ -2195,13 +2871,15 @@ if __name__ == '__main__':
         while not STOP:
             loop_count += 1
             start_time = time.time()
+            joint_temperature_last_log = _maybe_log_arm_joint_temperatures(
+                args, arm_ctrl, joint_temperature_last_log
+            )
             neck_record = None
             left_wrist_bgr = None
             right_wrist_bgr = None
-            # get image ( --loop also needs frames every tick, independent of record )
+            # get image (the policy needs every camera every tick, independent of --record)
             if camera_config['head_camera']['enable_zmq']:
-                if args.record or args.screen_record or args.loop or (xr_need_local_img and selected_camera_name == "head"):
-                    head_img = img_client.get_head_frame()
+                head_img = img_client.get_head_frame()
             if xr_need_local_img:
                 if selected_camera_name == "head_and_wrist":
                     viewer_bgr, head_viewer_frame, left_viewer_frame, right_viewer_frame = _get_head_and_wrist_bgr(img_client, args)
@@ -2246,18 +2924,16 @@ if __name__ == '__main__':
                         f"camera_name={selected_camera_name} {viewer_frame_debug}"
                     )
             if camera_config['left_wrist_camera']['enable_zmq']:
-                if args.record or args.loop:
-                    left_wrist_img = img_client.get_left_wrist_frame()
-                    if left_wrist_img is not None and left_wrist_img.bgr is not None and cv2 is not None:
-                        # Store the camera frame exactly as received from the image server.
-                        left_wrist_bgr = left_wrist_img.bgr
+                left_wrist_img = img_client.get_left_wrist_frame()
+                if left_wrist_img is not None and left_wrist_img.bgr is not None:
+                    # Store the camera frame exactly as received from the image server —
+                    # the recordings the policy trained on were not reoriented either.
+                    left_wrist_bgr = left_wrist_img.bgr
 
             if camera_config['right_wrist_camera']['enable_zmq']:
-                if args.record or args.loop:
-                    right_wrist_img = img_client.get_right_wrist_frame()
-                    if right_wrist_img is not None and right_wrist_img.bgr is not None and cv2 is not None:
-                        # Store the camera frame exactly as received from the image server.
-                        right_wrist_bgr = right_wrist_img.bgr
+                right_wrist_img = img_client.get_right_wrist_frame()
+                if right_wrist_img is not None and right_wrist_img.bgr is not None:
+                    right_wrist_bgr = right_wrist_img.bgr
 
             # hand the freshest frames to Config Loop (control thread only swaps
             # references; JPEG handling + RTSP happen off-thread in loop_camera).
@@ -2285,14 +2961,6 @@ if __name__ == '__main__':
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
-                        waist_source = "keyboard" if WAIST_KEY_ENABLED else ("follow_neck" if args.enable_waist_follow_neck else "fixed")
-                        waist_state = _waist_state_snapshot(WAIST_YAW_REL, waist_source)
-                        recorder.update_info({"waist_state": waist_state})
-                        logger_mp.info(
-                            "[teleop record] waist_state source=%s commanded=%s deg",
-                            waist_state["source"],
-                            waist_state["commanded_relative_deg"],
-                        )
                         if depth_worker is not None:
                             recorder.save_depth_info(depth_worker.estimator.intrinsics())
                         try:
@@ -2383,63 +3051,114 @@ if __name__ == '__main__':
                     screen_record_writer.write(frame)
 
             # get xr's tele data
-            tele_data = tv_wrapper.get_tele_data()
-            arm_tracking_ready = bool(
-                getattr(tele_data, "tracking_active", True)
-                and getattr(tele_data, "head_pose_is_valid", True)
-                and getattr(tele_data, "left_arm_is_valid", True)
-                and getattr(tele_data, "right_arm_is_valid", True)
-                # fixed arm-reference mode: hold arms until the frozen reference
-                # anchor has been captured from a settled immersive frame.
-                and getattr(tele_data, "arm_anchor_ready", True)
-            )
-            raw_arm_tracking_ready = arm_tracking_ready
-            now = time.time()
-            if args.arm_standby_on_tracking_loss and not args.disable_arm and arm_ctrl is not None:
-                if raw_arm_tracking_ready:
-                    arm_lost_since = None
-                    if arm_fsm == "STANDBY":
-                        if arm_found_since is None:
-                            arm_found_since = now
-                        elif now - arm_found_since >= args.arm_found_confirm:
-                            arm_fsm = "ACTIVE"
-                            arm_found_since = None
-                            arm_last_good_left_pose = None
-                            arm_last_good_right_pose = None
-                            arm_sensitivity_state.clear()
-                            tracking_start_time = now
-                            arm_standby_logged = False
-                            arm_ctrl.speed_gradual_max()
-                            _safe_enter_hand_auto(hand_ctrl)
-                            logger_mp.warning("[teleop arm tracking fsm] Tracking restored -> ACTIVE")
-                    else:
-                        arm_found_since = None
-                else:
-                    arm_found_since = None
-                    if arm_lost_since is None:
-                        arm_lost_since = now
-                    elif arm_fsm == "ACTIVE" and now - arm_lost_since >= args.arm_lost_timeout:
-                        arm_fsm = "STANDBY"
-                        arm_last_good_left_pose = None
-                        arm_last_good_right_pose = None
-                        arm_sensitivity_state.clear()
-                        # Drop the fixed arm reference anchor so it is re-captured from
-                        # the operator's stance when tracking returns (handles AVP
-                        # re-centering / operator drift during the standby period).
-                        # Resetting here (not on the STANDBY->ACTIVE transition) matters:
-                        # arm_anchor_ready gates that transition, so resetting on
-                        # restore would immediately bounce the FSM back to STANDBY.
-                        if hasattr(tv_wrapper, "reset_arm_reference_anchor"):
-                            tv_wrapper.reset_arm_reference_anchor()
-                        _safe_enter_hand_standby_open(hand_ctrl)
-                        logger_mp.warning(
-                            "[teleop arm tracking fsm] Tracking lost -> STANDBY "
-                            "head_valid=%s left_arm_valid=%s right_arm_valid=%s",
-                            getattr(tele_data, "head_pose_is_valid", None),
-                            getattr(tele_data, "left_arm_is_valid", None),
-                            getattr(tele_data, "right_arm_is_valid", None),
+            maybe_start_delayed_run()
+
+            # Robot observation. Read it every tick regardless of START so the pause path
+            # and the recorder see the same numbers the policy would.
+            if arm_ctrl is None:
+                current_lr_arm_q = np.array([], dtype=np.float64)
+                current_lr_arm_dq = np.array([], dtype=np.float64)
+            else:
+                current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
+                current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+            with dual_hand_data_lock:
+                policy_left_ee_state = list(dual_hand_state_array[:POLICY_EE_DIM])
+                policy_right_ee_state = list(dual_hand_state_array[-POLICY_EE_DIM:])
+            policy_head_latched = _read_neck_yaw_pitch(neck_feedback, policy_head_latched)
+
+            if not START:
+                if PAUSE_TO_READY and not args.disable_arm and arm_ctrl is not None and not args.dry_run:
+                    # [p] pause: ease the arms back to the ready pose while disengaged.
+                    try:
+                        _, home_cmd_q = _step_arms_toward_ready(
+                            arm_ctrl, current_lr_arm_q, max(0.0, args.policy_arm_startup_max_step),
+                            cmd_q=home_cmd_q, gravity_comp=arm_gravity_comp,
                         )
-                arm_tracking_ready = raw_arm_tracking_ready and arm_fsm == "ACTIVE"
+                    except Exception as exc:
+                        if loop_count % 30 == 0:
+                            logger_mp.warning("[policy pause] ready pose command skipped: %s", exc)
+                    # Drop the raw override so the hands fall back to the controller's open
+                    # baseline instead of freezing on the last action they were given.
+                    hand_ctrl.clear_raw_command()
+                    if loop_count % 100 == 0:
+                        logger_mp.info("[policy pause] paused at ready pose. Press [r] to resume.")
+
+                if GO_HOME:
+                    # [h] home: same ready pose as the pause path, plus an open-hand
+                    # baseline and a centred neck, so the rollout starts from the pose
+                    # the episodes were recorded from.
+                    home_reached, neck_log_last_ts, home_cmd_q = _go_home_tick(
+                        args, arm_ctrl, hand_ctrl, neck_ctrl, neck_feedback,
+                        loop_count, neck_log_last_ts, neck_log_interval,
+                        current_arm_q=current_lr_arm_q,
+                        cmd_q=home_cmd_q, gravity_comp=arm_gravity_comp,
+                    )
+                    if home_reached:
+                        with STATE_LOCK:
+                            GO_HOME = False
+                        logger_mp.info("[policy home] home pose reached. Press [r] to start the policy.")
+                    elif loop_count % 40 == 0:
+                        logger_mp.info("[policy home] easing to the home pose...")
+                if not GO_HOME and not PAUSE_TO_READY:
+                    home_cmd_q = None  # restart the command ramp from the live pose next time
+                # Rewind so the next [r] replays the episode from frame 0.
+                replay_feeder.reset()
+                replay_finish_handled = False
+                policy_last_action = None
+                policy_last_action_time = 0.0
+                policy_last_left_hand_cmd = None
+                policy_last_right_hand_cmd = None
+                policy_arm_cmd_q = None
+                policy_started_at = time.time()
+                current_time = time.time()
+                time_elapsed = current_time - start_time
+                sleep_time = max(0, (1 / args.frequency) - time_elapsed)
+                time.sleep(sleep_time)
+                continue
+
+            # Engaged: seed the policy arm command from the held home/pause command (if
+            # any) so the rollout starts from the pose [h] drove to instead of dipping
+            # to the gravity-drooped measured pose; later [p]/[h] ramps restart live.
+            if policy_arm_cmd_q is None and home_cmd_q is not None:
+                policy_arm_cmd_q = home_cmd_q.copy()
+            home_cmd_q = None
+
+            # Pop the recorded action whose timestamp has come up on the replay clock.
+            policy_action = replay_feeder.pop_action()
+            if replay_feeder.finished and not replay_finish_handled:
+                replay_finish_handled = True
+                logger_mp.info(
+                    "[replay] episode finished after %s frame(s) x %s pass(es); finish=%s.",
+                    replay_feeder.n, replay_feeder.repeat, args.replay_finish,
+                )
+                if args.replay_finish == "pause":
+                    with STATE_LOCK:
+                        START = False
+                        START_SYNC_AT = None
+                        PAUSE_TO_READY = True
+                    logger_mp.info(
+                        "[replay] auto-pause: arms return to the ready pose; press [r] to replay again."
+                    )
+                elif args.replay_finish == "stop":
+                    with STATE_LOCK:
+                        START = False
+                        STOP = True
+            now = time.time()
+            if policy_action is not None:
+                policy_last_action = policy_action
+                policy_last_action_time = now
+                policy_hold_logged = False
+            policy_action_age = now - policy_last_action_time if policy_last_action_time else float("inf")
+            policy_engaged = policy_last_action is not None and policy_action_age <= args.policy_action_timeout
+            if not policy_engaged and not policy_hold_logged:
+                policy_hold_logged = True
+                logger_mp.warning(
+                    "[replay action] no fresh action for %.2fs (timeout %.2fs); holding pose. "
+                    "replay=%s",
+                    policy_action_age, args.policy_action_timeout, replay_feeder.stats(),
+                )
+            action_parts = _split_policy_action(policy_last_action) if policy_engaged else None
+
             latest_tactiles = None
             if rh5dg2_tactile_udp is not None:
                 latest_tactiles = rh5dg2_tactile_udp.read_latest()
@@ -2452,56 +3171,30 @@ if __name__ == '__main__':
                             mapper.update(latest_tactiles)
                             for mapper in rh5dg2_tactile_heat_mappers.values()
                         ]
-                        tv_wrapper.set_tactile_overlay(tactile_views)
-                    else:
+                        if tv_wrapper is not None:
+                            tv_wrapper.set_tactile_overlay(tactile_views)
+                    elif tv_wrapper is not None:
                         tv_wrapper.set_tactile_overlay(None)
                 except Exception as exc:
                     if loop_count % 30 == 0:
                         logger_mp.warning("[RH5DG2 tactile VR overlay] update skipped: %s", exc)
-            if neck_ctrl is not None and getattr(tele_data, "head_pose_is_valid", True):
-                try:
-                    neck_measured = neck_ctrl._extract_yaw_pitch(tele_data.head_pose)
-                    neck_command, neck_target = neck_ctrl.update(tele_data.head_pose)
-                    neck_actual = neck_feedback.read_latest() if neck_feedback is not None else None
-                    neck_record = {
-                        "raw_head_yaw_pitch": neck_measured.tolist(),
-                        "target_yaw_pitch": neck_target.tolist(),
-                        "command_yaw_pitch": neck_command.tolist(),
-                        "actual_yaw_pitch": None if neck_actual is None else neck_actual.get("yaw_pitch"),
-                        "actual_timestamp": None if neck_actual is None else neck_actual.get("timestamp"),
-                    }
-                    waist_command = None
-                    if args.enable_waist_follow_neck:
-                        waist_direction = -1.0 if args.waist_follow_neck_invert else 1.0
-                        waist_command = arm_ctrl.ctrl_waist_yaw(
-                            neck_command[0] * args.waist_yaw_gain * waist_direction,
-                            limit=args.waist_yaw_limit,
-                            velocity_limit=args.waist_yaw_velocity,
-                        )
-                    now = time.time()
-                    should_log_neck = neck_log_interval is not None and now - neck_log_last_ts >= neck_log_interval
-                    if should_log_neck:
-                        neck_log_last_ts = now
-                        waist_actual = None
-                        waist_error = None
-                        if waist_command is not None:
-                            waist_actual = arm_ctrl.get_waist_yaw_relative_position()
-                            waist_error = waist_command - waist_actual
-                        logger_mp.debug(
-                            f"[teleop neck] raw_head={np.round(neck_measured, 4).tolist()} "
-                            f"target={np.round(neck_target, 4).tolist()} "
-                            f"command={np.round(neck_command, 4).tolist()} "
-                            f"actual={None if neck_actual is None else np.round(neck_actual.get('yaw_pitch'), 4).tolist()} "
-                            f"waist_yaw={None if waist_command is None else round(waist_command, 4)} "
-                            f"waist_actual={None if waist_actual is None else round(waist_actual, 4)} "
-                            f"waist_error={None if waist_error is None else round(waist_error, 4)}"
-                        )
-                except (ValueError, OSError) as e:
-                    if loop_count % 30 == 0:
-                        logger_mp.warning(f"[teleop neck] command skipped: {e}")
 
-            # keyboard-driven H1_2 waist yaw ([j]/[k]); independent of neck tracking
-            if WAIST_KEY_ENABLED and arm_ctrl is not None and hasattr(arm_ctrl, "ctrl_waist_yaw"):
+            # ---- neck: policy head action -> pan/tilt UDP command
+            if action_parts is not None and not args.dry_run:
+                neck_record, neck_log_last_ts = _update_neck_from_action(
+                    args,
+                    neck_ctrl,
+                    neck_feedback,
+                    action_parts["head"],
+                    arm_ctrl,
+                    loop_count,
+                    neck_log_last_ts,
+                    neck_log_interval,
+                    allow_waist=True,
+                )
+
+            # keyboard-driven H1_2 waist yaw ([j]/[k]); independent of the policy
+            if WAIST_KEY_ENABLED and arm_ctrl is not None and hasattr(arm_ctrl, "ctrl_waist_yaw") and not args.dry_run:
                 try:
                     arm_ctrl.ctrl_waist_yaw(
                         WAIST_YAW_REL,
@@ -2513,7 +3206,7 @@ if __name__ == '__main__':
                         logger_mp.warning("[teleop waist keyboard] command skipped: %s", exc)
 
             # periodic current-waist-angle log
-            if loop_count % 50 == 0 and arm_ctrl is not None \
+            if args.log_waist_angle and loop_count % 50 == 0 and arm_ctrl is not None \
                and hasattr(arm_ctrl, "get_waist_yaw_relative_position") \
                and (WAIST_KEY_ENABLED or args.enable_waist_follow_neck):
                 try:
@@ -2522,275 +3215,69 @@ if __name__ == '__main__':
                 except Exception:
                     pass
 
-            # [수정 부분: 강제 Swap 로직 제거하고 있는 그대로(Left->Left, Right->Right) 할당]
-            left_hand_pos = tele_data.left_hand_pos
-            right_hand_pos = tele_data.right_hand_pos
-            if args.ee in ("rh5dg2_dfx", "rh5dg2_ftp") and args.rh5dg2_hand_swap:
-                left_hand_pos, right_hand_pos = right_hand_pos, left_hand_pos
-
-            left_wrist_pose = tele_data.left_wrist_pose
-            right_wrist_pose = tele_data.right_wrist_pose
-            if (
-                args.arm_max_frame_jump > 0.0
-                and raw_arm_tracking_ready
-                and arm_fsm == "ACTIVE"
-                and not args.disable_arm
-            ):
-                (
-                    left_wrist_pose,
-                    right_wrist_pose,
-                    arm_last_good_left_pose,
-                    arm_last_good_right_pose,
-                    left_jump,
-                    right_jump,
-                ) = _apply_pose_jump_filter(
-                    left_wrist_pose,
-                    right_wrist_pose,
-                    arm_last_good_left_pose,
-                    arm_last_good_right_pose,
-                    args.arm_max_frame_jump,
+            # ---- arms: policy joint targets, rate limited against the measured pose
+            sol_q = np.asarray(current_lr_arm_q, dtype=np.float64).copy()
+            sol_tauff = np.zeros_like(sol_q)
+            arm_step_limit = args.policy_arm_max_step
+            if args.policy_arm_startup_duration > 0.0 and \
+               time.time() - policy_started_at < args.policy_arm_startup_duration:
+                arm_step_limit = min(arm_step_limit, args.policy_arm_startup_max_step)
+            if action_parts is not None and arm_ctrl is not None:
+                arm_target = _policy_arm_target(
+                    policy_arm_cmd_q, current_lr_arm_q, action_parts, arm_step_limit,
+                    meas_margin=args.policy_arm_meas_margin,
                 )
-                if left_jump is not None and (
-                    left_jump > args.arm_max_frame_jump or right_jump > args.arm_max_frame_jump
-                ):
-                    logger_mp.warning(
-                        "[teleop arm pose filter] rejected wrist jump "
-                        "left=%.3fm right=%.3fm max=%.3fm",
-                        left_jump,
-                        right_jump,
-                        args.arm_max_frame_jump,
-                    )
-            left_wrist_pose, right_wrist_pose, left_arm_sens_debug, right_arm_sens_debug = _apply_arm_sensitivity(
-                left_wrist_pose,
-                right_wrist_pose,
-                arm_sensitivity_state,
-                arm_sensitivity_config,
-                enabled=not args.disable_arm and arm_tracking_ready,
-            )
-            if loop_count % 50 == 0:
-                logger_mp.debug(
-                    f"[teleop arm input] ready={READY} start={START} "
-                    f"tracking_ready={arm_tracking_ready} "
-                    f"tracking_active={getattr(tele_data, 'tracking_active', None)} "
-                    f"session_alive={getattr(tele_data, 'session_alive', None)} "
-                    f"head_valid={getattr(tele_data, 'head_pose_is_valid', None)} "
-                    f"left_arm_valid={getattr(tele_data, 'left_arm_is_valid', None)} "
-                    f"right_arm_valid={getattr(tele_data, 'right_arm_is_valid', None)} "
-                    f"left_wrist={_fmt_pose_debug(left_wrist_pose)} "
-                    f"right_wrist={_fmt_pose_debug(right_wrist_pose)} "
-                    f"head={_fmt_pose_debug(getattr(tele_data, 'head_pose', []))}"
-                )
-                logger_mp.debug(
-                    f"[teleop arm sensitivity] "
-                    f"{_fmt_arm_sensitivity_debug('left', left_arm_sens_debug)} "
-                    f"{_fmt_arm_sensitivity_debug('right', right_arm_sens_debug)} "
-                    f"pos_gain={np.round(arm_sensitivity_config['pos_gain'], 4).tolist()} "
-                    f"rot_gain={arm_sensitivity_config['rot_gain']:.3f} "
-                    f"max_delta={arm_sensitivity_config['max_delta']:.3f} "
-                    f"smoothing_alpha={arm_sensitivity_config['smoothing_alpha']:.3f} "
-                    f"enabled={arm_sensitivity_config.get('enabled', False)}"
-                )
-
-            left_hand_pinchValue = tele_data.left_hand_pinchValue
-            right_hand_pinchValue = tele_data.right_hand_pinchValue
-
-            left_hand_pinch = tele_data.left_hand_pinch
-            right_hand_pinch = tele_data.right_hand_pinch
-
-            left_hand_squeeze = tele_data.left_hand_squeeze
-            right_hand_squeeze = tele_data.right_hand_squeeze
-
-            left_hand_squeezeValue = tele_data.left_hand_squeezeValue
-            right_hand_squeezeValue = tele_data.right_hand_squeezeValue
-
-            if args.ee in ("dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2", "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco") and args.input_mode == "hand":
-                hand_input_count += 1
-                now = time.time()
-                should_hand_debug = hand_debug_interval is not None and now - hand_debug_last_ts >= hand_debug_interval
-                if should_hand_debug:
-                    hand_debug_last_ts = now
-                hand_status = _hand_tracking_status(left_hand_pos, right_hand_pos)
-                if should_hand_debug:
-                    logger_mp.info(
-                        f"[teleop hand input before write] ee={args.ee} input={args.input_mode} "
-                        f"left={_fmt_hand_debug(left_hand_pos)} right={_fmt_hand_debug(right_hand_pos)} "
-                        f"timestamp={now:.6f}"
-                    )
-                    logger_mp.info(
-                        "[teleop hand tracking status] "
-                        f"hand_tracking_ready={hand_status['hand_tracking_ready']} "
-                        f"left_allzero={hand_status['left_allzero']} "
-                        f"right_allzero={hand_status['right_allzero']} "
-                        f"left_valid_points={hand_status['left_valid_points']} "
-                        f"right_valid_points={hand_status['right_valid_points']}"
-                    )
-                hand_tracking_ready = hand_status["hand_tracking_ready"] and raw_arm_tracking_ready
-                if hand_tracking_ready:
-                    with left_hand_pos_array.get_lock():
-                        left_hand_pos_array[:] = left_hand_pos.flatten()
-                        left_shared_debug = np.array(left_hand_pos_array[:]).reshape(25, 3).copy() if should_hand_debug else None
-                    with right_hand_pos_array.get_lock():
-                        right_hand_pos_array[:] = right_hand_pos.flatten()
-                        right_shared_debug = np.array(right_hand_pos_array[:]).reshape(25, 3).copy() if should_hand_debug else None
-                    if args.ee in ("rh5dg2_dfx", "rh5dg2_ftp"):
-                        with hand_input_timestamp.get_lock():
-                            hand_input_timestamp.value = now
-                else:
-                    left_shared_debug = None
-                    right_shared_debug = None
-                    _safe_enter_hand_standby_open(hand_ctrl)
-                    if loop_count % 10 == 0:
+                if arm_target is None:
+                    if loop_count % 20 == 0:
                         logger_mp.warning(
-                            "[teleop hand tracking hold] skipped invalid hand frame "
-                            "raw_arm_tracking_ready=%s hand_tracking_ready=%s",
-                            raw_arm_tracking_ready,
-                            hand_status["hand_tracking_ready"],
+                            "[policy arm] target rejected: measured q=%s", _fmt_vec_debug(current_lr_arm_q)
                         )
-                if should_hand_debug:
-                    logger_mp.info(
-                        f"[teleop hand input after write] ee={args.ee} "
-                        f"left_shared={_fmt_hand_debug(left_shared_debug)} right_shared={_fmt_hand_debug(right_shared_debug)} "
-                        f"write_latency_ms={(time.time() - now) * 1000.0:.2f}"
-                    )
-                    logger_mp.info(
-                        f"[teleop hand input hz] hz={_rate_hz(hand_input_count, hand_input_rate_start):.2f} "
-                        f"count={hand_input_count}"
-                    )
-            elif args.ee == "dex1" and args.input_mode == "controller":
-                with left_gripper_value.get_lock():
-                    left_gripper_value.value = tele_data.left_ctrl_triggerValue
-                with right_gripper_value.get_lock():
-                    right_gripper_value.value = tele_data.right_ctrl_triggerValue
-            elif args.ee == "dex1" and args.input_mode == "hand":
-                with left_gripper_value.get_lock():
-                    left_gripper_value.value = left_hand_pinchValue
-                with right_gripper_value.get_lock():
-                    right_gripper_value.value = right_hand_pinchValue
-            else:
-                pass
-            
-            # high level control
-            if args.input_mode == "controller" and args.motion and not args.disable_body:
-                # quit teleoperate
-                if tele_data.right_ctrl_aButton:
-                    START = False
-                    STOP = True
-                # command robot to enter damping mode. soft emergency stop function
-                if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
-                    loco_wrapper.Damp()
-                # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                                  -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                                  -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
-
-            # get current robot state data.
-            if arm_ctrl is None:
-                current_lr_arm_q = np.array([], dtype=np.float64)
-                current_lr_arm_dq = np.array([], dtype=np.float64)
-            else:
-                current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
-                current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
-
-            # solve ik using motor data and wrist pose, then use ik results to control arms.
-            if args.disable_arm or arm_ctrl is None:
-                sol_q = np.asarray(current_lr_arm_q, dtype=np.float64).copy()
-                sol_tauff = np.zeros_like(sol_q)
-                if loop_count % 50 == 0:
-                    logger_mp.warning(
-                        f"[teleop arm disabled reason] loop={loop_count} reason=--disable-arm "
-                        f"current_q={_fmt_vec_debug(current_lr_arm_q)}"
-                    )
-            elif arm_fsm == "STANDBY":
-                if args.arm_standby_action == "ready":
-                    sol_q = _make_arm_ready_q(current_lr_arm_q)
                 else:
-                    sol_q = np.asarray(current_lr_arm_q, dtype=np.float64).copy()
-                sol_tauff = np.zeros_like(sol_q)
-                if not arm_standby_logged or loop_count % 50 == 0:
-                    arm_standby_logged = True
-                    logger_mp.warning(
-                        f"[teleop arm tracking standby] loop={loop_count} action={args.arm_standby_action} "
-                        f"head_valid={getattr(tele_data, 'head_pose_is_valid', None)} "
-                        f"left_arm_valid={getattr(tele_data, 'left_arm_is_valid', None)} "
-                        f"right_arm_valid={getattr(tele_data, 'right_arm_is_valid', None)} "
-                        f"target={_fmt_vec_debug(sol_q)}"
-                    )
-            elif not arm_tracking_ready:
-                sol_q = np.asarray(current_lr_arm_q, dtype=np.float64).copy()
-                sol_tauff = np.zeros_like(sol_q)
-                if loop_count % 10 == 0:
-                    logger_mp.warning(
-                        f"[teleop arm tracking hold] loop={loop_count} "
-                        f"head_valid={getattr(tele_data, 'head_pose_is_valid', None)} "
-                        f"left_arm_valid={getattr(tele_data, 'left_arm_is_valid', None)} "
-                        f"right_arm_valid={getattr(tele_data, 'right_arm_is_valid', None)} "
-                        f"current_q={_fmt_vec_debug(current_lr_arm_q)}"
-                    )
-            else:
-                time_ik_start = time.time()
-                if loop_count % 50 == 0:
-                    logger_mp.debug(
-                        f"[teleop arm ik enter] current_q={_fmt_vec_debug(current_lr_arm_q)} "
-                        f"current_dq={_fmt_vec_debug(current_lr_arm_dq)} "
-                        f"left_wrist={_fmt_pose_debug(left_wrist_pose)} "
-                        f"right_wrist={_fmt_pose_debug(right_wrist_pose)}"
-                    )
-                sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist_pose, right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
-                time_ik_end = time.time()
-                logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
-                if loop_count % 50 == 0:
-                    logger_mp.debug(
-                        f"[teleop arm ik result] dt={time_ik_end - time_ik_start:.6f} "
-                        f"current_q={_fmt_vec_debug(current_lr_arm_q)} sol_q={_fmt_vec_debug(sol_q)} "
-                        f"tauff={_fmt_vec_debug(sol_tauff)}"
-                    )
-                startup_elapsed = time.time() - tracking_start_time
-                if args.arm_startup_duration > 0.0 and startup_elapsed < args.arm_startup_duration:
-                    max_step = max(0.0, args.arm_startup_max_step)
-                    sol_q = current_lr_arm_q + np.clip(sol_q - current_lr_arm_q, -max_step, max_step)
-                    sol_tauff = np.zeros_like(sol_q)
-                    if loop_count % 10 == 0:
-                        logger_mp.info(
-                            f"[teleop arm startup clamp] elapsed={startup_elapsed:.3f}s "
-                            f"max_step={max_step:.4f} target={_fmt_vec_debug(sol_q)}"
-                        )
-            # ---- [추가 부분: 안전 장치 (Safety Mechanism)] ----
-            # 로봇 스펙에 맞게 최대/최소 라디안 및 급격한 움직임 허용치 설정
-            #MAX_RAD = 2.5    # 예: 절대적인 최대 관절 각도
-            #MIN_RAD = -2.5   # 예: 절대적인 최소 관절 각도
-            #MAX_DELTA = 0.5  # 예: 한 프레임(약 0.03초) 내 허용되는 최대 각도 변화량
-
-            #q_delta_abs = np.abs(sol_q - current_lr_arm_q)
-            
-            #if np.any(sol_q > MAX_RAD) or np.any(sol_q < MIN_RAD) or np.any(q_delta_abs > MAX_DELTA):
-            #    logger_mp.error("🚨 Safety Triggered: Abnormal joint movement detected!")
-                
-                # High-level controller가 있을 경우 Damping 모드 실행
-            #    if args.motion and args.input_mode == "controller":
-            #        try:
-            #            loco_wrapper.Damp()
-            #            logger_mp.info("Entered Damping Mode successfully.")
-            #        except NameError:
-            #            pass
-                
-                # 텔레오퍼레이션 즉시 정지 상태로 전환 (로봇에 비정상 sol_q 전달 방지)
-            #    START = False
-            #    STOP = True
-            #    continue 
-            # ---------------------------------------------------
-            if not args.disable_arm and arm_ctrl is not None:
-                if loop_count % 50 == 0:
-                    logger_mp.debug(
-                        f"[teleop arm publish enter] controller={arm_ctrl.__class__.__name__} "
-                        f"sim={args.sim} target={_fmt_vec_debug(sol_q)}"
-                    )
+                    sol_q = arm_target
+                    policy_arm_cmd_q = arm_target
+            if not args.disable_arm and arm_ctrl is not None and not args.dry_run:
+                if arm_gravity_comp is not None:
+                    sol_tauff = arm_gravity_comp.tau(sol_q)
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
                 if loop_count % 50 == 0:
                     arm_write_ok = arm_ctrl.get_last_write_ok() if hasattr(arm_ctrl, "get_last_write_ok") else None
                     logger_mp.debug(
-                        f"[teleop arm publish] controller={arm_ctrl.__class__.__name__} "
-                        f"sim={args.sim} write_ok={arm_write_ok} topic=rt/lowcmd domain={1 if args.sim else 0} "
-                        f"target={_fmt_vec_debug(sol_q)} tauff={_fmt_vec_debug(sol_tauff)}"
+                        f"[policy arm publish] controller={arm_ctrl.__class__.__name__} "
+                        f"sim={args.sim} write_ok={arm_write_ok} step_limit={arm_step_limit:.4f} "
+                        f"target={_fmt_vec_debug(sol_q)}"
+                    )
+
+            # ---- hands: policy raw DG2 targets, bypassing the landmark retargeting path
+            if action_parts is not None:
+                policy_last_left_hand_cmd = _policy_hand_target(
+                    policy_last_left_hand_cmd, action_parts["left_hand"], args.policy_hand_max_step
+                )
+                policy_last_right_hand_cmd = _policy_hand_target(
+                    policy_last_right_hand_cmd, action_parts["right_hand"], args.policy_hand_max_step
+                )
+                if not args.disable_hand and not args.dry_run:
+                    try:
+                        hand_ctrl.set_raw_command(policy_last_left_hand_cmd, policy_last_right_hand_cmd)
+                    except Exception as exc:
+                        if loop_count % 30 == 0:
+                            logger_mp.warning("[policy hand] raw command skipped: %s", exc)
+
+            if policy_log_interval is not None and time.time() - policy_log_last_ts >= policy_log_interval:
+                policy_log_last_ts = time.time()
+                replay_stats = replay_feeder.stats()
+                logger_mp.info(
+                    "[replay step] engaged=%s frame=%s/%s pass=%s/%s finished=%s",
+                    policy_engaged, replay_stats["frame"] + 1, replay_stats["frames"],
+                    replay_stats["cycle"] + 1, replay_stats["repeat"], replay_stats["finished"],
+                )
+                if action_parts is not None:
+                    logger_mp.info(
+                        "[replay action] l_arm=%s r_arm=%s l_hand=%s r_hand=%s head=%s",
+                        np.round(action_parts["left_arm"], 3).tolist(),
+                        np.round(action_parts["right_arm"], 3).tolist(),
+                        np.round(action_parts["left_hand"], 0).tolist(),
+                        np.round(action_parts["right_hand"], 0).tolist(),
+                        np.round(action_parts["head"], 3).tolist(),
                     )
 
             # stream robot state to Config Loop (non-blocking; never breaks teleop)
@@ -2844,66 +3331,13 @@ if __name__ == '__main__':
                         f"frames_failed={getattr(recorder, 'items_failed', None)} "
                         "ready_for_next_episode=True Press [s] to start next recording."
                     )
-                # dex hand or gripper
-                if args.ee == "dex3" and args.input_mode == "hand":
-                    with dual_hand_data_lock:
-                        left_ee_state = dual_hand_state_array[:7]
-                        right_ee_state = dual_hand_state_array[-7:]
-                        left_hand_action = dual_hand_action_array[:7]
-                        right_hand_action = dual_hand_action_array[-7:]
-                        current_body_state = []
-                        current_body_action = []
-                elif args.ee == "dex1" and args.input_mode == "hand":
-                    with dual_gripper_data_lock:
-                        left_ee_state = [dual_gripper_state_array[0]]
-                        right_ee_state = [dual_gripper_state_array[1]]
-                        left_hand_action = [dual_gripper_action_array[0]]
-                        right_hand_action = [dual_gripper_action_array[1]]
-                        current_body_state = []
-                        current_body_action = []
-                elif args.ee == "dex1" and args.input_mode == "controller":
-                    with dual_gripper_data_lock:
-                        left_ee_state = [dual_gripper_state_array[0]]
-                        right_ee_state = [dual_gripper_state_array[1]]
-                        left_hand_action = [dual_gripper_action_array[0]]
-                        right_hand_action = [dual_gripper_action_array[1]]
-                        current_body_state = arm_ctrl.get_current_motor_q().tolist() if arm_ctrl is not None else []
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
-                elif (args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
-                    with dual_hand_data_lock:
-                        left_ee_state = dual_hand_state_array[:6]
-                        right_ee_state = dual_hand_state_array[-6:]
-                        left_hand_action = dual_hand_action_array[:6]
-                        right_hand_action = dual_hand_action_array[-6:]
-                        current_body_state = []
-                        current_body_action = []
-
-                elif (args.ee == "rh5dg2_dfx" or args.ee == "rh5dg2_ftp" or args.ee == "inspire_dg2") and args.input_mode == "hand":
-                    with dual_hand_data_lock:
-                        left_ee_state = dual_hand_state_array[:13]
-                        right_ee_state = dual_hand_state_array[-13:]
-                        left_hand_action = dual_hand_action_array[:13]
-                        right_hand_action = dual_hand_action_array[-13:]
-                        current_body_state = []
-                        current_body_action = []
-                elif args.ee == "rh56f1" and args.input_mode == "hand":
-                    with dual_hand_data_lock:
-                        rh56f1_count = len(dual_hand_state_array) // 2
-                        left_ee_state = dual_hand_state_array[:rh56f1_count]
-                        right_ee_state = dual_hand_state_array[-rh56f1_count:]
-                        left_hand_action = dual_hand_action_array[:rh56f1_count]
-                        right_hand_action = dual_hand_action_array[-rh56f1_count:]
-                        current_body_state = []
-                        current_body_action = []
-                else:
-                    left_ee_state = []
-                    right_ee_state = []
-                    left_hand_action = []
-                    right_hand_action = []
-                    current_body_state = []
-                    current_body_action = []
+                with dual_hand_data_lock:
+                    left_ee_state = dual_hand_state_array[:POLICY_EE_DIM]
+                    right_ee_state = dual_hand_state_array[-POLICY_EE_DIM:]
+                    left_hand_action = dual_hand_action_array[:POLICY_EE_DIM]
+                    right_hand_action = dual_hand_action_array[-POLICY_EE_DIM:]
+                current_body_state = []
+                current_body_action = []
 
                 recorded_body_state = _read_body_qpos(arm_ctrl, enabled=args.record_body_state)
                 if recorded_body_state:
@@ -3091,6 +3525,11 @@ if __name__ == '__main__':
                 rh56f1_tactile_reader.stop()
         except Exception as e:
             logger_mp.error(f"Failed to stop RH56F1 tactile reader: {e}")
+
+        try:
+            logger_mp.info("[replay] final stats: %s", replay_feeder.stats())
+        except Exception as e:
+            logger_mp.error(f"Failed to log replay stats: {e}")
 
         try:
             if rh5dg2_tactile_udp is not None:

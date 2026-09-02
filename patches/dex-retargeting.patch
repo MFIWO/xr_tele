@@ -1,0 +1,98 @@
+diff --git a/src/dex_retargeting/optimizer.py b/src/dex_retargeting/optimizer.py
+index ed891fe..cae8224 100644
+--- a/src/dex_retargeting/optimizer.py
++++ b/src/dex_retargeting/optimizer.py
+@@ -187,6 +187,7 @@ class VectorOptimizer(Optimizer):
+         target_origin_link_names: List[str],
+         target_task_link_names: List[str],
+         target_link_human_indices: np.ndarray,
++        target_link_weights: Optional[np.ndarray] = None,
+         huber_delta=0.02,
+         norm_delta=4e-3,
+         scaling=1.0,
+@@ -194,9 +195,15 @@ class VectorOptimizer(Optimizer):
+         super().__init__(robot, target_joint_names, target_link_human_indices)
+         self.origin_link_names = target_origin_link_names
+         self.task_link_names = target_task_link_names
+-        self.huber_loss = torch.nn.SmoothL1Loss(beta=huber_delta, reduction="mean")
++        self.huber_loss = torch.nn.SmoothL1Loss(beta=huber_delta, reduction="none")
+         self.norm_delta = norm_delta
+         self.scaling = scaling
++        if target_link_weights is None:
++            self.target_link_weights = np.ones(len(target_origin_link_names), dtype=np.float32)
++        else:
++            self.target_link_weights = np.asarray(target_link_weights, dtype=np.float32)
++            if self.target_link_weights.shape != (len(target_origin_link_names),):
++                raise ValueError("VectorOptimizer target_link_weights must match target vector count")
+ 
+         # Computation cache for better performance
+         # For one link used in multiple vectors, e.g. hand palm, we do not want to compute it multiple times
+@@ -216,6 +223,8 @@ class VectorOptimizer(Optimizer):
+         qpos[self.idx_pin2fixed] = fixed_qpos
+         torch_target_vec = torch.as_tensor(target_vector) * self.scaling
+         torch_target_vec.requires_grad_(False)
++        torch_weight = torch.as_tensor(self.target_link_weights, dtype=torch.float32)
++        torch_weight = torch_weight / torch.clamp(torch_weight.sum(), min=1e-6)
+ 
+         def objective(x: np.ndarray, grad: np.ndarray) -> float:
+             qpos[self.idx_pin2target] = x
+@@ -239,7 +248,7 @@ class VectorOptimizer(Optimizer):
+ 
+             # Loss term for kinematics retargeting based on 3D position error
+             vec_dist = torch.norm(robot_vec - torch_target_vec, dim=1, keepdim=False)
+-            huber_distance = self.huber_loss(vec_dist, torch.zeros_like(vec_dist))
++            huber_distance = (self.huber_loss(vec_dist, torch.zeros_like(vec_dist)) * torch_weight).sum()
+             result = huber_distance.cpu().detach().item()
+ 
+             if grad.size > 0:
+diff --git a/src/dex_retargeting/retargeting_config.py b/src/dex_retargeting/retargeting_config.py
+index f1e8cd8..142b895 100644
+--- a/src/dex_retargeting/retargeting_config.py
++++ b/src/dex_retargeting/retargeting_config.py
+@@ -39,6 +39,7 @@ class RetargetingConfig:
+     target_origin_link_names: Optional[List[str]] = None
+     target_task_link_names: Optional[List[str]] = None
+     target_link_human_indices_vector: Optional[np.ndarray] = None
++    target_link_weights_vector: Optional[np.ndarray] = None
+ 
+     # Scaling factor for vector retargeting only
+     # For example, Allegro is 1.6 times larger than normal human hand, then this scaling factor should be 1.6
+@@ -81,6 +82,10 @@ class RetargetingConfig:
+                 raise ValueError(f"Vector retargeting link names and link indices dim mismatch")
+             if self.target_link_human_indices_vector is None:
+                 raise ValueError(f"Vector retargeting requires: target_link_human_indices_vector")
++            if self.target_link_weights_vector is not None:
++                self.target_link_weights_vector = self.target_link_weights_vector.squeeze()
++                if self.target_link_weights_vector.shape != (len(self.target_origin_link_names),):
++                    raise ValueError(f"Vector retargeting weights dim mismatch")
+ 
+         elif self.type == "position":
+             if self.target_link_names is None:
+@@ -135,6 +140,8 @@ class RetargetingConfig:
+             cfg["target_link_human_indices_position"] = np.array(cfg["target_link_human_indices_position"])
+         if "target_link_human_indices_vector" in cfg:
+             cfg["target_link_human_indices_vector"] = np.array(cfg["target_link_human_indices_vector"])
++        if "target_link_weights_vector" in cfg:
++            cfg["target_link_weights_vector"] = np.array(cfg["target_link_weights_vector"], dtype=np.float32)
+         if "target_link_human_indices_dexpilot" in cfg:
+             cfg["target_link_human_indices_dexpilot"] = np.array(cfg["target_link_human_indices_dexpilot"])
+ 
+@@ -185,6 +192,7 @@ class RetargetingConfig:
+                 target_origin_link_names=self.target_origin_link_names,
+                 target_task_link_names=self.target_task_link_names,
+                 target_link_human_indices=self.target_link_human_indices_vector,
++                target_link_weights=self.target_link_weights_vector,
+                 scaling=self.scaling_factor,
+                 norm_delta=self.normal_delta,
+                 huber_delta=self.huber_delta,
+@@ -196,6 +204,8 @@ class RetargetingConfig:
+                 finger_tip_link_names=self.finger_tip_link_names,
+                 wrist_link_name=self.wrist_link_name,
+                 target_link_human_indices=self.target_link_human_indices_dexpilot,
++                norm_delta=self.normal_delta,
++                huber_delta=self.huber_delta,
+                 scaling=self.scaling_factor,
+                 project_dist=self.project_dist,
+                 escape_dist=self.escape_dist,
+
+

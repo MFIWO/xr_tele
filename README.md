@@ -125,11 +125,24 @@ For more information, you can refer to [Official Documentation ](https://support
 (base) unitree@Host:~$ conda create -n tv python=3.10 pinocchio=3.1.0 numpy=1.26.4 -c conda-forge
 (base) unitree@Host:~$ conda activate tv
 # Clone this repo
-(tv) unitree@Host:~$ git clone https://github.com/unitreerobotics/xr_teleoperate.git
+(tv) unitree@Host:~$ git clone https://github.com/MFIWO/xr_tele.git xr_teleoperate
 (tv) unitree@Host:~$ cd xr_teleoperate
 # Shallow clone submodule
 (tv) unitree@Host:~/xr_teleoperate$ git submodule update --init --depth 1
+# Apply this fork's camera, XR viewer, and hand-retargeting extensions.
+(tv) unitree@Host:~/xr_teleoperate$ bash tools/apply_submodule_patches.sh
 ```
+
+The submodule extensions are stored under `patches/` because the upstream
+submodules are not hosted in the `MFIWO` account. The apply script is
+idempotent and excludes local certificates and copied development files.
+
+This fork adds the following H1_2 workflows:
+
+- `teleop/teleop_hand_and_arm_manus_and_vive.py` for Manus/Vive control and haptics.
+- `teleop/teleop_hand_and_arm_policy_infer.py` for remote VLA policy inference.
+- `teleop/teleop_hand_and_arm_lerobot_replay.py` for LeRobot and Config Loop episode replay.
+- `--loop --loop-addr 127.0.0.1:5590` for non-blocking VLA data streaming through the Config Loop sidecar.
 
 ```bash
 # Install teleimager submodule
