@@ -549,6 +549,10 @@ class AIWorkerArmController:
     def get_current_dual_arm_dq(self):
         return self._dq.copy()
 
+    def get_last_commanded_dual_arm_q(self):
+        """Return the most recent post-limit arm position command."""
+        return self._last_command.copy()
+
     def get_current_motor_q(self):
         return self.get_current_dual_arm_q()
 

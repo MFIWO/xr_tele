@@ -306,6 +306,27 @@ ROS 2 and `rclpy` are not required for this path:
   --ai-worker-ros-domain-id 30 --no-record --no-enable-neck
 ```
 
+> **AI Worker safety note:** `--sim` selects simulation-oriented behavior but
+> does not by itself replace the AI Worker arm/HX5 DDS publishers. For a
+> guaranteed no-actuator validation, use the `--command-sink` procedure in
+> [`teleop/VISIONPROTELEOP_POC.md`](teleop/VISIONPROTELEOP_POC.md).
+
+Run the USB foot-switch input in a second terminal on the same host. The pedal
+key mappings can all coexist: `W/A/S/D` drives the base, holding `O`/`P` moves
+the lift up/down, and `U` toggles a latched upper-body E-stop. While latched,
+the base and lift stop and the teleop process holds its current arm, hand, and
+neck commands; press `U` again to clear the latch. The native VisionProTeleop
+backend additionally requires fresh settled tracking and a new `R` enable before
+resuming. Vision Pro head height no longer
+controls the lift, and the old `--enable-lift` option is rejected. Base/lift
+motion also fails closed if the tracking heartbeat on UDP port 8766 expires;
+tracking recovery never clears a latched `U` E-stop.
+
+```bash
+(tv) $ export ROS_DOMAIN_ID=30
+(tv) $ python ai_worker_pedal_teleop.py --domain-id 30
+```
+
 HX5-D20 uses the same `dex_retargeting.RetargetingConfig` and DexPilot optimizer
 path as RH5DG2. Its YAML contains the standard 15 thumb/fingertip/wrist vector
 pairs, and the optimizer output is reordered into the HX5 DDS 1..20 joint
@@ -339,6 +360,54 @@ when the repositories are laid out differently. Arm and hand commands use the
 standard ROBOTIS DDS left/right `JointTrajectory` topics; `/joint_states` supplies
 feedback. The first valid Vision Pro wrist pair becomes the relative arm-motion
 anchor, preventing a jump caused by different XR and simulator world frames.
+
+When `--loop` is enabled for `--arm AI_WORKER --ee hx5_d20`, the robot-step
+payload uses the explicit `ai_worker.*` root with 7 arm joints and 20 raw HX5
+joints per side. Existing embodiments retain their legacy `g1.*` root. This
+checkout does not include `loop_sdk`, so the packet schema is unit-tested but a
+live Config Loop consumer was not connected; deployments whose consumer only
+declares `g1.*` must add the corresponding `ai_worker.*` channels.
+
+### AI Worker episode replay and live diagnostics
+
+`ai_worker_replay.py` is the AI Worker/HX5 counterpart to the H1-2 replay path.
+It requires every enabled command in `actions.*.qpos`, validates all frames and
+joint limits before opening DDS, and never falls back to recorded state as a
+command. Preview an episode first; this is the default even if `--dry-run` is
+omitted:
+
+```bash
+(tv) $ cd ../xr_tele/teleop
+(tv) $ python -m pip install rerun-sdk==0.20.1
+(tv) $ python ai_worker_replay.py /path/to/episode_0001 --dry-run
+```
+
+The Rerun web URL printed in the terminal shows the saved head/left-wrist/right-
+wrist images and, per joint, `recorded_state`, `target_action`, `sent_command`,
+and `live_measured`, plus their signed differences. A dry run intentionally has
+no `sent_command` or `live_measured` curves. `target_action` is the recorded IK
+request; the arm velocity limiter can make the actual DDS `sent_command`
+different, and `live_measured` is feedback rather than a DDS acknowledgement.
+
+For simulator or hardware execution, stop `teleop_hand_and_arm.py` first so the
+two processes cannot command the same four arm/hand topics. Start the pedal
+terminal, review the dry run, and then opt in explicitly:
+
+```bash
+# terminal 1: base/lift remains inhibited throughout replay; U still latches hold
+(tv) $ python ai_worker_pedal_teleop.py --domain-id 30
+
+# terminal 2
+(tv) $ python ai_worker_replay.py /path/to/episode_0001 --execute --domain-id 30
+```
+
+Live replay waits for all 14 arm and 40 HX5 joint states, blends from measured
+positions to the first target, and holds rather than homing/opening on exit.
+While pedal `U` is latched, the replay clock pauses and measured arm/hand poses
+are held; after `U` is cleared it re-anchors and blends to the pending frame.
+Base and lift receive `MOTION 0` for the entire replay. Neck, base, and lift are
+not replayed because the episode contains no equivalent qpos action contract.
+Only use `--allow-metadata-mismatch` with a manually verified legacy episode.
 
 The RH56F1 SIM interface uses `rt/rh56f1/cmd` and `rt/rh56f1/state` with
 `MotorCmds_`/`MotorStates_`. Each message contains 24 joints in

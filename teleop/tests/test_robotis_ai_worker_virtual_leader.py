@@ -7,15 +7,17 @@ from teleop.robot_control.robotis_ai_worker import AIWorkerArmIK, AIWorkerVirtua
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SG2_URDF = (
-    REPO_ROOT.parent
-    / "external_repos"
-    / "ai_worker"
-    / "ffw_description"
+_SG2_RELATIVE = (
+    Path("ffw_description")
     / "urdf"
     / "ffw_sg2_rev1_follower"
     / "ffw_sg2_follower.urdf"
 )
+_SG2_CANDIDATES = (
+    REPO_ROOT.parent / "ai_worker" / _SG2_RELATIVE,
+    REPO_ROOT.parent / "external_repos" / "ai_worker" / _SG2_RELATIVE,
+)
+SG2_URDF = next((path for path in _SG2_CANDIDATES if path.is_file()), _SG2_CANDIDATES[0])
 
 
 @unittest.skipUnless(SG2_URDF.is_file(), f"Official SG2 URDF not found: {SG2_URDF}")

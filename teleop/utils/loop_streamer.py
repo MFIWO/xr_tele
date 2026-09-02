@@ -1,4 +1,4 @@
-"""Stream G1 robot state and camera frames from xr_teleoperate into Config Loop.
+"""Stream robot state and camera frames from xr_teleoperate into Config Loop.
 
 This module is an OPTIONAL sink, enabled with ``--loop`` on
 ``teleop_hand_and_arm.py``. With the flag off, importing this module has zero
@@ -69,6 +69,11 @@ _EE_DIM_PER_HAND = {
     "rh5dg2_ftp": 13,
     "inspire_dg2": 13,
     "rh56f1": 12,
+    "hx5_d20": 20,
+}
+
+_EMBODIMENT_ROOT = {
+    "AI_WORKER": "ai_worker",
 }
 
 
@@ -91,20 +96,23 @@ def _as_float_list(values) -> list[float]:
 # Robot state streaming
 # ============================================================================
 class LoopRobotStreamer:
-    """Wrap loop_sdk.RobotStepSender for the G1 dual-arm + EE control loop.
+    """Wrap loop_sdk.RobotStepSender for a dual 7-DOF-arm + optional EE loop.
 
     Channel layout (fixed at first send, complete from tick 0):
 
-        g1.observation.left_arm.joint_position   [7]
-        g1.observation.left_arm.joint_velocity   [7]
-        g1.observation.right_arm.joint_position  [7]
-        g1.observation.right_arm.joint_velocity  [7]
-        g1.observation.left_ee.joint_position    [n]   (omitted if no EE)
-        g1.observation.right_ee.joint_position   [n]
-        g1.action.left_arm.joint_position        [7]   (IK target sol_q[:7])
-        g1.action.right_arm.joint_position       [7]   (IK target sol_q[-7:])
-        g1.action.left_ee.joint_position         [n]
-        g1.action.right_ee.joint_position        [n]
+        <embodiment>.observation.left_arm.joint_position   [7]
+        <embodiment>.observation.left_arm.joint_velocity   [7]
+        <embodiment>.observation.right_arm.joint_position  [7]
+        <embodiment>.observation.right_arm.joint_velocity  [7]
+        <embodiment>.observation.left_ee.joint_position    [n]
+        <embodiment>.observation.right_ee.joint_position   [n]
+        <embodiment>.action.left_arm.joint_position        [7]
+        <embodiment>.action.right_arm.joint_position       [7]
+        <embodiment>.action.left_ee.joint_position         [n]
+        <embodiment>.action.right_ee.joint_position        [n]
+
+    Existing embodiments retain ``g1`` for compatibility; AI Worker uses
+    ``ai_worker`` and HX5 supplies ``n=20`` without altering its joint order.
     """
 
     def __init__(
@@ -113,12 +121,15 @@ class LoopRobotStreamer:
         ee: str | None,
         frequency: float,
         *,
+        arm: str | None = None,
         source_key: str = "robot-step",
         connect_timeout_s: float = 5.0,
     ) -> None:
         self._loop_addr = loop_addr
         self._ee = ee
         self._ee_dim = ee_dim_per_hand(ee)
+        self._arm = arm
+        self._root = _EMBODIMENT_ROOT.get(arm or "", "g1")
         self._frequency = int(round(frequency))
         self._source_key = source_key
         self._connect_timeout_s = connect_timeout_s
@@ -196,7 +207,7 @@ class LoopRobotStreamer:
             observation["right_ee"] = {"joint_position": _as_float_list(right_ee_state)}
             action["left_ee"] = {"joint_position": _as_float_list(left_ee_action)}
             action["right_ee"] = {"joint_position": _as_float_list(right_ee_action)}
-        return {"g1": {"observation": observation, "action": action}}
+        return {self._root: {"observation": observation, "action": action}}
 
     def send(
         self,
@@ -228,8 +239,9 @@ class LoopRobotStreamer:
                 left_ee_action, right_ee_action,
             )
             # overwrite action arms with the actual IK target
-            step["g1"]["action"]["left_arm"]["joint_position"] = _as_float_list(arm_action[:7])
-            step["g1"]["action"]["right_arm"]["joint_position"] = _as_float_list(arm_action[-7:])
+            root = step[self._root]
+            root["action"]["left_arm"]["joint_position"] = _as_float_list(arm_action[:7])
+            root["action"]["right_arm"]["joint_position"] = _as_float_list(arm_action[-7:])
             self._sender.send(timestamp_us, step, sequence=self._sequence)
             self._sequence += 1
         except Exception as exc:  # never let streaming break teleop

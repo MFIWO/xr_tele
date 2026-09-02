@@ -39,6 +39,10 @@ class RobotisDDSImageClient:
         }
         self._frames = {name: TeleImage(fps=0.0, jpg=None, bgr=None) for name in self._readers}
         self._times = {name: deque(maxlen=20) for name in self._readers}
+        self._frame_timestamps = {
+            name: {"source_time_ns": None, "receive_time_ns": None}
+            for name in self._readers
+        }
         self._lock = threading.Lock()
         self._running = True
         self._threads = [
@@ -69,6 +73,15 @@ class RobotisDDSImageClient:
             "source": "robotis_dds",
         }
 
+    @staticmethod
+    def _source_time_ns(message):
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        sec = getattr(stamp, "sec", None)
+        nanosec = getattr(stamp, "nanosec", None)
+        if sec is None or nanosec is None:
+            return None
+        return int(sec) * 1_000_000_000 + int(nanosec)
+
     def _reader_loop(self, name, reader):
         while self._running:
             try:
@@ -80,6 +93,8 @@ class RobotisDDSImageClient:
                 jpg = bytes(message.data)
                 bgr = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
                 now = time.monotonic()
+                receive_time_ns = time.time_ns()
+                source_time_ns = self._source_time_ns(message)
                 stamps = self._times[name]
                 stamps.append(now)
                 fps = 0.0
@@ -87,6 +102,10 @@ class RobotisDDSImageClient:
                     fps = (len(stamps) - 1) / (stamps[-1] - stamps[0])
                 with self._lock:
                     self._frames[name] = TeleImage(fps=fps, jpg=jpg, bgr=bgr)
+                    self._frame_timestamps[name] = {
+                        "source_time_ns": source_time_ns,
+                        "receive_time_ns": receive_time_ns,
+                    }
             except Exception:
                 if self._running:
                     time.sleep(0.02)
@@ -107,6 +126,11 @@ class RobotisDDSImageClient:
     def get_right_wrist_frame(self):
         return self._get("right_wrist")
 
+    def get_frame_timestamps(self):
+        """Return source and host-receive times for each latest DDS camera frame."""
+        with self._lock:
+            return {name: dict(values) for name, values in self._frame_timestamps.items()}
+
     def close(self):
         self._running = False
         for thread in self._threads:
@@ -116,4 +140,3 @@ class RobotisDDSImageClient:
                 reader.close()
             except Exception:
                 pass
-

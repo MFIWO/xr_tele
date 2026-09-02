@@ -1,0 +1,4 @@
+# Stock Tracking Streamer compatible release verified against upstream main
+# commit 4c549905c2a8b214d79f7cd88e535101a1ce32af.
+# PyPI wheel SHA256: 03d19f56ca3d5a2013a0ae353ae68df8f898d1ae3c5567b49419b47421bc2412
+avp_stream==2.51

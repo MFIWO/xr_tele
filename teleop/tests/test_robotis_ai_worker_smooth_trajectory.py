@@ -119,6 +119,16 @@ class AIWorkerSmoothTrajectoryTest(unittest.TestCase):
         np.testing.assert_allclose(controller._last_command, measured)
         self.assertGreaterEqual(controller._last_command_time, previous_time)
 
+    def test_last_command_getter_returns_a_copy(self):
+        controller = _controller()
+        expected = np.linspace(-0.2, 0.2, 14)
+        controller._last_command = expected.copy()
+
+        returned = controller.get_last_commanded_dual_arm_q()
+        returned[0] = 999.0
+
+        np.testing.assert_allclose(controller.get_last_commanded_dual_arm_q(), expected)
+
     def test_live_control_stays_on_the_original_single_point_path(self):
         controller = _controller()
         controller._last_command_time -= 1.0
@@ -133,6 +143,12 @@ class AIWorkerSmoothTrajectoryTest(unittest.TestCase):
         )
         for call in controller.transport.live_calls:
             self.assertAlmostEqual(call["duration"], controller.command_duration)
+        np.testing.assert_allclose(
+            controller.get_last_commanded_dual_arm_q(),
+            np.concatenate(
+                [call["positions"] for call in controller.transport.live_calls]
+            ),
+        )
 
 
 if __name__ == "__main__":

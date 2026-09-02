@@ -5,7 +5,12 @@ import json
 from multiprocessing import Value, Array, Lock
 import threading
 import logging_mp
-logging_mp.basicConfig(level=logging_mp.INFO)
+try:
+    logging_mp.basicConfig(level=logging_mp.INFO)
+except RuntimeError:
+    # importing this entrypoint from an existing logging_mp test/application
+    # process must not fail merely because logging was configured already.
+    pass
 logger_mp = logging_mp.getLogger(__name__)
 try:
     import cv2
@@ -20,7 +25,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from televuer import TeleVuerWrapper
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.audio_recorder import BackgroundAudioRecorder, AudioRecorderError
@@ -28,6 +32,54 @@ from teleop.utils.ipc import IPC_Server
 from teleop.utils.rh5dg2_tactile import RH5DG2TactileHeatMapper
 from teleop.neck_control import AIWorkerNeckController, VisionProNeckController
 from sshkeyboard import listen_keyboard, stop_listening
+
+
+class PedalEstopReceiver:
+    """Receive a latched upper-body stop state from ai_worker_pedal_teleop."""
+
+    def __init__(self, host="127.0.0.1", port=8765):
+        self._active = False
+        self._running = True
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.bind((host, int(port)))
+        self._socket.settimeout(0.2)
+        self._thread = threading.Thread(target=self._run, name="pedal-estop", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while self._running:
+            try:
+                payload, _ = self._socket.recvfrom(64)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            fields = payload.decode("ascii", errors="ignore").strip().split()
+            if len(fields) == 2 and fields[0] == "ESTOP" and fields[1] in ("0", "1"):
+                self._active = fields[1] == "1"
+
+    @property
+    def active(self):
+        return self._active
+
+    def close(self):
+        self._running = False
+        self._socket.close()
+        self._thread.join(timeout=1.0)
+
+
+class PedalMotionSafetyNotifier:
+    """Tell the pedal process whether tracked base/lift motion is permitted."""
+
+    def __init__(self, host="127.0.0.1", port=8766):
+        self._target = (host, int(port))
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def publish(self, allowed):
+        self._socket.sendto(f"MOTION {int(bool(allowed))}".encode("ascii"), self._target)
+
+    def close(self):
+        self._socket.close()
 
 def publish_reset_category(category: int, publisher): # Scene Reset signal
     from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
@@ -42,6 +94,7 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 TACTILE_VR_OVERLAY_VISIBLE = True  # Toggle RH5DG2 tactile overlay visibility in the XR viewer
+XR_ENABLE_GENERATION = 0  # Incremented on every [r], including re-anchor requests.
 # waist keyboard control (H1_2 only): [j]/[k] nudge the waist yaw left/right during teleop
 WAIST_YAW_REL     = 0.0     # current relative waist-yaw target (rad, relative to startup home)
 WAIST_KEY_STEP    = 0.05    # rad added/removed per [j]/[k] press; overwritten from args in main
@@ -61,9 +114,10 @@ WAIST_KEY_INVERT  = False   # swap [j]/[k] direction; overwritten from args in m
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, READY, RECORD_RUNNING, RECORD_TOGGLE, TACTILE_VR_OVERLAY_VISIBLE, WAIST_YAW_REL
+    global STOP, START, READY, RECORD_RUNNING, RECORD_TOGGLE, TACTILE_VR_OVERLAY_VISIBLE, WAIST_YAW_REL, XR_ENABLE_GENERATION
     if key == 'r':
         START = True
+        XR_ENABLE_GENERATION += 1
     elif key == 'q':
         START = False
         STOP = True
@@ -984,6 +1038,28 @@ def _safe_enter_hand_standby_open(hand_ctrl):
             logger_mp.debug("[teleop hand standby] enter_standby_open failed: %s", exc)
     return False
 
+
+def _safe_enter_hand_tracking_standby(hand_ctrl, end_effector):
+    """Apply each hand controller's tracking-loss policy.
+
+    Calling HX5's existing ``enter_standby_open`` would publish an all-zero/open
+    command.  For HX5, pause its already-existing worker gate instead, which
+    freezes the last command without changing the production retargeting or
+    controller implementation.  Other end effectors retain their existing
+    standby-open behavior.
+    """
+    if str(end_effector).strip().lower() == "hx5_d20":
+        if hand_ctrl is None or not hasattr(hand_ctrl, "_enabled"):
+            return False
+        try:
+            hand_ctrl._enabled = False
+            return True
+        except Exception as exc:
+            logger_mp.debug("[teleop HX5 hold] failed to pause publish worker: %s", exc)
+            return False
+    return _safe_enter_hand_standby_open(hand_ctrl)
+
+
 def _safe_enter_hand_auto(hand_ctrl):
     if hand_ctrl is not None and hasattr(hand_ctrl, "enter_auto"):
         try:
@@ -992,6 +1068,89 @@ def _safe_enter_hand_auto(hand_ctrl):
         except Exception as exc:
             logger_mp.debug("[teleop hand standby] enter_auto failed: %s", exc)
     return False
+
+
+def _safe_stop_hx5_without_motion(hand_ctrl, timeout=2.0):
+    """Stop the existing HX5 worker without publishing an open-hand target.
+
+    ``HX5D20Controller.stop()`` intentionally opens both hands before closing.
+    That is useful for the legacy path, but it violates the native backend's
+    fail-closed hold contract.  Keep the production controller untouched and
+    only use its existing lifecycle fields after the publish worker has been
+    paused.  A timed-out worker is deliberately left with its transport open so
+    it cannot race a close; process exit remains fail-closed with a nonzero code.
+    """
+    if hand_ctrl is None:
+        return True
+    try:
+        if getattr(hand_ctrl, "_stopped", False):
+            return True
+        hand_ctrl._enabled = False
+        hand_ctrl._running = False
+        worker = getattr(hand_ctrl, "_thread", None)
+        if worker is None:
+            raise RuntimeError("HX5 controller has no publish worker")
+        if worker.is_alive():
+            worker.join(timeout=max(float(timeout), 0.0))
+        if worker.is_alive():
+            logger_mp.error(
+                "[VisionProTeleop HX5 shutdown] publish worker did not stop; "
+                "transport left open to avoid a concurrent close."
+            )
+            return False
+        transport = getattr(hand_ctrl, "transport", None)
+        if transport is None or not hasattr(transport, "close"):
+            raise RuntimeError("HX5 controller has no closeable transport")
+        transport.close()
+        hand_ctrl._stopped = True
+        return True
+    except Exception as exc:
+        logger_mp.error(
+            "[VisionProTeleop HX5 shutdown] no-motion cleanup failed: %s", exc
+        )
+        return False
+
+
+def _safe_sync_arm_hold_to_measured(arm_ctrl):
+    """Reset an arm velocity limiter before publishing a measured-pose hold."""
+    if arm_ctrl is None:
+        return False
+    sync_to_measured = getattr(arm_ctrl, "sync_arm_command_to_measured", None)
+    if not callable(sync_to_measured):
+        return False
+    try:
+        sync_to_measured()
+        return True
+    except Exception as exc:
+        logger_mp.warning("[teleop arm hold] failed to sync command to measured pose: %s", exc)
+        return False
+
+
+def _native_tracking_output_is_active(tele_data):
+    return bool(
+        getattr(tele_data, "tracking_active", False)
+        and getattr(tele_data, "head_pose_is_valid", False)
+        and getattr(tele_data, "left_arm_is_valid", False)
+        and getattr(tele_data, "right_arm_is_valid", False)
+    )
+
+
+def _native_enable_preconditions_met(status, tracking_timeout_s):
+    """Require fresh, continuously settled evidence before consuming an R enable."""
+    try:
+        sample_age_s = float(status.get("sample_age_s", float("inf")))
+        timeout_s = float(tracking_timeout_s)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        status.get("state") == "REANCHOR_REQUIRED"
+        and status.get("session_alive")
+        and status.get("settling_complete")
+        and not status.get("external_hold")
+        and np.isfinite(sample_age_s)
+        and np.isfinite(timeout_s)
+        and 0.0 <= sample_age_s <= timeout_s
+    )
 
 def _apply_pose_jump_filter(left_pose, right_pose, last_left, last_right, max_frame_jump):
     left = np.asarray(left_pose, dtype=np.float64).copy()
@@ -1018,11 +1177,26 @@ if __name__ == '__main__':
     # basic control parameters
     parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
+    parser.add_argument('--xr-backend', choices=['vuer', 'visionproteleop'], default='vuer', help='XR tracking/display backend. vuer remains the default.')
+    parser.add_argument('--visionpro-ip', default=os.environ.get('VISIONPRO_IP'), help='Tracking Streamer Local Network IP (or room code). May also be set with VISIONPRO_IP.')
+    parser.add_argument('--visionpro-webrtc-port', type=int, default=9999, help='Linux WebRTC port advertised to Tracking Streamer for the native video plane.')
+    parser.add_argument('--visionpro-tracking-timeout', type=float, default=0.25, help='Host-monotonic seconds without a new VisionProTeleop packet before fail-closed hold.')
+    parser.add_argument('--visionpro-settle-time', type=float, default=0.5, help='Continuous valid tracking required before an explicit R enable can take effect.')
+    parser.add_argument('--visionpro-max-wrist-translation-jump', type=float, default=0.15, help='Per-packet native backend wrist translation jump limit in metres.')
+    parser.add_argument('--visionpro-max-wrist-rotation-jump-deg', type=float, default=60.0, help='Per-packet native backend wrist rotation jump limit in degrees.')
+    parser.add_argument('--visionpro-max-wrist-velocity', type=float, default=3.0, help='Native backend wrist translation velocity limit in metres/second; violation holds tracking.')
+    parser.add_argument('--visionpro-max-wrist-angular-velocity', type=float, default=8.0, help='Native backend wrist angular velocity limit in radians/second; violation holds tracking.')
+    parser.add_argument('--visionpro-status-rate', type=float, default=1.0, help='Native backend tracking/video/hold diagnostic rate in Hz. Set 0 to disable periodic output.')
+    parser.add_argument('--visionpro-synthetic', action='store_true', help='Use deterministic synthetic AVP packets for DDS-free offline validation only; requires --command-sink.')
+    parser.add_argument('--command-sink', action='store_true', help='Run AI Worker IK and HX5 retargeting with in-memory targets and no motor DDS publishers.')
+    parser.add_argument('--command-sink-duration', type=float, default=0.0, help='Auto-start and stop a command-sink diagnostic after this many seconds; requires --visionpro-synthetic.')
+    parser.add_argument('--command-sink-log-rate', type=float, default=1.0, help='In-memory arm/HX5 target diagnostic rate in Hz. Set 0 to disable periodic output.')
+    parser.add_argument('--allow-real-hardware', action='store_true', help='Explicitly permit native Vision Pro backend to construct real AI Worker/HX5 controllers. Never use for first validation.')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'AI_WORKER'], default='H1_2', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco', 'hx5_d20'], default='rh5dg2_dfx', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
-    parser.add_argument('--image-source', choices=['auto', 'teleimager', 'robotis_dds'], default='auto', help='Camera transport. auto uses ROBOTIS DDS for AI_WORKER and TeleImager otherwise.')
+    parser.add_argument('--image-source', choices=['auto', 'teleimager', 'robotis_dds', 'none'], default='auto', help='Camera transport. none is a deterministic synthetic source allowed only with --command-sink.')
     parser.add_argument('--viewer-host-ip', type=str, default=None, help='Host IP advertised to the XR browser for the HTTPS/WSS viewer. If omitted, infer it from the route to --img-server-ip.')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     parser.add_argument('--camera', '--viewer-camera', dest='camera', type=str, choices=['head', 'left_wrist', 'right_wrist', 'both', 'both_wrist', 'head_and_wrist', 'head_wrist', 'all'], default='head', help='Camera stream shown in the 8012 XR viewer. Use head_and_wrist to show the head view with both wrist cameras below it.')
@@ -1039,12 +1213,15 @@ if __name__ == '__main__':
     parser.add_argument('--ai-worker-ik-mode', choices=['legacy', 'virtual-leader'], default='legacy', help='AI Worker arm IK. legacy preserves the current solver; virtual-leader adds reach-aware SG2 elbow posture and joint-space continuity.')
     parser.add_argument('--ai-worker-home-on-start', action=argparse.BooleanOptionalAction, default=True, help='Move AI Worker arms smoothly to the model-specific initial pose before teleoperation starts.')
     parser.add_argument('--ai-worker-home-duration', type=float, default=5.0, help='Seconds used to move AI Worker arms to the initial pose at startup.')
-    parser.add_argument('--enable-lift', action=argparse.BooleanOptionalAction, default=False, help='Track relative XR head height with the AI Worker lift joint.')
+    parser.add_argument('--enable-lift', action=argparse.BooleanOptionalAction, default=False, help='Deprecated: lift is controlled from ai_worker_pedal_teleop.py with O/P.')
     parser.add_argument('--lift-gain', type=float, default=1.0, help='AI Worker lift motion per meter of relative XR head-height motion.')
     parser.add_argument('--lift-deadband', type=float, default=0.015, help='Ignore relative XR head-height motion smaller than this many meters.')
     parser.add_argument('--lift-smoothing-alpha', type=float, default=0.2, help='Lift target low-pass alpha from 0 to 1.')
     parser.add_argument('--lift-max-step', type=float, default=0.01, help='Maximum lift command change per control frame in meters.')
     parser.add_argument('--lift-log-rate', type=float, default=0.0, help='Lift debug log rate in Hz. Set 0 to disable periodic logs.')
+    parser.add_argument('--pedal-estop-host', default='127.0.0.1', help='Local address for AI Worker pedal E-stop messages.')
+    parser.add_argument('--pedal-estop-port', type=int, default=8765, help='UDP port for the latched AI Worker upper-body E-stop.')
+    parser.add_argument('--pedal-safety-port', type=int, default=8766, help='UDP destination for pedal base/lift tracking-safety heartbeats.')
     parser.add_argument('--ai-worker-wrist-orientation-mode', choices=['relative', 'absolute'], default='relative', help='AI Worker wrist orientation mapping. relative aligns the Vision Pro and SH5 wrist frames at startup before applying rotation; absolute is an experimental H1_2-frame mapping.')
     parser.add_argument('--ai-worker-left-wrist-roll-offset-deg', type=float, default=0.0, help='Static HX5 left-hand roll correction in degrees about the hand longitudinal axis.')
     parser.add_argument('--ai-worker-right-wrist-roll-offset-deg', type=float, default=0.0, help='Static HX5 right-hand roll correction in degrees about the hand longitudinal axis.')
@@ -1183,7 +1360,109 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
-    if args.viewer_display_fps <= 0:
+    native_production_gate = bool(
+        args.xr_backend == "visionproteleop" and not args.command_sink
+    )
+    if args.xr_backend == "visionproteleop":
+        if args.arm != "AI_WORKER" or (args.ee != "hx5_d20" and not args.disable_hand):
+            raise ValueError(
+                "--xr-backend visionproteleop is scoped to --arm AI_WORKER --ee hx5_d20 in this PoC."
+            )
+        if args.input_mode != "hand":
+            raise ValueError("--xr-backend visionproteleop requires --input-mode hand.")
+        if not args.visionpro_synthetic and not args.visionpro_ip:
+            raise ValueError(
+                "--visionpro-ip is required for live native tracking (or export VISIONPRO_IP)."
+            )
+        if not args.command_sink and not args.allow_real_hardware:
+            raise ValueError(
+                "Native Vision Pro real controller construction is inhibited. Start with "
+                "--command-sink; supervised hardware use additionally requires --allow-real-hardware."
+            )
+        if args.arm_standby_action != "hold":
+            logger_mp.warning(
+                "[VisionProTeleop safety] forcing --arm-standby-action hold; stale native tracking must not move toward ready."
+            )
+            args.arm_standby_action = "hold"
+        if args.ai_worker_home_on_start:
+            logger_mp.warning(
+                "[VisionProTeleop safety] disabling pre-enable arm homing; measured pose is held until tracking settles and R is pressed."
+            )
+            args.ai_worker_home_on_start = False
+        if not args.skip_arm_go_home_on_exit:
+            logger_mp.warning(
+                "[VisionProTeleop safety] enabling --skip-arm-go-home-on-exit so shutdown cannot create an untracked arm motion."
+            )
+            args.skip_arm_go_home_on_exit = True
+        if args.camera not in ("head_and_wrist", "head_wrist"):
+            logger_mp.info(
+                "[VisionProTeleop video] using the PoC head + left wrist + right wrist composite."
+            )
+            args.camera = "head_and_wrist"
+    if args.command_sink and args.arm != "AI_WORKER":
+        raise ValueError("--command-sink currently supports --arm AI_WORKER only.")
+    if args.visionpro_synthetic and (
+        args.xr_backend != "visionproteleop" or not args.command_sink
+    ):
+        raise ValueError(
+            "--visionpro-synthetic requires --xr-backend visionproteleop --command-sink."
+        )
+    if not np.isfinite(args.command_sink_duration) or args.command_sink_duration < 0.0:
+        raise ValueError("--command-sink-duration must be zero or greater.")
+    if args.command_sink_duration > 0.0 and not (
+        args.command_sink and args.visionpro_synthetic
+    ):
+        raise ValueError(
+            "--command-sink-duration auto-start is restricted to the synthetic command-sink diagnostic."
+        )
+    if args.image_source == "none" and not args.command_sink:
+        raise ValueError("--image-source none is allowed only with --command-sink.")
+    if (
+        not np.isfinite(args.command_sink_log_rate)
+        or not np.isfinite(args.visionpro_status_rate)
+        or args.command_sink_log_rate < 0.0
+        or args.visionpro_status_rate < 0.0
+    ):
+        raise ValueError("Command-sink and VisionProTeleop status rates must be zero or greater.")
+    if args.visionpro_webrtc_port <= 0 or args.visionpro_webrtc_port > 65535:
+        raise ValueError("--visionpro-webrtc-port must be between 1 and 65535.")
+    if (
+        not np.isfinite(args.visionpro_tracking_timeout)
+        or not np.isfinite(args.visionpro_settle_time)
+        or args.visionpro_tracking_timeout <= 0.0
+        or args.visionpro_settle_time <= 0.0
+    ):
+        raise ValueError("VisionProTeleop tracking timeout and settle time must be greater than zero.")
+    if (
+        not np.isfinite(args.visionpro_max_wrist_translation_jump)
+        or not np.isfinite(args.visionpro_max_wrist_rotation_jump_deg)
+        or not np.isfinite(args.visionpro_max_wrist_velocity)
+        or not np.isfinite(args.visionpro_max_wrist_angular_velocity)
+        or args.visionpro_max_wrist_translation_jump <= 0.0
+        or args.visionpro_max_wrist_rotation_jump_deg <= 0.0
+        or args.visionpro_max_wrist_velocity <= 0.0
+        or args.visionpro_max_wrist_angular_velocity <= 0.0
+    ):
+        raise ValueError("VisionProTeleop wrist jump and velocity limits must be greater than zero.")
+    if (args.command_sink or args.xr_backend == "visionproteleop") and args.enable_neck:
+        if args.command_sink:
+            neck_disable_reason = (
+                "command-sink mode permits no motor DDS publisher"
+            )
+        else:
+            neck_disable_reason = (
+                "the minimal native PoC controls only AI Worker arms and HX5 hands"
+            )
+        logger_mp.warning(
+            "[teleop safety] disabling the neck controller because %s.",
+            neck_disable_reason,
+        )
+        args.enable_neck = False
+    if args.command_sink and args.sim:
+        logger_mp.warning(
+            "[command sink] --sim is not the safety boundary for AI Worker; the in-memory sink is."
+        )
+    if not np.isfinite(args.viewer_display_fps) or args.viewer_display_fps <= 0:
         raise ValueError("--viewer-display-fps must be greater than zero.")
     if not 1 <= args.viewer_jpeg_quality <= 100:
         raise ValueError("--viewer-jpeg-quality must be between 1 and 100.")
@@ -1272,8 +1551,8 @@ if __name__ == '__main__':
         raise ValueError("--ai-worker-arm-scale must be greater than zero.")
     if args.ai_worker_home_duration <= 0.0:
         raise ValueError("--ai-worker-home-duration must be greater than zero.")
-    if args.enable_lift and args.arm != "AI_WORKER":
-        raise ValueError("--enable-lift currently supports --arm AI_WORKER only.")
+    if args.enable_lift:
+        raise ValueError("Vision Pro Z lift tracking is disabled; run ai_worker_pedal_teleop.py and use O/P instead.")
     if args.lift_gain < 0.0:
         raise ValueError("--lift-gain must be zero or greater.")
     if args.lift_deadband < 0.0 or args.lift_max_step < 0.0 or args.lift_log_rate < 0.0:
@@ -1325,6 +1604,13 @@ if __name__ == '__main__':
             args.rh5dg2_log_throttle = 2.0
         if args.hand_debug_rate == 1.0:
             args.hand_debug_rate = 0.5
+    auto_command_sink = args.command_sink_duration > 0.0
+    if auto_command_sink:
+        on_press("r")
+        logger_mp.warning(
+            "[command sink] deterministic diagnostic auto-started; duration=%.2fs",
+            args.command_sink_duration,
+        )
     logger_mp.debug(f"args: {args}")
     if args.hand_only or args.disable_arm or args.disable_body:
         logger_mp.warning(
@@ -1385,6 +1671,8 @@ if __name__ == '__main__':
     neck_ctrl = None
     neck_feedback = None
     lift_ctrl = None
+    pedal_estop = None
+    pedal_safety = None
     rh56f1_tactile_reader = None
     rh5dg2_tactile_udp = None
     rh5dg2_tactile_heat_mappers = {}
@@ -1392,6 +1680,9 @@ if __name__ == '__main__':
     episode_audio_recorder = None
     loop_robot = None
     loop_camera = None
+    native_hardware_armed = not native_production_gate
+    upper_body_estop = False
+    exit_code = 0
 
     try:
         # setup dds communication domains id
@@ -1441,31 +1732,27 @@ if __name__ == '__main__':
                     neck_feedback = None
                     logger_mp.warning(f"[teleop neck feedback] disabled: {e}")
 
-        if args.enable_lift:
-            from teleop.robot_control.robotis_ai_worker_lift import AIWorkerLiftController
-
-            lift_ctrl = AIWorkerLiftController(
-                gain=args.lift_gain,
-                deadband=args.lift_deadband,
-                smoothing_alpha=args.lift_smoothing_alpha,
-                max_step=args.lift_max_step,
-                command_duration=args.ai_worker_command_duration,
-            )
-            if not lift_ctrl.wait_for_joint_state(timeout=5.0):
-                raise RuntimeError(
-                    "AI Worker did not receive lift_joint on /joint_states within 5 seconds; "
-                    "refusing to move the lift without its measured startup position."
-                )
+        if args.arm == "AI_WORKER" and not auto_command_sink:
+            pedal_estop = PedalEstopReceiver(args.pedal_estop_host, args.pedal_estop_port)
             logger_mp.info(
-                "[teleop lift] enabled topic=%s gain=%.3f deadband=%.3fm alpha=%.3f max_step=%.3fm",
-                lift_ctrl.TOPIC,
-                args.lift_gain,
-                args.lift_deadband,
-                args.lift_smoothing_alpha,
-                args.lift_max_step,
+                "[teleop pedal E-stop] listening on udp=%s:%d; U toggles upper-body hold",
+                args.pedal_estop_host,
+                args.pedal_estop_port,
+            )
+            if not args.command_sink:
+                pedal_safety = PedalMotionSafetyNotifier("127.0.0.1", args.pedal_safety_port)
+            else:
+                logger_mp.warning(
+                    "[command sink] U hold receive is enabled, but pedal base/lift "
+                    "safety authorization output is disabled."
+                )
+        elif args.arm == "AI_WORKER" and auto_command_sink:
+            logger_mp.warning(
+                "[command sink] pedal UDP paths are disabled for this bounded offline run."
             )
 
-        if args.rh5dg2_tactile_udp_port > 0:
+        uses_rh5dg2 = args.ee in ("rh5dg2_dfx", "rh5dg2_ftp")
+        if uses_rh5dg2 and args.rh5dg2_tactile_udp_port > 0:
             try:
                 rh5dg2_tactile_udp = RH5DG2TactileUDPReceiver(
                     port=args.rh5dg2_tactile_udp_port,
@@ -1481,7 +1768,11 @@ if __name__ == '__main__':
                 logger_mp.warning(f"[RH5DG2 tactile UDP] disabled: {e}")
 
         if args.enable_rh5dg2_tactile_vr_overlay:
-            if args.input_mode != "hand":
+            if not uses_rh5dg2:
+                logger_mp.warning(
+                    "[RH5DG2 tactile VR overlay] disabled: the selected end effector is not RH5DG2."
+                )
+            elif args.input_mode != "hand":
                 logger_mp.warning("[RH5DG2 tactile VR overlay] disabled: hand tracking input is required.")
             elif rh5dg2_tactile_udp is None:
                 logger_mp.warning("[RH5DG2 tactile VR overlay] disabled: --rh5dg2-tactile-udp-port is not active.")
@@ -1522,7 +1813,9 @@ if __name__ == '__main__':
                 logger_mp.warning(f"[record audio UDP] disabled: {e}")
 
         # ipc communication mode. client usage: see utils/ipc.py
-        if args.ipc:
+        if auto_command_sink:
+            logger_mp.info("[command sink] keyboard/IPC disabled for bounded synthetic run.")
+        elif args.ipc:
             ipc_server = IPC_Server(on_press=on_press,get_state=get_state)
             ipc_server.start()
         # sshkeyboard communication mode
@@ -1542,8 +1835,12 @@ if __name__ == '__main__':
                 RobotisDDSImageClient,
             )
             img_client = RobotisDDSImageClient(domain_id=args.ai_worker_ros_domain_id)
-        else:
+        elif image_source == "teleimager":
             img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        else:
+            from teleop.utils.synthetic_image_client import SyntheticImageClient
+
+            img_client = SyntheticImageClient(fps=args.viewer_display_fps)
         camera_config = img_client.get_cam_config()
         selected_camera_name = "head" if args.camera == "all" else args.camera
         if selected_camera_name == "both":
@@ -1602,18 +1899,22 @@ if __name__ == '__main__':
         )
         if image_source == "teleimager":
             _log_camera_reachability(args.img_server_ip, camera_config)
-        else:
+        elif image_source == "robotis_dds":
             logger_mp.info(
                 "[teleop camera server check] source=robotis_dds domain=%s topics=%s",
                 args.ai_worker_ros_domain_id,
                 AI_WORKER_CAMERA_TOPICS,
+            )
+        else:
+            logger_mp.warning(
+                "[teleop camera server check] source=synthetic_no_hardware; no camera DDS/network client exists."
             )
         viewer_webrtc, viewer_zmq, viewer_route = _select_viewer_camera_route(
             args.display_mode,
             args.viewer_camera_mode,
             selected_camera_config,
         )
-        if args.display_mode == "pass-through":
+        if args.display_mode == "pass-through" and args.xr_backend == "vuer":
             logger_mp.warning(
                 "[teleop camera route] display_mode=pass-through does not render robot camera frames in Vuer. "
                 "Use --display-mode=immersive for full ZED view or --display-mode=ego for pass-through plus a camera window."
@@ -1636,7 +1937,10 @@ if __name__ == '__main__':
                     "[teleop camera orientation] selected_camera=left_wrist vertical_flip=True "
                     "but ZMQ is disabled; WebRTC viewer may remain vertically inverted."
                 )
-        xr_need_local_img = args.display_mode != 'pass-through' and viewer_zmq
+        xr_need_local_img = (
+            args.xr_backend == "visionproteleop"
+            or (args.display_mode != 'pass-through' and viewer_zmq)
+        )
         viewer_host_ip = args.viewer_host_ip or _local_ip_for_remote(args.img_server_ip)
         viewer_host_source = "explicit" if args.viewer_host_ip else "route_to_img_server"
         viewer_url = f"https://{viewer_host_ip}:8012/?ws=wss://{viewer_host_ip}:8012"
@@ -1673,7 +1977,7 @@ if __name__ == '__main__':
                     logger_mp.warning(
                         f"[teleop camera shape] camera_name={selected_camera_name} "
                         f"configured_shape={selected_img_shape} sample_shape={actual_img_shape}; "
-                        "keeping configured_shape and resizing composed frames for Vuer."
+                        "keeping configured_shape and resizing composed frames for XR."
                     )
         logger_mp.info(
             f"[teleop camera selected] requested_camera={args.camera} "
@@ -1697,14 +2001,26 @@ if __name__ == '__main__':
             )
         if args.camera == "all":
             logger_mp.warning("[teleop camera selected] --camera=all logs all streams but displays head camera in the current 8012 viewer. Use --viewer-camera head_and_wrist to display head and wrist camera views together.")
-        logger_mp.info(
-            f"[teleop viewer 8012] url={viewer_url} bind=0.0.0.0:8012 "
-            f"host_source={viewer_host_source} "
-            f"display_mode={args.display_mode} requested_camera_mode={args.viewer_camera_mode} "
-            f"selected_camera_mode={viewer_route} selected_camera={selected_camera_name} "
-            f"display_fps={args.viewer_display_fps:.1f} jpeg_quality={args.viewer_jpeg_quality}"
-        )
-        if args.display_mode in ("immersive", "ego"):
+        if args.xr_backend == "visionproteleop":
+            viewer_route = "native_webrtc"
+            logger_mp.info(
+                "[VisionProTeleop video route] native mixed-passthrough plane "
+                "selected_camera=%s size=%sx%s fps=%.1f port=%d",
+                selected_camera_name,
+                selected_img_shape[1],
+                selected_img_shape[0],
+                args.viewer_display_fps,
+                args.visionpro_webrtc_port,
+            )
+        else:
+            logger_mp.info(
+                f"[teleop viewer 8012] url={viewer_url} bind=0.0.0.0:8012 "
+                f"host_source={viewer_host_source} "
+                f"display_mode={args.display_mode} requested_camera_mode={args.viewer_camera_mode} "
+                f"selected_camera_mode={viewer_route} selected_camera={selected_camera_name} "
+                f"display_fps={args.viewer_display_fps:.1f} jpeg_quality={args.viewer_jpeg_quality}"
+            )
+        if args.xr_backend == "vuer" and args.display_mode in ("immersive", "ego"):
             if viewer_webrtc:
                 logger_mp.info(
                     f"[teleop camera route] mode=webrtc url={webrtc_offer_url} "
@@ -1723,36 +2039,196 @@ if __name__ == '__main__':
                 f"zmq={args.img_server_ip}:{selected_zmq_port if viewer_zmq else None}"
             )
 
-        # televuer_wrapper: obtain hand pose data from the XR device and transmit the selected camera image to the XR device.
-        # TeleVuer submodule releases do not all expose the same optional
-        # tuning arguments. Pass the common API plus only options supported by
-        # the installed wrapper, so the pinned v4.0 submodule and newer local
-        # wrappers both work.
-        import inspect
-        tv_wrapper_kwargs = {
-            "use_hand_tracking": args.input_mode == "hand",
-            "binocular": selected_camera_config['binocular'],
-            "img_shape": selected_img_shape,
-            "display_fps": args.viewer_display_fps,
-            "jpeg_quality": args.viewer_jpeg_quality,
-            "display_mode": args.display_mode,
-            "zmq": viewer_zmq,
-            "webrtc": viewer_webrtc,
-            "webrtc_url": webrtc_offer_url,
-            "arm_reference_mode": "head_yaw",
-            "tracking_timeout": args.arm_lost_timeout,
-            "session_timeout": max(2.0, args.arm_lost_timeout * 4.0),
-        }
-        supported_tv_args = set(inspect.signature(TeleVuerWrapper.__init__).parameters) - {"self"}
-        ignored_tv_args = sorted(set(tv_wrapper_kwargs) - supported_tv_args)
-        if ignored_tv_args:
-            logger_mp.warning(
-                "[teleop TeleVuer compatibility] installed wrapper does not support optional args=%s; ignoring them",
-                ignored_tv_args,
+        # XR backend: preserve TeleVuer as the default and import avp_stream
+        # only when the native backend is explicitly selected.
+        if args.xr_backend == "vuer":
+            from televuer import TeleVuerWrapper
+
+            # TeleVuer submodule releases do not all expose the same optional
+            # tuning arguments. Pass only options supported by the installed
+            # wrapper so the pinned and newer local wrappers both work.
+            import inspect
+
+            tv_wrapper_kwargs = {
+                "use_hand_tracking": args.input_mode == "hand",
+                "binocular": selected_camera_config['binocular'],
+                "img_shape": selected_img_shape,
+                "display_fps": args.viewer_display_fps,
+                "jpeg_quality": args.viewer_jpeg_quality,
+                "display_mode": args.display_mode,
+                "zmq": viewer_zmq,
+                "webrtc": viewer_webrtc,
+                "webrtc_url": webrtc_offer_url,
+                "arm_reference_mode": "head_yaw",
+                "tracking_timeout": args.arm_lost_timeout,
+                "session_timeout": max(2.0, args.arm_lost_timeout * 4.0),
+            }
+            supported_tv_args = set(inspect.signature(TeleVuerWrapper.__init__).parameters) - {"self"}
+            ignored_tv_args = sorted(set(tv_wrapper_kwargs) - supported_tv_args)
+            if ignored_tv_args:
+                logger_mp.warning(
+                    "[teleop TeleVuer compatibility] installed wrapper does not support optional args=%s; ignoring them",
+                    ignored_tv_args,
+                )
+            tv_wrapper = TeleVuerWrapper(
+                **{key: value for key, value in tv_wrapper_kwargs.items() if key in supported_tv_args}
             )
-        tv_wrapper = TeleVuerWrapper(
-            **{key: value for key, value in tv_wrapper_kwargs.items() if key in supported_tv_args}
-        )
+        else:
+            from teleop.utils.visionproteleop_backend import (
+                SyntheticVisionProStreamer,
+                VisionProTeleopBackend,
+            )
+
+            synthetic_streamer = (
+                SyntheticVisionProStreamer(fps=max(args.frequency, 30.0))
+                if args.visionpro_synthetic
+                else None
+            )
+            tv_wrapper = VisionProTeleopBackend(
+                "synthetic" if args.visionpro_synthetic else args.visionpro_ip,
+                use_hand_tracking=True,
+                binocular=False,
+                img_shape=selected_img_shape,
+                display_fps=args.viewer_display_fps,
+                tracking_timeout_s=args.visionpro_tracking_timeout,
+                settling_time_s=args.visionpro_settle_time,
+                max_wrist_translation_jump_m=args.visionpro_max_wrist_translation_jump,
+                max_wrist_rotation_jump_rad=np.deg2rad(args.visionpro_max_wrist_rotation_jump_deg),
+                max_wrist_velocity_m_s=args.visionpro_max_wrist_velocity,
+                max_wrist_angular_velocity_rad_s=args.visionpro_max_wrist_angular_velocity,
+                webrtc_port=args.visionpro_webrtc_port,
+                start_video=True,
+                streamer=synthetic_streamer,
+                status_callback=logger_mp.warning,
+            )
+            logger_mp.info(
+                "[VisionProTeleop] backend=native source=%s video=mono_composite size=%sx%s "
+                "record=False port=%d native_isTracked=False",
+                "synthetic" if args.visionpro_synthetic else args.visionpro_ip,
+                selected_img_shape[1],
+                selected_img_shape[0],
+                args.visionpro_webrtc_port,
+            )
+
+        xr_enable_generation_applied = 0
+        xr_ever_enabled = False
+        visionpro_status_last = 0.0
+
+        if native_production_gate:
+            # A production controller constructor opens a motor DDS transport.
+            # Keep every such object nonexistent until a *new* R press occurs
+            # after continuously fresh native tracking has settled.  Rejected R
+            # generations are consumed so recovery can never auto-arm later.
+            xr_enable_generation_applied = XR_ENABLE_GENERATION
+            START = False
+            READY = True
+            prearm_status_last = 0.0
+            logger_mp.warning(
+                "[VisionProTeleop hardware gate] motor controllers are NOT constructed. "
+                "Wait for state=REANCHOR_REQUIRED and settling_complete=True with U released, "
+                "then press R once. Press Q or Ctrl+C to abort without motor cleanup commands."
+            )
+            while not STOP and not native_hardware_armed:
+                prearm_tick = time.monotonic()
+                prearm_data = tv_wrapper.get_tele_data()
+                upper_body_estop = bool(pedal_estop is not None and pedal_estop.active)
+                tv_wrapper.set_hold(
+                    upper_body_estop,
+                    reason="pedal U upper-body hold",
+                )
+
+                enable_generation = XR_ENABLE_GENERATION
+                if enable_generation != xr_enable_generation_applied:
+                    xr_enable_generation_applied = enable_generation
+                    prearm_status = tv_wrapper.get_status()
+                    enable_accepted = False
+                    if upper_body_estop:
+                        reject_reason = "pedal U hold is active"
+                    elif not _native_enable_preconditions_met(
+                        prearm_status,
+                        args.visionpro_tracking_timeout,
+                    ):
+                        reject_reason = (
+                            f"state={prearm_status.get('state')} "
+                            f"session_alive={prearm_status.get('session_alive')} "
+                            f"settling_complete={prearm_status.get('settling_complete')} "
+                            f"sample_age_s={prearm_status.get('sample_age_s')}"
+                        )
+                    else:
+                        enable_accepted = tv_wrapper.request_enable()
+                        reject_reason = "backend rejected enable"
+
+                    if enable_accepted:
+                        prearm_data = tv_wrapper.get_tele_data()
+                        upper_body_estop = bool(
+                            pedal_estop is not None and pedal_estop.active
+                        )
+                        if upper_body_estop:
+                            tv_wrapper.set_hold(
+                                True,
+                                reason="pedal U engaged during hardware enable",
+                            )
+                            reject_reason = "pedal U engaged during enable"
+                        elif _native_tracking_output_is_active(prearm_data):
+                            native_hardware_armed = True
+                            xr_ever_enabled = True
+                            START = True
+                            logger_mp.warning(
+                                "[VisionProTeleop hardware gate] R accepted after fresh settled "
+                                "tracking; AI Worker arm/HX5 controller construction is now permitted."
+                            )
+                        else:
+                            tv_wrapper.request_hold(
+                                "post-enable tracking validation failed"
+                            )
+                            reject_reason = "post-enable TeleData validity check failed"
+
+                    if not native_hardware_armed:
+                        START = False
+                        logger_mp.warning(
+                            "[VisionProTeleop hardware gate] R rejected and consumed (%s). "
+                            "Resolve the condition, wait for settling_complete=True, then press R again.",
+                            reject_reason,
+                        )
+
+                prearm_bgr, prearm_head, prearm_left, prearm_right = (
+                    _get_head_and_wrist_bgr(img_client, args)
+                )
+                if prearm_bgr is not None:
+                    prearm_bgr = _fit_bgr_to_shape(prearm_bgr, selected_img_shape)
+                    _safe_render_to_xr(
+                        tv_wrapper,
+                        prearm_bgr,
+                        "[VisionProTeleop hardware gate camera]",
+                    )
+
+                if prearm_tick - prearm_status_last >= 1.0:
+                    prearm_status_last = prearm_tick
+                    prearm_status = tv_wrapper.get_status()
+                    logger_mp.info(
+                        "[VisionProTeleop hardware gate] state=%s session_alive=%s "
+                        "settling_complete=%s fresh_ms=%s U_hold=%s motor_controllers=absent "
+                        "camera=(head=%s,left=%s,right=%s)",
+                        prearm_status.get("state"),
+                        prearm_status.get("session_alive"),
+                        prearm_status.get("settling_complete"),
+                        (
+                            "inf"
+                            if not np.isfinite(
+                                prearm_status.get("sample_age_s", np.inf)
+                            )
+                            else f"{prearm_status.get('sample_age_s') * 1000.0:.1f}"
+                        ),
+                        upper_body_estop,
+                        _frame_debug(prearm_head),
+                        _frame_debug(prearm_left),
+                        _frame_debug(prearm_right),
+                    )
+                if not native_hardware_armed:
+                    time.sleep(0.02)
+
+            if not native_hardware_armed:
+                raise KeyboardInterrupt
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.arm == "AI_WORKER":
@@ -1824,11 +2300,33 @@ if __name__ == '__main__':
                 args.ai_worker_ik_mode,
                 arm_ik_class.__name__,
             )
-            arm_ctrl = AIWorkerArmController(
-                command_duration=args.ai_worker_command_duration,
-                home_q=arm_ik.home_q,
-                ready_q=arm_ik.ready_q,
-            )
+            if args.command_sink:
+                from teleop.utils.ai_worker_command_sink import AIWorkerArmCommandSink
+
+                arm_ctrl = AIWorkerArmCommandSink(
+                    command_duration=args.ai_worker_command_duration,
+                    home_q=arm_ik.home_q,
+                    ready_q=arm_ik.ready_q,
+                    report_interval=(
+                        1.0 / args.command_sink_log_rate
+                        if args.command_sink_log_rate > 0.0
+                        else 0.0
+                    ),
+                    reporter=logger_mp.info,
+                )
+                logger_mp.warning(
+                    "[command sink] AI Worker arm targets are memory-only; no motor DDS transport was created."
+                )
+            else:
+                if native_production_gate and not native_hardware_armed:
+                    raise RuntimeError(
+                        "VisionProTeleop hardware gate invariant failed before AI Worker arm construction."
+                    )
+                arm_ctrl = AIWorkerArmController(
+                    command_duration=args.ai_worker_command_duration,
+                    home_q=arm_ik.home_q,
+                    ready_q=arm_ik.ready_q,
+                )
             if not arm_ctrl.wait_for_joint_state(timeout=5.0):
                 raise RuntimeError(
                     "AI Worker did not receive all 14 arm joints on /joint_states within 5 seconds; "
@@ -2022,7 +2520,23 @@ if __name__ == '__main__':
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', HX5_D20_NUM_JOINTS * 2, lock=False)
             dual_hand_action_array = Array('d', HX5_D20_NUM_JOINTS * 2, lock=False)
-            hand_ctrl = HX5D20Controller(
+            hx5_controller_class = HX5D20Controller
+            hx5_extra_kwargs = {}
+            if args.command_sink:
+                from teleop.utils.ai_worker_command_sink import HX5D20CommandSink
+
+                hx5_controller_class = HX5D20CommandSink
+                hx5_extra_kwargs["report_interval"] = (
+                    1.0 / args.command_sink_log_rate
+                    if args.command_sink_log_rate > 0.0
+                    else 0.0
+                )
+                hx5_extra_kwargs["reporter"] = logger_mp.info
+            elif native_production_gate and not native_hardware_armed:
+                raise RuntimeError(
+                    "VisionProTeleop hardware gate invariant failed before HX5 construction."
+                )
+            hand_ctrl = hx5_controller_class(
                 left_hand_pos_array,
                 right_hand_pos_array,
                 dual_hand_data_lock,
@@ -2037,7 +2551,18 @@ if __name__ == '__main__':
                 retarget_mode=args.hx5_d20_retarget_mode,
                 left_hand_scale=args.hx5_d20_left_hand_scale,
                 right_hand_scale=args.hx5_d20_right_hand_scale,
+                **hx5_extra_kwargs,
             )
+            if args.xr_backend == "visionproteleop":
+                _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
+                logger_mp.warning(
+                    "[VisionProTeleop safety] HX5 publish worker starts paused; "
+                    "an accepted fresh R enable is required before tracking commands."
+                )
+            if args.command_sink:
+                logger_mp.warning(
+                    "[command sink] HX5 targets are memory-only; no motor DDS transport was created."
+                )
         else:
             pass
 
@@ -2149,7 +2674,25 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
+            if camera_config['head_camera']['binocular']:
+                recording_color_keys = {
+                    "color_0": "head_left",
+                    "color_1": "head_right",
+                }
+                if camera_config['left_wrist_camera']['enable_zmq']:
+                    recording_color_keys["color_2"] = "left_wrist"
+                if camera_config['right_wrist_camera']['enable_zmq']:
+                    recording_color_keys["color_3"] = "right_wrist"
+            else:
+                recording_color_keys = {"color_0": "head"}
+                if camera_config['left_wrist_camera']['enable_zmq']:
+                    recording_color_keys["color_1"] = "left_wrist"
+                if camera_config['right_wrist_camera']['enable_zmq']:
+                    recording_color_keys["color_2"] = "right_wrist"
             recording_metadata = {
+                "schema_extensions": {
+                    "timestamps": "per-frame host/source nanoseconds; absent in older episodes",
+                },
                 "robot": {
                     "arm": args.arm,
                     "end_effector": args.ee,
@@ -2165,11 +2708,17 @@ if __name__ == '__main__':
                     "display_mode": args.display_mode,
                     "viewer_camera_mode": args.viewer_camera_mode,
                     "server_ip": args.img_server_ip,
+                    "color_keys": recording_color_keys,
                 },
                 "control": {
                     "frequency": args.frequency,
                     "network_interface": args.network_interface,
                     "motion": args.motion,
+                },
+                "synchronization": {
+                    "policy": "latest_sample_at_control_tick",
+                    "clock": "host time.time_ns unless a DDS source_time_ns is present",
+                    "hardware_synchronized": False,
                 },
                 "body_state": {
                     "enabled": args.record_body_state,
@@ -2219,6 +2768,28 @@ if __name__ == '__main__':
                     "feedback_port": args.neck_feedback_port,
                 },
             }
+            if args.arm == "AI_WORKER":
+                for irrelevant_key in ("rh56f1_tactile", "inspire_dg2", "rh5dg2_tactile_udp"):
+                    recording_metadata.pop(irrelevant_key, None)
+                recording_metadata["robot"].pop("rh56f1_retarget_mode", None)
+                recording_metadata["neck"] = {
+                    "enabled": args.enable_neck,
+                    "transport": "robotis_dds",
+                    "joint_names": ["head_joint1", "head_joint2"],
+                }
+                recording_metadata["ai_worker"] = {
+                    "dds_domain_id": args.ai_worker_ros_domain_id,
+                    "image_source": image_source,
+                    "camera_topics": {
+                        "head": "/zed/zed_node/left/image_rect_color/compressed",
+                        "left_wrist": "/camera_left/camera_left/color/image_rect_raw/compressed",
+                        "right_wrist": "/camera_right/camera_right/color/image_rect_raw/compressed",
+                    } if image_source == "robotis_dds" else None,
+                    "arm_joint_count_per_side": 7,
+                    "hand_joint_count_per_side": 20 if args.ee == "hx5_d20" else 0,
+                    "lift_control": "external_pedal_o_p",
+                    "software_estop": f"udp://{args.pedal_estop_host}:{args.pedal_estop_port}",
+                }
             if args.enable_audio:
                 recording_metadata["continuous_audio"] = {
                     "enabled": True,
@@ -2272,6 +2843,42 @@ if __name__ == '__main__':
         logger_mp.info(f"[teleop ready state] READY={READY} START={START} STOP={STOP} disable_arm={args.disable_arm}")
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
+            if args.xr_backend == "visionproteleop":
+                # Keep packet freshness and settling diagnostics alive while the
+                # operator checks the native passthrough/video plane before R.
+                tv_wrapper.get_tele_data()
+                prestart_now = time.monotonic()
+                prestart_status_interval = (
+                    1.0 / args.visionpro_status_rate
+                    if args.visionpro_status_rate > 0.0
+                    else None
+                )
+                if (
+                    prestart_status_interval is not None
+                    and prestart_now - visionpro_status_last
+                    >= prestart_status_interval
+                ):
+                    visionpro_status_last = prestart_now
+                    prestart_status = tv_wrapper.get_status()
+                    logger_mp.info(
+                        "[VisionProTeleop prestart] state=%s session_alive=%s "
+                        "settling_complete=%s tracking_hz=%.2f fresh_ms=%s "
+                        "motor_output=%s",
+                        prestart_status.get("state"),
+                        prestart_status.get("session_alive"),
+                        prestart_status.get("settling_complete"),
+                        float(prestart_status.get("tracking_rate_hz", 0.0)),
+                        (
+                            "inf"
+                            if not np.isfinite(
+                                prestart_status.get("sample_age_s", np.inf)
+                            )
+                            else f"{prestart_status.get('sample_age_s') * 1000.0:.1f}"
+                        ),
+                        "DDS-free command sink"
+                        if args.command_sink
+                        else "hardware gate",
+                    )
             if selected_camera_config.get('enable_zmq') and xr_need_local_img:
                 if selected_camera_name == "head_and_wrist":
                     prestart_bgr, head_prestart_img, left_prestart_img, right_prestart_img = _get_head_and_wrist_bgr(img_client, args)
@@ -2292,6 +2899,28 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         logger_mp.info(f"[teleop ready state] READY={READY} START={START} STOP={STOP} disable_arm={args.disable_arm}")
+        native_start_tracking_ready = True
+        if args.xr_backend == "visionproteleop":
+            startup_data = tv_wrapper.get_tele_data()
+            upper_body_estop = bool(pedal_estop is not None and pedal_estop.active)
+            tv_wrapper.set_hold(
+                upper_body_estop,
+                reason="pedal U upper-body hold",
+            )
+            startup_data = tv_wrapper.get_tele_data()
+            native_start_tracking_ready = bool(
+                not upper_body_estop
+                and _native_tracking_output_is_active(startup_data)
+            )
+            if native_start_tracking_ready:
+                _safe_enter_hand_auto(hand_ctrl)
+            else:
+                _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
+                _safe_sync_arm_hold_to_measured(arm_ctrl)
+                logger_mp.warning(
+                    "[VisionProTeleop startup] tracking is no longer active after R; "
+                    "startup command seed is inhibited and a new settled R is required."
+                )
         if args.disable_arm:
             logger_mp.warning("[teleop arm disabled reason] --disable-arm set; IK/control publish will be skipped.")
         else:
@@ -2299,12 +2928,23 @@ if __name__ == '__main__':
             # Seed the arm target with the current (ready) pose so START eases up from
             # where the arms already are, instead of the arms first snapping toward the
             # zeros/home target and dropping "as if torque off" before rising to the IK pose.
-            try:
-                _seed_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
-                if _seed_q.size and np.isfinite(_seed_q).all():
-                    arm_ctrl.ctrl_dual_arm(_seed_q, np.zeros_like(_seed_q))
-            except Exception as _seed_exc:
-                logger_mp.debug("[teleop arm startup] q_target seed skipped: %s", _seed_exc)
+            if native_start_tracking_ready:
+                try:
+                    _seed_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64).reshape(-1)
+                    if _seed_q.size and np.isfinite(_seed_q).all():
+                        seed_sync_ok = bool(
+                            args.xr_backend != "visionproteleop"
+                            or _safe_sync_arm_hold_to_measured(arm_ctrl)
+                        )
+                        if seed_sync_ok:
+                            arm_ctrl.ctrl_dual_arm(_seed_q, np.zeros_like(_seed_q))
+                        else:
+                            logger_mp.error(
+                                "[VisionProTeleop startup] q_target seed inhibited because "
+                                "the velocity limiter could not sync to measured pose."
+                            )
+                except Exception as _seed_exc:
+                    logger_mp.debug("[teleop arm startup] q_target seed skipped: %s", _seed_exc)
             logger_mp.info(
                 f"[teleop arm startup safety] reset wrist base at START; "
                 f"startup_duration={args.arm_startup_duration:.3f}s "
@@ -2350,10 +2990,23 @@ if __name__ == '__main__':
         neck_log_interval = 1.0 / args.neck_log_rate if args.neck_log_rate > 0 else None
         lift_log_last_ts = 0.0
         lift_log_interval = 1.0 / args.lift_log_rate if args.lift_log_rate > 0 else None
+        command_sink_deadline = (
+            time.monotonic() + args.command_sink_duration
+            if auto_command_sink
+            else None
+        )
         while not STOP:
             loop_count += 1
             start_time = time.time()
+            if command_sink_deadline is not None and time.monotonic() >= command_sink_deadline:
+                logger_mp.info(
+                    "[command sink] deterministic diagnostic duration reached; shutting down cleanly."
+                )
+                STOP = True
+                continue
+            control_tick_time_ns = time.time_ns()
             neck_record = None
+            arm_command_time_ns = None
             left_wrist_bgr = None
             right_wrist_bgr = None
             # get image ( --loop also needs frames every tick, independent of record )
@@ -2518,6 +3171,126 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            tracking_sample_time_ns = time.time_ns()
+            pedal_estop_active = bool(pedal_estop is not None and pedal_estop.active)
+            if pedal_estop_active != upper_body_estop:
+                upper_body_estop = pedal_estop_active
+                arm_sensitivity_state.clear()
+                if upper_body_estop:
+                    _safe_sync_arm_hold_to_measured(arm_ctrl)
+                    _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
+                else:
+                    if arm_ik is not None and hasattr(arm_ik, "reset_anchor"):
+                        arm_ik.reset_anchor()
+                    tracking_start_time = time.time()
+                logger_mp.warning(
+                    "[teleop pedal E-stop] %s: upper body %s current pose%s",
+                    "ENGAGED" if upper_body_estop else "RELEASED",
+                    "holding" if upper_body_estop else "anchored at",
+                    (
+                        "; press R after tracking settles to resume"
+                        if not upper_body_estop and args.xr_backend == "visionproteleop"
+                        else ""
+                    ),
+                )
+            if args.xr_backend == "visionproteleop":
+                tv_wrapper.set_hold(
+                    upper_body_estop,
+                    reason="pedal U upper-body hold",
+                )
+                enable_generation = XR_ENABLE_GENERATION
+                if enable_generation != xr_enable_generation_applied:
+                    native_status = tv_wrapper.get_status()
+                    enable_accepted = False
+                    if auto_command_sink:
+                        # The bounded synthetic route has no actuators and may
+                        # latch its generated startup R while deterministic
+                        # packets complete settling.
+                        enable_accepted = tv_wrapper.request_enable()
+                    else:
+                        # A live R is single-use.  Do not call request_enable()
+                        # early because the backend supports a latching API for
+                        # offline tests; live recovery always requires a new R.
+                        xr_enable_generation_applied = enable_generation
+                        if (
+                            not upper_body_estop
+                            and _native_enable_preconditions_met(
+                                native_status,
+                                args.visionpro_tracking_timeout,
+                            )
+                        ):
+                            enable_accepted = tv_wrapper.request_enable()
+                    if enable_accepted:
+                        xr_enable_generation_applied = enable_generation
+                        xr_ever_enabled = True
+                        arm_sensitivity_state.clear()
+                        if arm_ik is not None and hasattr(arm_ik, "reset_anchor"):
+                            arm_ik.reset_anchor()
+                        tracking_start_time = time.time()
+                        _safe_enter_hand_auto(hand_ctrl)
+                        logger_mp.warning(
+                            "[VisionProTeleop] operator R enable accepted; IK anchor reset."
+                        )
+                    elif not auto_command_sink:
+                        logger_mp.warning(
+                            "[VisionProTeleop] operator R enable rejected and consumed; "
+                            "state=%s session_alive=%s settling_complete=%s U_hold=%s. "
+                            "Wait for fresh settled tracking, then press R again.",
+                            native_status.get("state"),
+                            native_status.get("session_alive"),
+                            native_status.get("settling_complete"),
+                            upper_body_estop,
+                        )
+                # Re-read annotations after a hold or accepted enable so no
+                # previous TRACKING_OK sample can leak through for one tick.
+                tele_data = tv_wrapper.get_tele_data()
+                now_monotonic = time.monotonic()
+                status_interval = (
+                    1.0 / args.visionpro_status_rate
+                    if args.visionpro_status_rate > 0.0
+                    else None
+                )
+                if (
+                    status_interval is not None
+                    and now_monotonic - visionpro_status_last >= status_interval
+                ):
+                    visionpro_status_last = now_monotonic
+                    native_status = tv_wrapper.get_status()
+                    logger_mp.info(
+                        "[VisionProTeleop status] state=%s fresh_ms=%s tracking_hz=%.2f "
+                        "video_input_hz=%.2f video_callback_hz=%.2f invalid=%d rejected_jump=%d "
+                        "head_xyz_m=%s head_yaw_rad=%.3f wrist_xyz_m=(L%s,R%s) "
+                        "hand_joints=(L%d,R%d) hand_nonzero=(L%d,R%d) "
+                        "pinch_cm=(L%.2f,R%.2f) settling_complete=%s "
+                        "startup_pending=%s startup_error=%s "
+                        "native_isTracked=%s reason=%s",
+                        native_status.get("state"),
+                        (
+                            "inf"
+                            if not np.isfinite(native_status.get("sample_age_s", np.inf))
+                            else f"{native_status.get('sample_age_s') * 1000.0:.1f}"
+                        ),
+                        float(native_status.get("tracking_rate_hz", 0.0)),
+                        float(native_status.get("video_input_rate_hz", 0.0)),
+                        float(native_status.get("video_callback_rate_hz", 0.0)),
+                        int(native_status.get("invalid_packet_count", 0)),
+                        int(native_status.get("rejected_jump_count", 0)),
+                        np.round(native_status.get("head_position_m", np.zeros(3)), 3).tolist(),
+                        float(native_status.get("head_yaw_rad", 0.0)),
+                        np.round(native_status.get("left_wrist_position_m", np.zeros(3)), 3).tolist(),
+                        np.round(native_status.get("right_wrist_position_m", np.zeros(3)), 3).tolist(),
+                        int(native_status.get("left_hand_joint_count", 0)),
+                        int(native_status.get("right_hand_joint_count", 0)),
+                        int(native_status.get("left_hand_nonzero_points", 0)),
+                        int(native_status.get("right_hand_nonzero_points", 0)),
+                        float(native_status.get("left_pinch_distance_cm", 0.0)),
+                        float(native_status.get("right_pinch_distance_cm", 0.0)),
+                        native_status.get("settling_complete"),
+                        native_status.get("startup_pending"),
+                        native_status.get("startup_error"),
+                        native_status.get("native_tracking_status_available", False),
+                        native_status.get("reason"),
+                    )
             arm_tracking_ready = bool(
                 getattr(tele_data, "tracking_active", True)
                 and getattr(tele_data, "head_pose_is_valid", True)
@@ -2525,6 +3298,19 @@ if __name__ == '__main__':
                 and getattr(tele_data, "right_arm_is_valid", True)
             )
             raw_arm_tracking_ready = arm_tracking_ready
+            if args.xr_backend == "visionproteleop" and (
+                upper_body_estop or not raw_arm_tracking_ready
+            ):
+                # HX5 publishes from its own worker thread, so pause it as soon
+                # as native validity drops rather than waiting for the generic
+                # arm-loss confirmation timer.
+                _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
+            if pedal_safety is not None:
+                pedal_safety.publish(
+                    raw_arm_tracking_ready
+                    and not upper_body_estop
+                    and not args.command_sink
+                )
             lift_tracking_ready = bool(
                 getattr(tele_data, "tracking_active", True)
                 and getattr(tele_data, "head_pose_is_valid", True)
@@ -2560,7 +3346,7 @@ if __name__ == '__main__':
                         arm_last_good_left_pose = None
                         arm_last_good_right_pose = None
                         arm_sensitivity_state.clear()
-                        _safe_enter_hand_standby_open(hand_ctrl)
+                        _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
                         logger_mp.warning(
                             "[teleop arm tracking fsm] Tracking lost -> STANDBY "
                             "head_valid=%s left_arm_valid=%s right_arm_valid=%s",
@@ -2569,7 +3355,7 @@ if __name__ == '__main__':
                             getattr(tele_data, "right_arm_is_valid", None),
                         )
                 arm_tracking_ready = raw_arm_tracking_ready and arm_fsm == "ACTIVE"
-            if lift_ctrl is not None and lift_tracking_ready:
+            if lift_ctrl is not None and lift_tracking_ready and not upper_body_estop:
                 try:
                     lift_command, lift_target, head_z, lift_delta_z = lift_ctrl.update(
                         tele_data.head_pose
@@ -2604,7 +3390,7 @@ if __name__ == '__main__':
                 except Exception as exc:
                     if loop_count % 30 == 0:
                         logger_mp.warning("[RH5DG2 tactile VR overlay] update skipped: %s", exc)
-            if neck_ctrl is not None and getattr(tele_data, "head_pose_is_valid", True):
+            if neck_ctrl is not None and not upper_body_estop and getattr(tele_data, "head_pose_is_valid", True):
                 try:
                     neck_measured = neck_ctrl._extract_yaw_pitch(tele_data.head_pose)
                     neck_command, neck_target = neck_ctrl.update(tele_data.head_pose)
@@ -2711,7 +3497,7 @@ if __name__ == '__main__':
                 right_wrist_pose,
                 arm_sensitivity_state,
                 arm_sensitivity_config,
-                enabled=not args.disable_arm and arm_tracking_ready,
+                enabled=not args.disable_arm and arm_tracking_ready and not upper_body_estop,
             )
             if loop_count % 50 == 0:
                 logger_mp.debug(
@@ -2771,7 +3557,7 @@ if __name__ == '__main__':
                         f"right_valid_points={hand_status['right_valid_points']}"
                     )
                 hand_tracking_ready = hand_status["hand_tracking_ready"] and raw_arm_tracking_ready
-                if hand_tracking_ready:
+                if hand_tracking_ready and not upper_body_estop:
                     with left_hand_pos_array.get_lock():
                         left_hand_pos_array[:] = left_hand_pos.flatten()
                         left_shared_debug = np.array(left_hand_pos_array[:]).reshape(25, 3).copy() if should_hand_debug else None
@@ -2781,10 +3567,10 @@ if __name__ == '__main__':
                     if args.ee in ("rh5dg2_dfx", "rh5dg2_ftp"):
                         with hand_input_timestamp.get_lock():
                             hand_input_timestamp.value = now
-                else:
+                elif not upper_body_estop:
                     left_shared_debug = None
                     right_shared_debug = None
-                    _safe_enter_hand_standby_open(hand_ctrl)
+                    _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
                     if loop_count % 10 == 0:
                         logger_mp.warning(
                             "[teleop hand tracking hold] skipped invalid hand frame "
@@ -2792,6 +3578,9 @@ if __name__ == '__main__':
                             raw_arm_tracking_ready,
                             hand_status["hand_tracking_ready"],
                         )
+                else:
+                    left_shared_debug = None
+                    right_shared_debug = None
                 if should_hand_debug:
                     logger_mp.info(
                         f"[teleop hand input after write] ee={args.ee} "
@@ -2836,6 +3625,24 @@ if __name__ == '__main__':
             else:
                 current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
                 current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+            robot_state_time_ns = time.time_ns()
+
+            native_arm_hold = bool(
+                args.xr_backend == "visionproteleop"
+                and arm_ctrl is not None
+                and (
+                    upper_body_estop
+                    or arm_fsm == "STANDBY"
+                    or not arm_tracking_ready
+                )
+            )
+            native_arm_hold_sync_ok = True
+            if native_arm_hold:
+                # AIWorkerArmController velocity-limits from its previous
+                # command.  Re-anchor that limiter before the measured-pose
+                # hold so U/stale cannot continue converging toward an old IK
+                # target for several ticks.
+                native_arm_hold_sync_ok = _safe_sync_arm_hold_to_measured(arm_ctrl)
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             if args.disable_arm or arm_ctrl is None:
@@ -2846,6 +3653,9 @@ if __name__ == '__main__':
                         f"[teleop arm disabled reason] loop={loop_count} reason=--disable-arm "
                         f"current_q={_fmt_vec_debug(current_lr_arm_q)}"
                     )
+            elif upper_body_estop:
+                sol_q = np.asarray(current_lr_arm_q, dtype=np.float64).copy()
+                sol_tauff = np.zeros_like(sol_q)
             elif arm_fsm == "STANDBY":
                 if args.arm_standby_action == "ready":
                     controller_home = getattr(arm_ctrl, "home_q", None)
@@ -2928,19 +3738,30 @@ if __name__ == '__main__':
             #    STOP = True
             #    continue 
             # ---------------------------------------------------
-            if not args.disable_arm and arm_ctrl is not None:
+            if (
+                not args.disable_arm
+                and arm_ctrl is not None
+                and (not native_arm_hold or native_arm_hold_sync_ok)
+            ):
                 if loop_count % 50 == 0:
                     logger_mp.debug(
                         f"[teleop arm publish enter] controller={arm_ctrl.__class__.__name__} "
                         f"sim={args.sim} target={_fmt_vec_debug(sol_q)}"
                     )
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                arm_command_time_ns = time.time_ns()
                 if loop_count % 50 == 0:
                     arm_write_ok = arm_ctrl.get_last_write_ok() if hasattr(arm_ctrl, "get_last_write_ok") else None
                     logger_mp.debug(
                         f"[teleop arm publish] controller={arm_ctrl.__class__.__name__} "
                         f"sim={args.sim} write_ok={arm_write_ok} topic={getattr(arm_ctrl, 'command_topic_description', 'rt/lowcmd')} "
                         f"target={_fmt_vec_debug(sol_q)} tauff={_fmt_vec_debug(sol_tauff)}"
+                    )
+            elif native_arm_hold and not native_arm_hold_sync_ok:
+                if loop_count % 10 == 0:
+                    logger_mp.error(
+                        "[VisionProTeleop arm hold] command publish inhibited because "
+                        "the velocity limiter could not sync to measured pose."
                     )
 
             # stream robot state to Config Loop (non-blocking; never breaks teleop)
@@ -3051,6 +3872,18 @@ if __name__ == '__main__':
                 left_arm_action = sol_q[:7]
                 right_arm_action = sol_q[-7:]
                 if RECORD_RUNNING:
+                    camera_timestamps = (
+                        img_client.get_frame_timestamps()
+                        if hasattr(img_client, "get_frame_timestamps")
+                        else None
+                    )
+                    timestamps = {
+                        "control_tick_time_ns": control_tick_time_ns,
+                        "tracking_sample_time_ns": tracking_sample_time_ns,
+                        "robot_state_time_ns": robot_state_time_ns,
+                        "arm_command_time_ns": arm_command_time_ns,
+                        "camera": camera_timestamps,
+                    }
                     colors = {}
                     depths = {}
                     if camera_config['head_camera']['binocular']:
@@ -3088,12 +3921,12 @@ if __name__ == '__main__':
                     states = {
                         "left_arm": {                                                                    
                             "qpos":   left_arm_state.tolist(),    # numpy.array -> list
-                            "qvel":   [],                          
+                            "qvel":   np.asarray(current_lr_arm_dq[:7]).tolist(),
                             "torque": [],                        
                         }, 
                         "right_arm": {                                                                    
                             "qpos":   right_arm_state.tolist(),       
-                            "qvel":   [],                          
+                            "qvel":   np.asarray(current_lr_arm_dq[-7:]).tolist(),
                             "torque": [],                         
                         },                        
                         "left_ee": {                                                                    
@@ -3162,9 +3995,9 @@ if __name__ == '__main__':
                         audios = audio_udp_receiver.read_latest()
                     if args.sim and sim_state_subscriber is not None:
                         sim_state = sim_state_subscriber.read_data()            
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, tactiles=tactiles, audios=audios, sim_state=sim_state)
+                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, tactiles=tactiles, audios=audios, sim_state=sim_state, timestamps=timestamps)
                     else:
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, tactiles=tactiles, audios=audios)
+                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, tactiles=tactiles, audios=audios, timestamps=timestamps)
 
             current_time = time.time()
             time_elapsed = current_time - start_time
@@ -3177,7 +4010,17 @@ if __name__ == '__main__':
     except Exception:
         import traceback
         logger_mp.error(traceback.format_exc())
+        exit_code = 1
     finally:
+        native_no_motion_hx5 = bool(
+            args.xr_backend == "visionproteleop"
+            and not args.command_sink
+            and args.ee == "hx5_d20"
+        )
+        if native_no_motion_hx5:
+            # Stop new HX5 iterations before recorder/audio cleanup can block.
+            _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
+
         try:
             if episode_audio_recorder is not None and recorder is not None:
                 _stop_episode_audio(episode_audio_recorder, recorder)
@@ -3212,6 +4055,19 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close lift controller: {e}")
 
         try:
+            if pedal_estop is not None:
+                pedal_estop.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close pedal E-stop receiver: {e}")
+
+        try:
+            if pedal_safety is not None:
+                pedal_safety.publish(False)
+                pedal_safety.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close pedal safety notifier: {e}")
+
+        try:
             if rh56f1_tactile_reader is not None:
                 rh56f1_tactile_reader.stop()
         except Exception as e:
@@ -3229,17 +4085,21 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to stop audio UDP receiver: {e}")
 
-        try:
-            if hand_ctrl is not None and hasattr(hand_ctrl, "stop"):
-                hand_ctrl.stop()
-        except Exception as e:
-            logger_mp.error(f"Failed to stop hand controller: {e}")
+        if native_no_motion_hx5:
+            if not _safe_stop_hx5_without_motion(hand_ctrl):
+                exit_code = 1
+        else:
+            try:
+                if hand_ctrl is not None and hasattr(hand_ctrl, "stop"):
+                    hand_ctrl.stop()
+            except Exception as e:
+                logger_mp.error(f"Failed to stop hand controller: {e}")
 
-        try:
-            if hand_ctrl is not None and hasattr(hand_ctrl, "restore_initial_pose"):
-                hand_ctrl.restore_initial_pose()
-        except Exception as e:
-            logger_mp.error(f"Failed to restore RH5DG2 initial hand pose: {e}")
+            try:
+                if hand_ctrl is not None and hasattr(hand_ctrl, "restore_initial_pose"):
+                    hand_ctrl.restore_initial_pose()
+            except Exception as e:
+                logger_mp.error(f"Failed to restore RH5DG2 initial hand pose: {e}")
 
         try:
             if args.skip_arm_go_home_on_exit:
@@ -3273,9 +4133,11 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close arm controller: {e}")
         
         try:
-            if args.ipc:
+            if auto_command_sink:
+                pass
+            elif args.ipc:
                 ipc_server.stop()
-            else:
+            elif listen_keyboard_thread is not None:
                 stop_listening()
                 listen_keyboard_thread.join(timeout=1.0)
         except Exception as e:
@@ -3326,4 +4188,4 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to close screen recorder: {e}")
         logger_mp.info("✅ Finally, exiting program.")
-        exit(0)
+        raise SystemExit(exit_code)

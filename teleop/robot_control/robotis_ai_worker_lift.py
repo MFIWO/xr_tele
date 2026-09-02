@@ -1,4 +1,4 @@
-"""Vision Pro height tracking for the AI Worker lift joint."""
+"""Bounded position control for the AI Worker lift joint."""
 
 import threading
 
@@ -58,6 +58,36 @@ class AIWorkerLiftController:
         self._neutral_head_z = None
         self._neutral_lift_position = None
         self._command = None
+
+    def hold(self):
+        """Hold the last commanded (or currently measured) lift position."""
+        if self._measured_position is None:
+            raise RuntimeError("lift_joint state has not been received")
+        if self._command is None:
+            self._command = float(np.clip(self._measured_position, self.LOWER, self.UPPER))
+        self.transport.publish(
+            "lift", (self.JOINT,), (self._command,), self.command_duration
+        )
+        return self._command
+
+    def nudge(self, direction, distance):
+        """Move the lift by a signed bounded increment and publish the new target."""
+        if direction not in (-1, 0, 1):
+            raise ValueError("direction must be -1, 0, or 1")
+        distance = float(distance)
+        if not np.isfinite(distance) or distance < 0.0:
+            raise ValueError("distance must be finite and zero or greater")
+        if self._measured_position is None:
+            raise RuntimeError("lift_joint state has not been received")
+        if self._command is None:
+            self._command = float(np.clip(self._measured_position, self.LOWER, self.UPPER))
+        self._command = float(
+            np.clip(self._command + int(direction) * distance, self.LOWER, self.UPPER)
+        )
+        self.transport.publish(
+            "lift", (self.JOINT,), (self._command,), self.command_duration
+        )
+        return self._command
 
     def update(self, head_pose):
         if self._measured_position is None:

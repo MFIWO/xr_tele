@@ -191,7 +191,7 @@ class EpisodeWriter():
             self.rerun_logger.log_status("episode_active", 1.0)
         return True  # Return True if the episode is successfully created
         
-    def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
+    def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None, timestamps=None):
         # Increment the item ID
         self.item_id += 1
         # Create the item data dictionary
@@ -205,6 +205,8 @@ class EpisodeWriter():
             'audios': audios,
             'sim_state': sim_state,
         }
+        if timestamps is not None:
+            item_data['timestamps'] = timestamps
         # Enqueue the item data
         self.item_data_queue.put(item_data)
 
