@@ -628,7 +628,7 @@ class VisionProTeleopBackendTests(unittest.TestCase):
         self.streamer.latest = copy.deepcopy(packet)
         backend.get_tele_data()
 
-        ready_messages = [message for message in self.logs if "press R once" in message]
+        ready_messages = [message for message in self.logs if "ready to enable" in message]
         self.assertEqual(len(ready_messages), 1)
 
     def test_reconnect_requires_a_new_explicit_enable(self):

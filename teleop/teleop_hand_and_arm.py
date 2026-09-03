@@ -1273,6 +1273,23 @@ def _native_enable_preconditions_met(status, tracking_timeout_s):
         and 0.0 <= sample_age_s <= timeout_s
     )
 
+
+def _request_native_enable_if_ready(tv_wrapper, tracking_timeout_s):
+    """Auto-enable a previously armed native session once tracking is safe."""
+    status = tv_wrapper.get_status()
+    if not _native_enable_preconditions_met(status, tracking_timeout_s):
+        return False
+    return bool(tv_wrapper.request_enable())
+
+
+def _native_u_pause_can_auto_resume(xr_backend, xr_ever_enabled, tele_data):
+    """Only a U pause entered from active native teleop may auto-resume."""
+    return bool(
+        xr_backend == "visionproteleop"
+        and xr_ever_enabled
+        and _native_tracking_output_is_active(tele_data)
+    )
+
 def _apply_pose_jump_filter(left_pose, right_pose, last_left, last_right, max_frame_jump):
     left = np.asarray(left_pose, dtype=np.float64).copy()
     right = np.asarray(right_pose, dtype=np.float64).copy()
@@ -2298,6 +2315,8 @@ if __name__ == '__main__':
 
         xr_enable_generation_applied = 0
         xr_ever_enabled = False
+        native_u_auto_resume_eligible = False
+        native_u_auto_resume_pending = False
         visionpro_status_last = 0.0
         operator_instructions_logged = False
 
@@ -3440,9 +3459,17 @@ if __name__ == '__main__':
                 upper_body_estop = pedal_estop_active
                 arm_sensitivity_state.clear()
                 if upper_body_estop:
+                    native_u_auto_resume_eligible = _native_u_pause_can_auto_resume(
+                        args.xr_backend,
+                        xr_ever_enabled,
+                        tele_data,
+                    )
+                    native_u_auto_resume_pending = False
                     _safe_sync_arm_hold_to_measured(arm_ctrl)
                     _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
                 else:
+                    native_u_auto_resume_pending = native_u_auto_resume_eligible
+                    native_u_auto_resume_eligible = False
                     if arm_ik is not None and hasattr(arm_ik, "reset_anchor"):
                         arm_ik.reset_anchor()
                     tracking_start_time = time.time()
@@ -3451,8 +3478,8 @@ if __name__ == '__main__':
                     "ENGAGED" if upper_body_estop else "RELEASED",
                     "holding" if upper_body_estop else "anchored at",
                     (
-                        "; press R after tracking settles to resume"
-                        if not upper_body_estop and args.xr_backend == "visionproteleop"
+                        "; automatic resume armed for fresh settled tracking"
+                        if native_u_auto_resume_pending
                         else ""
                     ),
                 )
@@ -3461,6 +3488,26 @@ if __name__ == '__main__':
                     upper_body_estop,
                     reason="pedal U upper-body hold",
                 )
+                if (
+                    native_u_auto_resume_pending
+                    and not upper_body_estop
+                    and _request_native_enable_if_ready(
+                        tv_wrapper,
+                        args.visionpro_tracking_timeout,
+                    )
+                ):
+                    native_u_auto_resume_pending = False
+                    xr_enable_generation_applied = XR_ENABLE_GENERATION
+                    xr_ever_enabled = True
+                    arm_sensitivity_state.clear()
+                    if arm_ik is not None and hasattr(arm_ik, "reset_anchor"):
+                        arm_ik.reset_anchor()
+                    tracking_start_time = time.time()
+                    _safe_enter_hand_auto(hand_ctrl)
+                    logger_mp.warning(
+                        "[VisionProTeleop] pedal U released; automatic enable accepted "
+                        "after fresh settled tracking; IK anchor reset."
+                    )
                 enable_generation = XR_ENABLE_GENERATION
                 if enable_generation != xr_enable_generation_applied:
                     native_status = tv_wrapper.get_status()
@@ -3473,7 +3520,7 @@ if __name__ == '__main__':
                     else:
                         # A live R is single-use.  Do not call request_enable()
                         # early because the backend supports a latching API for
-                        # offline tests; live recovery always requires a new R.
+                        # offline tests; live non-U recovery requires a new R.
                         xr_enable_generation_applied = enable_generation
                         if (
                             not upper_body_estop
@@ -3485,6 +3532,8 @@ if __name__ == '__main__':
                             enable_accepted = tv_wrapper.request_enable()
                     if enable_accepted:
                         xr_enable_generation_applied = enable_generation
+                        native_u_auto_resume_eligible = False
+                        native_u_auto_resume_pending = False
                         xr_ever_enabled = True
                         arm_sensitivity_state.clear()
                         if arm_ik is not None and hasattr(arm_ik, "reset_anchor"):

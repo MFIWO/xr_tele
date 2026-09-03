@@ -1,0 +1,96 @@
+# AI Worker SG2 실행 명령어
+
+## Terminal 1 - 로봇 follower bridge
+
+ssh robotis@ffw-SNPR48A1111.local
+
+cd ~/ai_worker
+./docker/container.sh enter
+ffw_sg2_follower_ai
+
+
+## Host의 새 Terminal 공통 준비
+
+# 아래 설정은 Terminal 2, 3에서 각각 실행
+conda activate tv
+cd /home/kimm/Downloads/xr_tele/teleop
+
+export PYTHONPATH="/home/kimm/Downloads/external_repos/robotis_dds_python:/home/kimm/Downloads/xr_tele${PYTHONPATH:+:$PYTHONPATH}"
+export CYCLONEDDS_HOME=/home/kimm/Downloads/external_repos/cyclonedds-install
+export LD_LIBRARY_PATH="$CYCLONEDDS_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROS_DOMAIN_ID=30
+export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain Id="any"><General><Interfaces><NetworkInterface address="192.168.6.12" multicast="true"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
+
+
+## Terminal 2 - 키보드 주행 및 pause toggle
+
+python -u ai_worker_pedal_teleop.py \
+  --keyboard \
+  --domain-id 30 \
+  --linear-speed 0.4 \
+  --angular-speed 0.8 \
+  --lift-speed 0.08 \
+  --publish-rate 30
+
+# W/S: 전진/후진, A/D: 좌/우 회전, O/P: 리프트 상승/하강
+# U: pause toggle
+#   첫 번째 U: base/lift 정지 + 상체 자세 유지 + replay 일시정지
+#   두 번째 U: pause 해제 후 추적 안정 시 teleop/replay 자동 재개
+#   R은 최초 Vision Pro 활성화 또는 U와 무관한 추적 장애 복구 때만 필요
+# Ctrl+C: 키보드 제어 종료
+
+
+## Terminal 3 - 기본 Vision Pro teleop 및 녹화
+
+# 코드 기본값과 같은 옵션은 생략함
+python -u teleop_hand_and_arm.py \
+  --xr-backend visionproteleop \
+  --visionpro-ip 192.168.6.6 \
+  --arm AI_WORKER \
+  --ee hx5_d20 \
+  --allow-real-hardware \
+  --visionpro-home-before-enable \
+  --disable-hand \
+  --enable-neck \
+  --neck-log-rate 1 \
+  --image-source robotis_dds \
+  --camera head_and_wrist \
+  --head-wrist-layout side-portrait \
+  --no-left-wrist-camera-vflip \
+  --left-wrist-camera-rotation 270 \
+  --right-wrist-camera-rotation 270 \
+  --visionpro-max-wrist-angular-velocity 20 \
+  --ai-worker-ros-domain-id 30 \
+  --ai-worker-home-duration 7 \
+  --record \
+  --visionpro-status-rate 0
+
+
+## Episode replay
+
+EPISODE="/home/kimm/Downloads/xr_tele/teleop/utils/data/pick cube/episode_0002"
+
+# 1. 로봇을 움직이지 않고 Rerun 그래프/카메라 확인
+python -u ai_worker_replay.py "$EPISODE" \
+  --dry-run \
+  --no-hand \
+  --visualize \
+  --rerun-viewer native \
+  --viewer-hold-seconds 30
+
+# 2. 실기 replay
+# Terminal 2의 keyboard 명령을 먼저 실행해 둬야 함
+# teleop_hand_and_arm.py는 종료해서 두 프로세스가 팔을 동시에 제어하지 않게 할 것
+python -u ai_worker_replay.py "$EPISODE" \
+  --execute \
+  --domain-id 30 \
+  --no-hand \
+  --visualize \
+  --rerun-viewer native \
+  --post-replay-prompt \
+  --ai-worker-model sg2 \
+  --home-duration 3
+
+# replay 중 U: pause/resume toggle
+# replay 종료 후 R: 다시 replay
+# replay 종료 후 Q: 3초 동안 차렷자세로 이동 후 종료

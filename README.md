@@ -315,9 +315,10 @@ Run the USB foot-switch input in a second terminal on the same host. The pedal
 key mappings can all coexist: `W/A/S/D` drives the base, holding `O`/`P` moves
 the lift up/down, and `U` toggles a latched upper-body E-stop. While latched,
 the base and lift stop and the teleop process holds its current arm, hand, and
-neck commands; press `U` again to clear the latch. The native VisionProTeleop
-backend additionally requires fresh settled tracking and a new `R` enable before
-resuming. Vision Pro head height no longer
+neck commands; press `U` again to clear the latch. After the native
+VisionProTeleop session has been enabled once with `R`, clearing `U`
+automatically resumes teleop as soon as fresh tracking has settled. Initial
+startup and recovery from non-`U` tracking faults still require `R`. Vision Pro head height no longer
 controls the lift, and the old `--enable-lift` option is rejected. Base/lift
 motion also fails closed if the tracking heartbeat on UDP port 8766 expires;
 tracking recovery never clears a latched `U` E-stop.

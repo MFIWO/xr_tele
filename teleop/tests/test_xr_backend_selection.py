@@ -177,6 +177,78 @@ assert TeleVuerWrapper.__name__ == "TeleVuerWrapper"
                     entrypoint._native_enable_preconditions_met(rejected, 0.25)
                 )
 
+    def test_native_u_release_auto_enables_only_after_tracking_is_safe(self):
+        entrypoint = load_entrypoint_helpers(
+            "_native_enable_preconditions_met",
+            "_request_native_enable_if_ready",
+        )
+
+        class FakeWrapper:
+            def __init__(self, status, accepted=True):
+                self.status = status
+                self.accepted = accepted
+                self.request_count = 0
+
+            def get_status(self):
+                return dict(self.status)
+
+            def request_enable(self):
+                self.request_count += 1
+                return self.accepted
+
+        ready = {
+            "state": "REANCHOR_REQUIRED",
+            "session_alive": True,
+            "settling_complete": True,
+            "external_hold": False,
+            "sample_age_s": 0.01,
+        }
+        waiting = FakeWrapper({**ready, "settling_complete": False})
+        self.assertFalse(entrypoint._request_native_enable_if_ready(waiting, 0.25))
+        self.assertEqual(waiting.request_count, 0)
+
+        accepted = FakeWrapper(ready)
+        self.assertTrue(entrypoint._request_native_enable_if_ready(accepted, 0.25))
+        self.assertEqual(accepted.request_count, 1)
+
+        rejected = FakeWrapper(ready, accepted=False)
+        self.assertFalse(entrypoint._request_native_enable_if_ready(rejected, 0.25))
+        self.assertEqual(rejected.request_count, 1)
+
+    def test_native_u_pause_auto_resume_requires_pre_pause_active_tracking(self):
+        entrypoint = load_entrypoint_helpers(
+            "_native_tracking_output_is_active",
+            "_native_u_pause_can_auto_resume",
+        )
+        active = SimpleNamespace(
+            tracking_active=True,
+            head_pose_is_valid=True,
+            left_arm_is_valid=True,
+            right_arm_is_valid=True,
+        )
+        self.assertTrue(
+            entrypoint._native_u_pause_can_auto_resume(
+                "visionproteleop", True, active
+            )
+        )
+        for backend, ever_enabled, tracking_active in (
+            ("vuer", True, True),
+            ("visionproteleop", False, True),
+            ("visionproteleop", True, False),
+        ):
+            with self.subTest(
+                backend=backend,
+                ever_enabled=ever_enabled,
+                tracking_active=tracking_active,
+            ):
+                sample = SimpleNamespace(**vars(active))
+                sample.tracking_active = tracking_active
+                self.assertFalse(
+                    entrypoint._native_u_pause_can_auto_resume(
+                        backend, ever_enabled, sample
+                    )
+                )
+
     def test_hx5_hold_pauses_worker_without_open_command(self):
         entrypoint = load_entrypoint_helpers(
             "_safe_enter_hand_standby_open",

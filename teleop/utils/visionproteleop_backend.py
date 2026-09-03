@@ -713,7 +713,7 @@ class VisionProTeleopBackend:
             if self._is_fresh(self._clock()) and self._pending_data is not None:
                 self._transition(
                     REANCHOR_REQUIRED,
-                    "external hold released; explicit enable required",
+                    "external hold released; reanchor required",
                 )
             else:
                 self._transition(TRACKING_STALE, "external hold released without fresh pose")
@@ -824,7 +824,7 @@ class VisionProTeleopBackend:
                 else:
                     self._transition(
                         REANCHOR_REQUIRED,
-                        "tracking stream reconnected; explicit enable required",
+                        "tracking stream reconnected; reanchor required",
                     )
             self._last_raw_object = raw
             self._last_packet_monotonic = now
@@ -926,7 +926,7 @@ class VisionProTeleopBackend:
                 elapsed = self._settling_elapsed(now)
                 self._transition(
                     REANCHOR_REQUIRED,
-                    "fresh tracking requires explicit enable; settling "
+                    "fresh tracking awaiting enable; settling "
                     f"{elapsed:.3f}/{self.settling_time_s:.3f}s",
                 )
 
@@ -1108,7 +1108,7 @@ class VisionProTeleopBackend:
             and self._status_callback is not None
         ):
             self._status_callback(
-                "[VisionProTeleop] REANCHOR_REQUIRED: tracking settled; press R once to enable."
+                "[VisionProTeleop] REANCHOR_REQUIRED: tracking settled; ready to enable."
             )
 
     def _settling_elapsed(self, now: float) -> float:
