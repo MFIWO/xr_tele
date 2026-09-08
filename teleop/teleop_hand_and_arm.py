@@ -1282,12 +1282,32 @@ def _request_native_enable_if_ready(tv_wrapper, tracking_timeout_s):
     return bool(tv_wrapper.request_enable())
 
 
-def _native_u_pause_can_auto_resume(xr_backend, xr_ever_enabled, tele_data):
-    """Only a U pause entered from active native teleop may auto-resume."""
+def _native_u_pause_can_auto_resume(xr_backend, xr_ever_enabled):
+    """A U pause may resume any native session that was enabled once."""
     return bool(
         xr_backend == "visionproteleop"
         and xr_ever_enabled
-        and _native_tracking_output_is_active(tele_data)
+    )
+
+
+def _native_session_should_auto_resume(
+    xr_backend,
+    xr_ever_enabled,
+    upper_body_estop,
+):
+    """Recover an authorized native session unless U is currently holding it."""
+    return bool(
+        xr_backend == "visionproteleop"
+        and xr_ever_enabled
+        and not upper_body_estop
+    )
+
+
+def _should_pause_hand_worker(xr_backend, upper_body_estop, tracking_ready):
+    """Native HX5 standby is operator-only; Vuer keeps legacy loss handling."""
+    return bool(
+        upper_body_estop
+        or (xr_backend != "visionproteleop" and not tracking_ready)
     )
 
 def _apply_pose_jump_filter(left_pose, right_pose, last_left, last_right, max_frame_jump):
@@ -1326,17 +1346,17 @@ if __name__ == '__main__':
     parser.add_argument('--visionpro-max-wrist-rotation-jump-deg', type=float, default=60.0, help='Per-packet native backend wrist rotation jump limit in degrees.')
     parser.add_argument('--visionpro-max-wrist-velocity', type=float, default=3.0, help='Native backend wrist translation velocity limit in metres/second; violation holds tracking.')
     parser.add_argument('--visionpro-max-wrist-angular-velocity', type=float, default=8.0, help='Native backend wrist angular velocity limit in radians/second; violation holds tracking.')
-    parser.add_argument('--visionpro-motion-rejection', action=argparse.BooleanOptionalAction, default=True, help='Reject native wrist jumps/velocity spikes. Use --no-visionpro-motion-rejection only in simulation or command-sink diagnostics.')
+    parser.add_argument('--visionpro-motion-rejection', action=argparse.BooleanOptionalAction, default=False, help='Reject native wrist jumps/velocity spikes. Disabled by default so normal hand motion does not force a tracking hold.')
     parser.add_argument('--visionpro-status-rate', type=float, default=1.0, help='Native backend tracking/video/hold diagnostic rate in Hz. Set 0 to disable periodic output.')
     parser.add_argument('--visionpro-synthetic', action='store_true', help='Use deterministic synthetic AVP packets for DDS-free offline validation only; requires --command-sink.')
-    parser.add_argument('--command-sink', action='store_true', help='Run AI Worker IK and HX5 retargeting with in-memory targets and no motor DDS publishers.')
+    parser.add_argument('--command-sink', action='store_true', help='Run AI Worker IK and selected end-effector handling with in-memory targets and no motor DDS publishers.')
     parser.add_argument('--command-sink-duration', type=float, default=0.0, help='Auto-start and stop a command-sink diagnostic after this many seconds; requires --visionpro-synthetic.')
     parser.add_argument('--command-sink-log-rate', type=float, default=1.0, help='In-memory arm/HX5 target diagnostic rate in Hz. Set 0 to disable periodic output.')
     parser.add_argument('--allow-real-hardware', action='store_true', help='Explicitly permit native Vision Pro backend to construct real AI Worker/HX5 controllers. Never use for first validation.')
     parser.add_argument('--visionpro-home-before-enable', action='store_true', help='Explicitly allow AI Worker startup ready-pose motion before R when using the native backend. R still gates all tracking-driven commands.')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'AI_WORKER'], default='H1_2', help='Select arm controller')
-    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco', 'hx5_d20'], default='rh5dg2_dfx', help='Select end effector controller')
+    parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco', 'hx5_d20', 'ai_worker_2g'], default='rh5dg2_dfx', help='Select end effector controller')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--image-source', choices=['auto', 'teleimager', 'robotis_dds', 'none'], default='auto', help='Camera transport. none is a deterministic synthetic source allowed only with --command-sink.')
     parser.add_argument('--viewer-host-ip', type=str, default=None, help='Host IP advertised to the XR browser for the HTTPS/WSS viewer. If omitted, infer it from the route to --img-server-ip.')
@@ -1351,7 +1371,7 @@ if __name__ == '__main__':
     parser.add_argument('--left-wrist-camera-rotation', type=int, choices=[0, 90, 180, 270], default=0, help='Clockwise wrist-camera display rotation in degrees. Use 270 to undo an image that appears 90 degrees clockwise.')
     parser.add_argument('--right-wrist-camera-rotation', type=int, choices=[0, 90, 180, 270], default=0, help='Clockwise wrist-camera display rotation in degrees. Use 270 to undo an image that appears 90 degrees clockwise.')
     parser.add_argument('--hand-control-hz', type=float, default=50.0, help='RH5DG2 hand retarget/publish loop frequency.')
-    parser.add_argument('--ai-worker-urdf', type=str, default=None, help='Expanded AI Worker SH5 URDF. Defaults to the sibling external_repos/ai_worker checkout.')
+    parser.add_argument('--ai-worker-urdf', type=str, default=None, help='Expanded AI Worker arm URDF. Its checkout also supplies the HX5-D20 hand URDF; defaults to external_repos/ai_worker.')
     parser.add_argument('--ai-worker-ros-domain-id', type=int, default=None, help='DDS domain ID used by AI Worker arm/hand trajectory topics (robotis_lab commonly uses 30).')
     parser.add_argument('--ai-worker-command-duration', type=float, default=0.08, help='AI Worker DDS JointTrajectory point duration in seconds.')
     parser.add_argument('--ai-worker-arm-scale', type=float, default=1.0, help='Scale Vision Pro wrist translation deltas for AI Worker IK.')
@@ -1367,9 +1387,12 @@ if __name__ == '__main__':
     parser.add_argument('--pedal-estop-host', default='127.0.0.1', help='Local address for AI Worker pedal E-stop messages.')
     parser.add_argument('--pedal-estop-port', type=int, default=8765, help='UDP port for the latched AI Worker upper-body E-stop.')
     parser.add_argument('--pedal-safety-port', type=int, default=8766, help='UDP destination for pedal base/lift tracking-safety heartbeats.')
-    parser.add_argument('--ai-worker-wrist-orientation-mode', choices=['relative', 'relative-local', 'absolute'], default='relative', help='AI Worker wrist orientation mapping. relative applies startup-anchored rotation in the shared world basis; relative-local applies it about the aligned wrist-local axes so pitch and terminal rotation stay distinct; absolute is an experimental H1_2-frame mapping.')
-    parser.add_argument('--ai-worker-left-wrist-roll-offset-deg', type=float, default=0.0, help='Static HX5 left-hand roll correction in degrees about the hand longitudinal axis.')
-    parser.add_argument('--ai-worker-right-wrist-roll-offset-deg', type=float, default=0.0, help='Static HX5 right-hand roll correction in degrees about the hand longitudinal axis.')
+    parser.add_argument('--ai-worker-wrist-orientation-mode', choices=['relative', 'relative-local', 'absolute'], default='relative', help='AI Worker wrist orientation mapping. relative applies startup-anchored rotation in the shared world basis; relative-local applies it about aligned wrist-local axes; absolute is experimental.')
+    parser.add_argument('--ai-worker-left-wrist-roll-offset-deg', type=float, default=-15.0, help='Static AI Worker left-wrist roll correction in degrees about robot-forward +X; positive is CCW when viewed along +X.')
+    parser.add_argument('--ai-worker-right-wrist-roll-offset-deg', type=float, default=0.0, help='Static AI Worker right-wrist roll correction in degrees about robot-forward +X; positive is CCW when viewed along +X.')
+    parser.add_argument('--ai-worker-2g-gripper-max-position', type=float, default=1.1, help='Closed SG2 gripper command in radians; constrained by the follower URDF 1.1 rad limit.')
+    parser.add_argument('--ai-worker-2g-pinch-closed-cm', type=float, default=5.0, help='XR thumb-index distance mapped to a fully closed SG2 gripper.')
+    parser.add_argument('--ai-worker-2g-pinch-open-cm', type=float, default=7.0, help='XR thumb-index distance mapped to a fully open SG2 gripper.')
     parser.add_argument('--hx5-d20-retarget-mode', choices=['dexpilot', 'geometric'], default='dexpilot', help='HX5-D20 hand retargeter. dexpilot jointly optimizes all fingertips; geometric keeps the legacy per-joint mapping.')
     parser.add_argument('--hx5-d20-smoothing-alpha', type=float, default=1.0, help='HX5-D20 retarget low-pass alpha from 0 to 1; 1.0 matches RH5DG2 DexPilot.')
     parser.add_argument('--hx5-d20-left-hand-scale', type=float, default=1.0, help='Multiplier on the left HX5 DexPilot YAML scaling factor.')
@@ -1403,11 +1426,11 @@ if __name__ == '__main__':
     parser.add_argument('--arm-smoothing-alpha', type=float, default=1.0, help='Arm target smoothing alpha, where 1.0 means no translation lag.')
     parser.add_argument('--arm-startup-duration', type=float, default=2.0, help='Seconds to apply extra-small arm q target clamp after teleop starts.')
     parser.add_argument('--arm-startup-max-step', type=float, default=0.08, help='Max per-joint arm q target delta during startup clamp, in radians.')
-    parser.add_argument('--arm-standby-on-tracking-loss', action=argparse.BooleanOptionalAction, default=True, help='Enter arm standby when XR head/wrist tracking becomes invalid.')
+    parser.add_argument('--arm-standby-on-tracking-loss', action=argparse.BooleanOptionalAction, default=None, help='Enter arm standby when XR head/wrist tracking becomes invalid. Defaults off for native Vision Pro so only U enters standby, and on for the legacy Vuer path.')
     parser.add_argument('--arm-lost-timeout', type=float, default=0.5, help='Seconds of invalid XR arm tracking before entering standby.')
     parser.add_argument('--arm-found-confirm', type=float, default=0.5, help='Seconds of valid XR arm tracking required before leaving standby.')
     parser.add_argument('--arm-standby-action', type=str, choices=['ready', 'hold'], default='ready', help='Arm target while XR tracking is lost: ready pose or current-pose hold.')
-    parser.add_argument('--arm-max-frame-jump', type=float, default=0.15, help='Reject valid XR wrist pose frames whose translation jumps more than this many meters from the last good pose. Set 0 to disable.')
+    parser.add_argument('--arm-max-frame-jump', type=float, default=0.0, help='Reject valid XR wrist pose frames whose translation jumps more than this many meters from the last good pose. Disabled by default; set a positive value to enable.')
     # mode flags
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--headless', action=argparse.BooleanOptionalAction, default=True, help='Enable headless mode and disable Rerun recording visualization by default. Use --no-headless to enable Rerun.')
@@ -1479,6 +1502,14 @@ if __name__ == '__main__':
     # Config Loop streaming (optional data-collection sink; see teleop/utils/loop_streamer.py)
     parser.add_argument('--loop', action='store_true', help='Stream robot state + cameras to a Config Loop instance via loop-sdk')
     parser.add_argument('--loop-addr', type=str, default='localhost:50051', help='Config Loop gRPC SourceIngestService host:port')
+    parser.add_argument('--leader-master-loop', '--leader-master-loop-only', action='store_true', help='Skip XR and robot command publishers; observe ffw_sg2_ai leader/follower/camera DDS topics and stream them only to Config Loop.')
+    parser.add_argument('--meta-quest-loop', '--robotis-webxr-loop', action='store_true', help='Skip xr_tele robot control; observe ROBOTIS Meta Quest WebXR/Cyclo Control topics through rclpy (Zenoh-compatible) and stream them only to Config Loop.')
+    parser.add_argument('--meta-quest-rmw-implementation', type=str, default='rmw_zenoh_cpp', help='ROS 2 RMW used by --meta-quest-loop. Must match ROBOTIS Vuer/Cyclo Control; defaults to rmw_zenoh_cpp.')
+    parser.add_argument('--meta-quest-ros-python', type=str, default='/usr/bin/python3', help='ROS 2 Jazzy-compatible Python used by the Meta Quest subscription helper.')
+    parser.add_argument('--meta-quest-ros-setup', type=str, default='/opt/ros/jazzy/setup.bash', help='ROS 2 setup script sourced before starting the Meta Quest subscription helper. Pass an empty string if the environment is already configured.')
+    parser.add_argument('--leader-master-startup-timeout', '--observer-startup-timeout', dest='leader_master_startup_timeout', type=float, default=45.0, help='Seconds before warning that follower state or an 8-joint SG2 action stream is still missing. Streaming continues with source_valid=false.')
+    parser.add_argument('--leader-master-stale-timeout', '--observer-stale-timeout', dest='leader_master_stale_timeout', type=float, default=0.5, help='Seconds without an update before a leader-master or Meta Quest Loop source_valid channel becomes false.')
+    parser.add_argument('--leader-master-status-rate', '--observer-status-rate', dest='leader_master_status_rate', type=float, default=1.0, help='Leader-master/Meta Quest observer status output rate in Hz. Set 0 to disable.')
     # record mode and task info
     parser.add_argument('--record', action=argparse.BooleanOptionalAction, default=True, help='Enable data recording mode')
     parser.add_argument('--screen-record', action='store_true', help='Record only the head camera view to MP4; toggle with s.')
@@ -1506,17 +1537,80 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    if args.leader_master_loop and args.meta_quest_loop:
+        raise ValueError(
+            "--leader-master-loop and --meta-quest-loop are mutually exclusive."
+        )
+    observer_loop_mode = (
+        "leader-master"
+        if args.leader_master_loop
+        else "meta-quest" if args.meta_quest_loop else None
+    )
+    if observer_loop_mode is not None:
+        if args.command_sink or args.visionpro_synthetic or args.sim:
+            raise ValueError(
+                f"--{observer_loop_mode}-loop cannot be combined with "
+                "--command-sink, --visionpro-synthetic, or --sim."
+            )
+        if args.leader_master_startup_timeout <= 0.0:
+            raise ValueError("--leader-master-startup-timeout must be greater than zero.")
+        if args.leader_master_stale_timeout <= 0.0:
+            raise ValueError("--leader-master-stale-timeout must be greater than zero.")
+        if args.leader_master_status_rate < 0.0:
+            raise ValueError("--leader-master-status-rate must be zero or greater.")
+        args.loop = True
+        args.record = False
+        args.arm = "AI_WORKER"
+        args.ee = "ai_worker_2g"
+        if args.meta_quest_loop:
+            if not args.meta_quest_rmw_implementation.strip():
+                raise ValueError(
+                    "--meta-quest-rmw-implementation cannot be empty."
+                )
+            if not args.meta_quest_ros_python.strip():
+                raise ValueError("--meta-quest-ros-python cannot be empty.")
+            if args.ai_worker_ros_domain_id is None:
+                args.ai_worker_ros_domain_id = int(
+                    os.environ.get("ROS_DOMAIN_ID", "30")
+                )
+            os.environ["RMW_IMPLEMENTATION"] = (
+                args.meta_quest_rmw_implementation.strip()
+            )
+            args.meta_quest_ros_python = args.meta_quest_ros_python.strip()
+            args.meta_quest_ros_setup = args.meta_quest_ros_setup.strip()
+        logger_mp.warning(
+            f"[{observer_loop_mode} loop] xr_tele XR/IK, local episode recording, "
+            "and all robot command publishers are disabled; Config Loop is the "
+            "only recorder."
+        )
+        if args.meta_quest_loop:
+            from teleop.ai_worker_leader_loop import run_meta_quest_loop
+
+            run_meta_quest_loop(args)
+        else:
+            from teleop.ai_worker_leader_loop import run_leader_master_loop
+
+            run_leader_master_loop(args)
+        raise SystemExit(0)
     if args.enable_neck is None:
         # Preserve the established Vuer default while requiring an explicit
         # motor opt-in for the native Tracking Streamer production path.
         args.enable_neck = args.xr_backend != "visionproteleop"
+    if args.arm_standby_on_tracking_loss is None:
+        # Native tracking recovers by accepting a fresh anchor automatically;
+        # only the external U hold puts its hand/arm workers in standby.
+        # Preserve the established tracking-loss standby behavior for Vuer.
+        args.arm_standby_on_tracking_loss = args.xr_backend != "visionproteleop"
     native_production_gate = bool(
         args.xr_backend == "visionproteleop" and not args.command_sink
     )
     if args.xr_backend == "visionproteleop":
-        if args.arm != "AI_WORKER" or (args.ee != "hx5_d20" and not args.disable_hand):
+        if args.arm != "AI_WORKER" or (
+            args.ee not in ("hx5_d20", "ai_worker_2g") and not args.disable_hand
+        ):
             raise ValueError(
-                "--xr-backend visionproteleop is scoped to --arm AI_WORKER --ee hx5_d20 in this PoC."
+                "--xr-backend visionproteleop requires --arm AI_WORKER with "
+                "--ee hx5_d20 or --ee ai_worker_2g."
             )
         if args.input_mode != "hand":
             raise ValueError("--xr-backend visionproteleop requires --input-mode hand.")
@@ -1536,14 +1630,10 @@ if __name__ == '__main__':
                 "--visionpro-home-before-enable requires the production AI Worker arm "
                 "with --ai-worker-home-on-start enabled."
             )
-        if not args.visionpro_motion_rejection and not (args.sim or args.command_sink):
-            raise ValueError(
-                "--no-visionpro-motion-rejection is restricted to --sim or --command-sink."
-            )
         if not args.visionpro_motion_rejection:
             logger_mp.warning(
-                "[VisionProTeleop simulation] wrist jump/velocity rejection is disabled; "
-                "URDF joint limits and downstream command limiting remain active."
+                "[VisionProTeleop] wrist jump/velocity rejection is disabled; "
+                "physical URDF joint limits and downstream command limiting remain active."
             )
         if args.arm_standby_action != "hold":
             logger_mp.warning(
@@ -1714,10 +1804,23 @@ if __name__ == '__main__':
         raise ValueError("--record and --screen-record cannot be enabled together.")
     if args.ee == "rh56f1" and args.arm != "H1_2":
         raise ValueError("--ee rh56f1 currently supports the H1_2 arm path only; use --arm H1_2.")
-    if args.ee == "hx5_d20" and args.arm != "AI_WORKER":
-        raise ValueError("--ee hx5_d20 currently supports the AI_WORKER arm path only; use --arm AI_WORKER.")
-    if args.arm == "AI_WORKER" and args.ee != "hx5_d20" and not args.disable_hand:
-        raise ValueError("--arm AI_WORKER currently requires --ee hx5_d20.")
+    if args.ee in ("hx5_d20", "ai_worker_2g") and args.arm != "AI_WORKER":
+        raise ValueError(
+            f"--ee {args.ee} supports the AI_WORKER arm path only; use --arm AI_WORKER."
+        )
+    if (
+        args.arm == "AI_WORKER"
+        and args.ee not in ("hx5_d20", "ai_worker_2g")
+        and not args.disable_hand
+    ):
+        raise ValueError(
+            "--arm AI_WORKER requires --ee hx5_d20 or --ee ai_worker_2g."
+        )
+    if args.ee == "ai_worker_2g" and (args.disable_arm or args.hand_only):
+        raise ValueError(
+            "--ee ai_worker_2g requires the AI Worker arm controller because its 2G "
+            "command is appended to the same left/right trajectory messages."
+        )
     if args.arm == "AI_WORKER" and args.input_mode != "hand":
         raise ValueError("--arm AI_WORKER currently supports Apple Vision Pro hand tracking only; use --input-mode hand.")
     if args.arm == "AI_WORKER" and not args.disable_body:
@@ -1728,6 +1831,20 @@ if __name__ == '__main__':
         raise ValueError("--ai-worker-arm-scale must be greater than zero.")
     if args.ai_worker_home_duration <= 0.0:
         raise ValueError("--ai-worker-home-duration must be greater than zero.")
+    if not 0.0 < args.ai_worker_2g_gripper_max_position <= 1.1:
+        raise ValueError("--ai-worker-2g-gripper-max-position must be in (0, 1.1].")
+    if (
+        args.ai_worker_2g_pinch_closed_cm < 0.0
+        or args.ai_worker_2g_pinch_open_cm <= args.ai_worker_2g_pinch_closed_cm
+    ):
+        raise ValueError(
+            "--ai-worker-2g-pinch-open-cm must be greater than the non-negative "
+            "--ai-worker-2g-pinch-closed-cm."
+        )
+    if args.ee == "ai_worker_2g" and args.ai_worker_urdf is None:
+        from teleop.robot_control.robotis_ai_worker import default_ai_worker_urdf
+
+        args.ai_worker_urdf = str(default_ai_worker_urdf("sg2"))
     if args.enable_lift:
         raise ValueError("Vision Pro Z lift tracking is disabled; run ai_worker_pedal_teleop.py and use O/P instead.")
     if args.lift_gain < 0.0:
@@ -2343,10 +2460,16 @@ if __name__ == '__main__':
                 command_duration=args.ai_worker_command_duration,
                 home_q=arm_ik.home_q,
                 ready_q=arm_ik.ready_q,
+                include_2g_gripper=args.ee == "ai_worker_2g",
             )
             if not arm_ctrl.wait_for_joint_state(timeout=5.0):
+                required_state = (
+                    "all 14 arm and both SG2 gripper joints"
+                    if args.ee == "ai_worker_2g"
+                    else "all 14 arm joints"
+                )
                 raise RuntimeError(
-                    "AI Worker did not receive all 14 arm joints on /joint_states within 5 seconds; "
+                    f"AI Worker did not receive {required_state} on /joint_states within 5 seconds; "
                     "refusing the explicit pre-enable ready-pose motion."
                 )
             logger_mp.warning(
@@ -2560,6 +2683,7 @@ if __name__ == '__main__':
                 AIWorkerArmController,
                 AIWorkerArmIK,
                 AIWorkerVirtualLeaderIK,
+                ai_worker_2g_gripper_position,
             )
             arm_ik_class = (
                 AIWorkerVirtualLeaderIK
@@ -2575,9 +2699,11 @@ if __name__ == '__main__':
                     right_wrist_roll_offset_deg=args.ai_worker_right_wrist_roll_offset_deg,
                 )
             logger_mp.info(
-                "[teleop arm IK] AI Worker mode=%s solver=%s",
+                "[teleop arm IK] AI Worker mode=%s solver=%s scale=%.3f wrist_orientation=%s",
                 args.ai_worker_ik_mode,
                 arm_ik_class.__name__,
+                args.ai_worker_arm_scale,
+                args.ai_worker_wrist_orientation_mode,
             )
             if args.command_sink:
                 from teleop.utils.ai_worker_command_sink import AIWorkerArmCommandSink
@@ -2586,6 +2712,7 @@ if __name__ == '__main__':
                     command_duration=args.ai_worker_command_duration,
                     home_q=arm_ik.home_q,
                     ready_q=arm_ik.ready_q,
+                    include_2g_gripper=args.ee == "ai_worker_2g",
                     report_interval=(
                         1.0 / args.command_sink_log_rate
                         if args.command_sink_log_rate > 0.0
@@ -2606,10 +2733,16 @@ if __name__ == '__main__':
                         command_duration=args.ai_worker_command_duration,
                         home_q=arm_ik.home_q,
                         ready_q=arm_ik.ready_q,
+                        include_2g_gripper=args.ee == "ai_worker_2g",
                     )
             if not arm_ctrl.wait_for_joint_state(timeout=5.0):
+                required_state = (
+                    "all 14 arm and both SG2 gripper joints"
+                    if args.ee == "ai_worker_2g"
+                    else "all 14 arm joints"
+                )
                 raise RuntimeError(
-                    "AI Worker did not receive all 14 arm joints on /joint_states within 5 seconds; "
+                    f"AI Worker did not receive {required_state} on /joint_states within 5 seconds; "
                     "refusing to anchor IK from guessed home positions. Check the DDS domain and AI Worker bringup."
                 )
             logger_mp.info(
@@ -2652,6 +2785,10 @@ if __name__ == '__main__':
             dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
             gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
                                                      dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim)
+        elif args.ee == "ai_worker_2g":
+            dual_gripper_data_lock = Lock()
+            dual_gripper_state_array = Array('d', 2, lock=False)
+            dual_gripper_action_array = Array('d', 2, lock=False)
         elif args.ee == "inspire_dfx":
             from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX, Inspire_Num_Motors
             left_hand_pos_array = Array('d', 75, lock = True)      # [input]
@@ -2831,13 +2968,14 @@ if __name__ == '__main__':
                 retarget_mode=args.hx5_d20_retarget_mode,
                 left_hand_scale=args.hx5_d20_left_hand_scale,
                 right_hand_scale=args.hx5_d20_right_hand_scale,
+                ai_worker_urdf=getattr(arm_ik, "urdf_path", args.ai_worker_urdf),
                 **hx5_extra_kwargs,
             )
             if args.xr_backend == "visionproteleop":
                 _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
                 logger_mp.warning(
                     "[VisionProTeleop safety] HX5 publish worker starts paused; "
-                    "an accepted fresh R enable is required before tracking commands."
+                    "it is enabled when the already-authorized native session is active."
                 )
             if args.command_sink:
                 logger_mp.warning(
@@ -2870,6 +3008,15 @@ if __name__ == '__main__':
 
         if args.ee in ["dex3", "inspire_dfx", "inspire_ftp", "inspire_dg2", "rh5dg2_dfx", "rh5dg2_ftp", "rh56f1", "brainco", "hx5_d20"]:
             logger_mp.info(f"[teleop ee] ee={args.ee} hand_controller={hand_ctrl.__class__.__name__}")
+        if args.ee == "ai_worker_2g":
+            logger_mp.info(
+                "[teleop AI Worker 2G] integrated_with_arm_topics=True "
+                "joint_names=(gripper_l_joint1,gripper_r_joint1) max_position=%.3f "
+                "pinch_cm=(closed=%.3f,open=%.3f)",
+                args.ai_worker_2g_gripper_max_position,
+                args.ai_worker_2g_pinch_closed_cm,
+                args.ai_worker_2g_pinch_open_cm,
+            )
         if args.ee in ("rh5dg2_dfx", "rh5dg2_ftp"):
             logger_mp.info(
                 f"[teleop hand side mapping] ee={args.ee} "
@@ -2914,7 +3061,7 @@ if __name__ == '__main__':
         loop_ee_state_array = None
         loop_ee_action_array = None
         loop_ee_lock = None
-        if args.ee == "dex1":
+        if args.ee in ("dex1", "ai_worker_2g"):
             loop_ee_state_array = dual_gripper_state_array
             loop_ee_action_array = dual_gripper_action_array
             loop_ee_lock = dual_gripper_data_lock
@@ -3071,7 +3218,14 @@ if __name__ == '__main__':
                         "right_wrist": "/camera_right/camera_right/color/image_rect_raw/compressed",
                     } if image_source == "robotis_dds" else None,
                     "arm_joint_count_per_side": 7,
-                    "hand_joint_count_per_side": 20 if args.ee == "hx5_d20" else 0,
+                    "hand_joint_count_per_side": (
+                        20 if args.ee == "hx5_d20" else 1 if args.ee == "ai_worker_2g" else 0
+                    ),
+                    "gripper_joint_names": (
+                        ["gripper_l_joint1", "gripper_r_joint1"]
+                        if args.ee == "ai_worker_2g"
+                        else None
+                    ),
                     "lift_control": "external_pedal_o_p",
                     "software_estop": f"udp://{args.pedal_estop_host}:{args.pedal_estop_port}",
                 }
@@ -3198,7 +3352,8 @@ if __name__ == '__main__':
                 _safe_sync_arm_hold_to_measured(arm_ctrl)
                 logger_mp.warning(
                     "[VisionProTeleop startup] tracking is no longer active after R; "
-                    "startup command seed is inhibited and a new settled R is required."
+                    "startup command seed is inhibited until fresh tracking settles "
+                    "and re-anchors automatically."
                 )
         if args.disable_arm:
             logger_mp.warning("[teleop arm disabled reason] --disable-arm set; IK/control publish will be skipped.")
@@ -3462,7 +3617,6 @@ if __name__ == '__main__':
                     native_u_auto_resume_eligible = _native_u_pause_can_auto_resume(
                         args.xr_backend,
                         xr_ever_enabled,
-                        tele_data,
                     )
                     native_u_auto_resume_pending = False
                     _safe_sync_arm_hold_to_measured(arm_ctrl)
@@ -3489,13 +3643,17 @@ if __name__ == '__main__':
                     reason="pedal U upper-body hold",
                 )
                 if (
-                    native_u_auto_resume_pending
-                    and not upper_body_estop
+                    _native_session_should_auto_resume(
+                        args.xr_backend,
+                        xr_ever_enabled,
+                        upper_body_estop,
+                    )
                     and _request_native_enable_if_ready(
                         tv_wrapper,
                         args.visionpro_tracking_timeout,
                     )
                 ):
+                    resumed_from_u = native_u_auto_resume_pending
                     native_u_auto_resume_pending = False
                     xr_enable_generation_applied = XR_ENABLE_GENERATION
                     xr_ever_enabled = True
@@ -3505,8 +3663,9 @@ if __name__ == '__main__':
                     tracking_start_time = time.time()
                     _safe_enter_hand_auto(hand_ctrl)
                     logger_mp.warning(
-                        "[VisionProTeleop] pedal U released; automatic enable accepted "
-                        "after fresh settled tracking; IK anchor reset."
+                        "[VisionProTeleop] %s; automatic enable accepted after fresh "
+                        "settled tracking; IK anchor reset.",
+                        "pedal U released" if resumed_from_u else "tracking recovered",
                     )
                 enable_generation = XR_ENABLE_GENERATION
                 if enable_generation != xr_enable_generation_applied:
@@ -3520,7 +3679,8 @@ if __name__ == '__main__':
                     else:
                         # A live R is single-use.  Do not call request_enable()
                         # early because the backend supports a latching API for
-                        # offline tests; live non-U recovery requires a new R.
+                        # offline tests. Once enabled, ordinary tracking recovery
+                        # is handled automatically above without entering standby.
                         xr_enable_generation_applied = enable_generation
                         if (
                             not upper_body_estop
@@ -3610,12 +3770,14 @@ if __name__ == '__main__':
                 and getattr(tele_data, "right_arm_is_valid", True)
             )
             raw_arm_tracking_ready = arm_tracking_ready
-            if args.xr_backend == "visionproteleop" and (
-                upper_body_estop or not raw_arm_tracking_ready
+            if _should_pause_hand_worker(
+                args.xr_backend,
+                upper_body_estop,
+                raw_arm_tracking_ready,
             ):
                 # HX5 publishes from its own worker thread, so pause it as soon
-                # as native validity drops rather than waiting for the generic
-                # arm-loss confirmation timer.
+                # as the operator asserts the U hold. Ordinary tracking gaps keep
+                # the last hand target and recover without entering standby.
                 _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
             if pedal_safety is not None:
                 pedal_safety.publish(
@@ -3890,7 +4052,12 @@ if __name__ == '__main__':
                 elif not upper_body_estop:
                     left_shared_debug = None
                     right_shared_debug = None
-                    _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
+                    if _should_pause_hand_worker(
+                        args.xr_backend,
+                        upper_body_estop,
+                        hand_tracking_ready,
+                    ):
+                        _safe_enter_hand_tracking_standby(hand_ctrl, args.ee)
                     if loop_count % 10 == 0:
                         logger_mp.warning(
                             "[teleop hand tracking hold] skipped invalid hand frame "
@@ -3921,6 +4088,32 @@ if __name__ == '__main__':
                     left_gripper_value.value = left_hand_pinchValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = right_hand_pinchValue
+            elif args.ee == "ai_worker_2g" and arm_ctrl is not None:
+                if raw_arm_tracking_ready and not upper_body_estop:
+                    if args.input_mode == "controller":
+                        closed_input = 0.0
+                        open_input = 10.0
+                        left_2g_input = tele_data.left_ctrl_triggerValue
+                        right_2g_input = tele_data.right_ctrl_triggerValue
+                    else:
+                        closed_input = args.ai_worker_2g_pinch_closed_cm
+                        open_input = args.ai_worker_2g_pinch_open_cm
+                        left_2g_input = left_hand_pinchValue
+                        right_2g_input = right_hand_pinchValue
+                    arm_ctrl.set_dual_gripper_command([
+                        ai_worker_2g_gripper_position(
+                            left_2g_input,
+                            closed_input=closed_input,
+                            open_input=open_input,
+                            max_position=args.ai_worker_2g_gripper_max_position,
+                        ),
+                        ai_worker_2g_gripper_position(
+                            right_2g_input,
+                            closed_input=closed_input,
+                            open_input=open_input,
+                            max_position=args.ai_worker_2g_gripper_max_position,
+                        ),
+                    ])
             else:
                 pass
             
@@ -4093,6 +4286,11 @@ if __name__ == '__main__':
                         "the velocity limiter could not sync to measured pose."
                     )
 
+            if args.ee == "ai_worker_2g" and arm_ctrl is not None:
+                with dual_gripper_data_lock:
+                    dual_gripper_state_array[:] = arm_ctrl.get_current_dual_gripper_q()
+                    dual_gripper_action_array[:] = arm_ctrl.get_last_commanded_dual_gripper_q()
+
             teleop_trace = {
                 "raw_left_wrist_pose": raw_left_wrist_pose.tolist(),
                 "raw_right_wrist_pose": raw_right_wrist_pose.tolist(),
@@ -4141,6 +4339,11 @@ if __name__ == '__main__':
                     getattr(tele_data, "right_arm_is_valid", True)
                 ),
             }
+            if args.ee == "ai_worker_2g" and arm_ctrl is not None:
+                teleop_trace.update({
+                    "measured_2g_gripper_qpos": list(dual_gripper_state_array),
+                    "sent_2g_gripper_qpos": list(dual_gripper_action_array),
+                })
             if arm_trace_file is not None:
                 arm_trace_file.write(
                     json.dumps(
@@ -4196,7 +4399,7 @@ if __name__ == '__main__':
                         right_hand_action = dual_hand_action_array[-7:]
                         current_body_state = []
                         current_body_action = []
-                elif args.ee == "dex1" and args.input_mode == "hand":
+                elif args.ee in ("dex1", "ai_worker_2g") and args.input_mode == "hand":
                     with dual_gripper_data_lock:
                         left_ee_state = [dual_gripper_state_array[0]]
                         right_ee_state = [dual_gripper_state_array[1]]

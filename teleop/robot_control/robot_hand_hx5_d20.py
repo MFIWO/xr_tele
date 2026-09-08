@@ -38,6 +38,44 @@ _HX5_D20_POSITION_AXES = np.array(
 )
 
 
+def resolve_hx5_d20_urdf(side, ai_worker_urdf=None):
+    """Resolve a hand URDF from the selected AI Worker checkout."""
+    if side not in ("left", "right"):
+        raise ValueError("side must be 'left' or 'right'")
+
+    relative_path = Path("common") / "hx5_d20" / f"hx5_d20_{side}.urdf"
+    if ai_worker_urdf is not None:
+        arm_urdf = Path(ai_worker_urdf).expanduser().resolve()
+        for parent in arm_urdf.parents:
+            if parent.name == "urdf":
+                return (parent / relative_path).resolve()
+        raise ValueError(
+            "AI Worker arm URDF must be located below an ffw_description/urdf "
+            f"directory, got: {arm_urdf}"
+        )
+
+    workspace_root = Path(__file__).resolve().parents[3]
+    candidates = (
+        workspace_root
+        / "external_repos"
+        / "ai_worker"
+        / "ffw_description"
+        / "urdf"
+        / relative_path,
+        workspace_root
+        / "ai_worker"
+        / "ffw_description"
+        / "urdf"
+        / relative_path,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    # Prefer the repository layout used by this workspace in the eventual
+    # FileNotFoundError so the diagnostic points at the expected location.
+    return candidates[0].resolve()
+
+
 def _unit(vector):
     norm = float(np.linalg.norm(vector))
     if norm < 1e-8:
@@ -161,6 +199,7 @@ class HX5D20DexPilotRetargeter:
         smoothing_alpha=1.0,
         hand_scale=1.0,
         urdf_path=None,
+        ai_worker_urdf=None,
     ):
         if side not in ("left", "right"):
             raise ValueError("side must be 'left' or 'right'")
@@ -190,16 +229,7 @@ class HX5D20DexPilotRetargeter:
             config = yaml.safe_load(config_file)
         side_config = dict(config[side])
         if urdf_path is None:
-            external_repos = Path(__file__).resolve().parents[3]
-            urdf_path = (
-                external_repos
-                / "ai_worker"
-                / "ffw_description"
-                / "urdf"
-                / "common"
-                / "hx5_d20"
-                / f"hx5_d20_{side}.urdf"
-            )
+            urdf_path = resolve_hx5_d20_urdf(side, ai_worker_urdf)
         self.urdf_path = Path(urdf_path).expanduser().resolve()
         if not self.urdf_path.is_file():
             raise FileNotFoundError(f"HX5-D20 {side} URDF not found: {self.urdf_path}")
@@ -259,6 +289,7 @@ class HX5D20Controller:
         retarget_mode="dexpilot",
         left_hand_scale=1.0,
         right_hand_scale=1.0,
+        ai_worker_urdf=None,
     ):
         from teleop.robot_control.robotis_dds import RobotisJointTrajectoryTransport
 
@@ -272,11 +303,13 @@ class HX5D20Controller:
                 "left",
                 smoothing_alpha=smoothing_alpha,
                 hand_scale=left_hand_scale,
+                ai_worker_urdf=ai_worker_urdf,
             )
             self.right_retargeter = HX5D20DexPilotRetargeter(
                 "right",
                 smoothing_alpha=smoothing_alpha,
                 hand_scale=right_hand_scale,
+                ai_worker_urdf=ai_worker_urdf,
             )
         elif retarget_mode == "geometric":
             self.left_retargeter = HX5D20Retargeter(
@@ -296,10 +329,13 @@ class HX5D20Controller:
         self._stopped = False
         self._logger = logging.getLogger(__name__)
         self._logger.info(
-            "HX5-D20 hand retargeting mode=%s, hand_scale=(left=%.3f, right=%.3f)",
+            "HX5-D20 hand retargeting mode=%s, "
+            "hand_scale=(left=%.3f, right=%.3f), urdf=(left=%s, right=%s)",
             retarget_mode,
             left_hand_scale,
             right_hand_scale,
+            getattr(self.left_retargeter, "urdf_path", "geometric"),
+            getattr(self.right_retargeter, "urdf_path", "geometric"),
         )
         self.transport = RobotisJointTrajectoryTransport(
             {

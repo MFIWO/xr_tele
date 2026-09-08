@@ -390,9 +390,11 @@ PASS 조건이 아니다.
 
 terminal의 `[VisionProTeleop prestart]`에서 `state=REANCHOR_REQUIRED`,
 `session_alive=True`, `settling_complete=True`, 낮은 `fresh_ms`와 양수
-`tracking_hz`를 확인한 뒤 `r`을 한 번 누른다. 기본 native safety 값은 tracking
-timeout 0.25 s, continuous settle 0.5 s, wrist translation jump 0.15 m, rotation
-jump 60 deg, velocity 3 m/s, angular velocity 8 rad/s다. 다음을 확인한다.
+`tracking_hz`를 확인한 뒤 `r`을 한 번 누른다. 기본 native tracking timeout은
+0.25 s이고 continuous settle은 0.5 s다. 손목 jump/velocity rejection과 별도 arm
+frame-jump filter는 기본적으로 꺼져 있으며, 필요할 때만
+`--visionpro-motion-rejection`과 양수 `--arm-max-frame-jump`로 다시 켠다. 다음을
+확인한다.
 
 - `state=TRACKING_OK`, 낮은 `fresh_ms`, 양수 `tracking_hz`
 - `head_xyz_m`, `head_yaw_rad`, `wrist_xyz_m=(L...,R...)`가 유한함
@@ -418,8 +420,8 @@ movement checklist:
    멈추지 않아야 한다.
 6. Wi-Fi를 잠시 끊는다: timeout 뒤 `TRACKING_STALE`, validity false, 마지막
    arm/hand target hold여야 한다.
-7. 다시 연결한다: `REANCHOR_REQUIRED`이며 자동 재개하지 않아야 한다. 안정된
-   자세를 취하고 `r`을 다시 눌러야만 `TRACKING_OK`가 된다.
+7. 다시 연결한다: 잠시 `REANCHOR_REQUIRED`를 거쳐 fresh tracking이 settle되면
+   새 anchor로 자동 복귀하며 `TRACKING_OK`가 된다. arm/HX5 standby는 들어가지 않는다.
 
 `fresh_ms`는 Linux가 마지막 새 packet을 관찰한 monotonic age이지 end-to-end
 transport latency가 아니다. stock protocol에는 그 latency를 계산할 일반 tracking
@@ -456,9 +458,9 @@ command-sink 조합은 base/lift safety heartbeat를 의도적으로 내보내�
 actuator publish를 검증하지 않는다.
 
 U를 한 번 누르면 pedal terminal에 `upper_body_estop=ON`, teleop backend에 `HOLD`가
-나오고 arm/HX5 target이 hold되어야 한다. 다시 U를 누르면 `OFF`가 나오지만 자동
-재개하지 않으며 `REANCHOR_REQUIRED`와 `settling_complete=True`를 확인하고 새로
-`r`을 눌러야 한다. U는 safety-rated hardware E-stop이 아니다.
+나오고 arm/HX5 target이 hold되어야 한다. 다시 U를 누르면 `OFF`가 나오고 fresh
+tracking이 settle된 뒤 자동으로 새 anchor를 잡아 재개해야 한다. 최초 활성화 전에는
+여전히 `r`이 필요하다. U는 safety-rated hardware E-stop이 아니다.
 
 ## 종료와 이 process만 대상으로 한 비상 종료
 
@@ -538,12 +540,12 @@ bringup에서는 base/lift publisher를 열지 않는다. 로봇을 지지대에
   consumer가 legacy `g1.*`만 선언한다면 `ai_worker.*` channel 추가가 필요하다.
 - stock normal tracking payload에는 ARKit `isTracked`, source sequence, 일반 pose
   source timestamp가 없다. adapter는 새 raw object의 host arrival identity,
-  monotonic timeout, finite/rigid/jump/velocity 검사로 fail closed하지만, 정지한
-  손과 ARKit이 cached pose를 계속 보내는 tracking loss를 구별한다고 주장하지
-  않는다.
+  monotonic timeout, finite/rigid 검사로 invalid data를 hold한다. jump/velocity
+  검사는 선택적으로 다시 켤 수 있지만 기본값은 off이므로, 정지한 손과 ARKit이
+  cached pose를 계속 보내는 tracking loss를 구별한다고 주장하지 않는다.
 - production HX5 구현은 요구대로 수정하지 않았다. native 실기 종료 시에는 main이
   먼저 publish worker를 pause한 뒤 종료를 확인하고 transport만 닫아 기존 `stop()`의
-  zero/open 명령을 피한다. 다만 runtime U/stale가 들어온 바로 그 순간 worker가 이미
+  zero/open 명령을 피한다. 다만 runtime U가 들어온 바로 그 순간 worker가 이미
   한 publish iteration을 시작했다면, public synchronized barrier가 없는 기존 HX5
   구조상 그 한 iteration(좌/우 사이 포함)이 끝날 수 있다. 따라서 U는 여전히
   software hold이고 안전 등급 hardware E-stop이 아니다.

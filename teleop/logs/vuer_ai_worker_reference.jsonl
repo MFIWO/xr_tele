@@ -1,0 +1,1 @@
+{"type":"metadata","schema":"xr_tele.ai_worker_arm_trace.v1","xr_backend":"vuer","arm":"AI_WORKER","ik_mode":"legacy","wrist_orientation_mode":"relative","frequency_hz":30.0,"simulation":true}

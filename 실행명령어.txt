@@ -8,6 +8,11 @@ cd ~/ai_worker
 ./docker/container.sh enter
 ffw_sg2_follower_ai
 
+# Leader master로 teleop하는 경우에는 위 명령 대신:
+# xr_tele observer가 CycloneDDS를 사용하므로 DDS RMW로 실행:
+# export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# ffw_sg2_ai
+
 
 ## Host의 새 Terminal 공통 준비
 
@@ -21,6 +26,10 @@ export LD_LIBRARY_PATH="$CYCLONEDDS_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH
 export ROS_DOMAIN_ID=30
 export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain Id="any"><General><Interfaces><NetworkInterface address="192.168.6.12" multicast="true"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
 
+# 주의: xr_tele은 CycloneDDS로 직접 publish함. Physical AI Tools 1.0의
+# 기본 rmw_zenoh_cpp와 함께 쓸 때는 DDS 호환 RMW로 맞추거나
+# DDS/Zenoh bridge가 필요함. ROS_DOMAIN_ID=30만 맞춘 것으로는 충분하지 않음.
+
 
 ## Terminal 2 - 키보드 주행 및 pause toggle
 
@@ -32,11 +41,13 @@ python -u ai_worker_pedal_teleop.py \
   --lift-speed 0.08 \
   --publish-rate 30
 
+python ai_worker_pedal_lift_override.py --allow-lift-without-tracking --keyboard
+
 # W/S: 전진/후진, A/D: 좌/우 회전, O/P: 리프트 상승/하강
 # U: pause toggle
 #   첫 번째 U: base/lift 정지 + 상체 자세 유지 + replay 일시정지
 #   두 번째 U: pause 해제 후 추적 안정 시 teleop/replay 자동 재개
-#   R은 최초 Vision Pro 활성화 또는 U와 무관한 추적 장애 복구 때만 필요
+#   R은 최초 Vision Pro 활성화 때만 필요; 이후 추적 장애는 안정화 후 자동 복구
 # Ctrl+C: 키보드 제어 종료
 
 
@@ -45,12 +56,18 @@ python -u ai_worker_pedal_teleop.py \
 # 코드 기본값과 같은 옵션은 생략함
 python -u teleop_hand_and_arm.py \
   --xr-backend visionproteleop \
-  --visionpro-ip 192.168.6.6 \
+  --visionpro-ip 192.168.6.7 \
   --arm AI_WORKER \
-  --ee hx5_d20 \
+  --ee ai_worker_2g \
+  --ai-worker-urdf /home/kimm/Downloads/external_repos/ai_worker/ffw_description/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf \
   --allow-real-hardware \
   --visionpro-home-before-enable \
-  --disable-hand \
+  --ai-worker-arm-scale 1.0 \
+  --ai-worker-wrist-orientation-mode relative \
+  --no-visionpro-motion-rejection \
+  --no-arm-standby-on-tracking-loss \
+  --arm-max-frame-jump 0 \
+  --ai-worker-left-wrist-roll-offset-deg 20 \
   --enable-neck \
   --neck-log-rate 1 \
   --image-source robotis_dds \
@@ -59,11 +76,78 @@ python -u teleop_hand_and_arm.py \
   --no-left-wrist-camera-vflip \
   --left-wrist-camera-rotation 270 \
   --right-wrist-camera-rotation 270 \
-  --visionpro-max-wrist-angular-velocity 20 \
   --ai-worker-ros-domain-id 30 \
   --ai-worker-home-duration 7 \
   --record \
   --visionpro-status-rate 0
+
+# Physical AI Tools에서 ffw_sg2_rev1을 선택하면 위 teleop의 좌/우
+# leader trajectory(arm 7 + 2G gripper 1)와 /joint_states, 카메라를 기존
+# 설정으로 수집함. Physical AI Tools만으로 로깅할 때는 --record 대신
+# --no-record를 사용.
+# Config Loop도 동시에 보내려면 위 명령에 다음을 추가:
+#   --loop --loop-addr <loop-host>:50051
+
+
+## Terminal 3 대안 - Vision Pro/Physical AI Tools 없이 leader master를 Loop로만 기록
+
+# Terminal 1에서 ffw_sg2_ai를 실행한 경우에 사용.
+# --loop, --arm AI_WORKER, --ee ai_worker_2g, --no-record는 자동 적용됨.
+python -u teleop_hand_and_arm.py \
+  --leader-master-loop \
+  --loop-addr <loop-host>:50051 \
+  --ai-worker-ros-domain-id 30 \
+  --frequency 30
+
+# 이 터미널에서는 R/S를 누르지 않음.
+# Config Loop UI에서 episode별 task prompt를 지정하고 기록 start/stop.
+# source_valid에 follower/leader/head/lift/mobile 수신 상태가 기록됨.
+# 초기 동기화/차렷자세는 ffw_sg2_ai와 leader master가 담당하며,
+# 이 프로세스는 로봇 command를 publish하지 않음.
+# 종료 순서: Loop episode stop -> leader 정상 종료/자세 복귀 -> Ctrl+C.
+
+
+## Meta Quest 3 / ROBOTIS WebXR teleop + Config Loop 기록
+
+# Meta Quest 모드에서는 ffw_sg2_ai(physical leader 포함)를 사용하지 않음.
+# Robot PC의 ai_worker 컨테이너, Terminal 1:
+ffw_sg2_follower_ai
+
+# Robot PC의 ai_worker 컨테이너, Terminal 2:
+# follower가 초기 자세에 도착한 후 실행
+motion_controller controller_type:=vr
+
+# Robot PC의 robotis_applications 컨테이너, Terminal 3:
+vr model:=sg2
+
+# Quest 브라우저:
+# https://<robot-or-vuer-pc-ip>:8012?ws=wss://<robot-or-vuer-pc-ip>:8012
+# Enter VR -> 양손 squeeze 유지 -> 왼손 X + 오른손 A 동시 입력
+
+# xr_tele/Loop 기록 Terminal 4:
+conda activate tv
+cd /home/kimm/Downloads/xr_tele/teleop
+
+# 기록 PC가 Robot PC와 다르면 robot-ip를 실제 주소로 교체.
+# 같은 Robot PC에서 실행하고 로컬 Zenoh daemon을 사용한다면 기존 환경을 유지.
+export ZENOH_CONFIG_OVERRIDE='transport/shared_memory/enabled=true;mode="client";connect/endpoints=["tcp/<robot-ip>:7447"]'
+
+python -u teleop_hand_and_arm.py \
+  --meta-quest-loop \
+  --loop-addr <loop-host>:50051 \
+  --ai-worker-ros-domain-id 30 \
+  --frequency 30
+
+# --robotis-webxr-loop도 같은 옵션임.
+# Python 3.10인 tv 환경에서 ROS 2 Jazzy rclpy를 직접 import하지 않고,
+# /usr/bin/python3 + /opt/ros/jazzy/setup.bash 보조 프로세스를 자동 사용함.
+# 기록 PC에는 rmw_zenoh_cpp가 설치되어 있어야 함. 사전 확인:
+#   source /opt/ros/jazzy/setup.bash && ros2 pkg prefix rmw_zenoh_cpp
+# 현재 개발 PC에는 아직 rmw_zenoh_cpp가 설치되어 있지 않음.
+# 설치 경로가 다르면 다음 옵션으로 변경:
+#   --meta-quest-ros-python <python> --meta-quest-ros-setup <setup.bash>
+# 이 터미널은 read-only이며 로봇 command와 초기/차렷자세를 publish하지 않음.
+# Config Loop UI에서 task prompt와 episode start/stop을 지정.
 
 
 ## Episode replay

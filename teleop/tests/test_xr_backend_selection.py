@@ -32,6 +32,23 @@ def load_entrypoint_helpers(*names):
 
 
 class XRBackendSelectionTest(unittest.TestCase):
+    @staticmethod
+    def _argument_default(option):
+        tree = ast.parse(ENTRYPOINT.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == option
+            ):
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+            return ast.literal_eval(keywords["default"])
+        raise AssertionError(f"argument not found: {option}")
+
     def test_native_neck_requires_explicit_enable_flag(self):
         tree = ast.parse(ENTRYPOINT.read_text(encoding="utf-8"))
         enable_neck_calls = []
@@ -177,7 +194,31 @@ assert TeleVuerWrapper.__name__ == "TeleVuerWrapper"
                     entrypoint._native_enable_preconditions_met(rejected, 0.25)
                 )
 
-    def test_native_u_release_auto_enables_only_after_tracking_is_safe(self):
+    def test_native_defaults_use_manual_standby_and_unrestricted_motion(self):
+        self.assertFalse(self._argument_default("--visionpro-motion-rejection"))
+        self.assertEqual(self._argument_default("--arm-max-frame-jump"), 0.0)
+        self.assertIsNone(
+            self._argument_default("--arm-standby-on-tracking-loss")
+        )
+        self.assertEqual(
+            self._argument_default("--ai-worker-left-wrist-roll-offset-deg"),
+            -15.0,
+        )
+        self.assertEqual(
+            self._argument_default("--ai-worker-arm-scale"),
+            1.0,
+        )
+        self.assertEqual(
+            self._argument_default("--ai-worker-wrist-orientation-mode"),
+            "relative",
+        )
+        source = ENTRYPOINT.read_text(encoding="utf-8")
+        self.assertIn(
+            'args.arm_standby_on_tracking_loss = args.xr_backend != "visionproteleop"',
+            source,
+        )
+
+    def test_native_recovery_auto_enables_only_after_tracking_is_safe(self):
         entrypoint = load_entrypoint_helpers(
             "_native_enable_preconditions_met",
             "_request_native_enable_if_ready",
@@ -215,39 +256,68 @@ assert TeleVuerWrapper.__name__ == "TeleVuerWrapper"
         self.assertFalse(entrypoint._request_native_enable_if_ready(rejected, 0.25))
         self.assertEqual(rejected.request_count, 1)
 
-    def test_native_u_pause_auto_resume_requires_pre_pause_active_tracking(self):
+    def test_native_u_pause_auto_resume_requires_an_enabled_native_session(self):
         entrypoint = load_entrypoint_helpers(
-            "_native_tracking_output_is_active",
             "_native_u_pause_can_auto_resume",
-        )
-        active = SimpleNamespace(
-            tracking_active=True,
-            head_pose_is_valid=True,
-            left_arm_is_valid=True,
-            right_arm_is_valid=True,
         )
         self.assertTrue(
             entrypoint._native_u_pause_can_auto_resume(
-                "visionproteleop", True, active
+                "visionproteleop", True
             )
         )
-        for backend, ever_enabled, tracking_active in (
-            ("vuer", True, True),
-            ("visionproteleop", False, True),
-            ("visionproteleop", True, False),
+        for backend, ever_enabled in (
+            ("vuer", True),
+            ("visionproteleop", False),
         ):
             with self.subTest(
                 backend=backend,
                 ever_enabled=ever_enabled,
-                tracking_active=tracking_active,
             ):
-                sample = SimpleNamespace(**vars(active))
-                sample.tracking_active = tracking_active
                 self.assertFalse(
                     entrypoint._native_u_pause_can_auto_resume(
-                        backend, ever_enabled, sample
+                        backend, ever_enabled
                     )
                 )
+
+    def test_native_session_auto_resume_never_overrides_u(self):
+        entrypoint = load_entrypoint_helpers(
+            "_native_session_should_auto_resume",
+        )
+        self.assertTrue(
+            entrypoint._native_session_should_auto_resume(
+                "visionproteleop", True, False
+            )
+        )
+        self.assertFalse(
+            entrypoint._native_session_should_auto_resume(
+                "visionproteleop", True, True
+            )
+        )
+        self.assertFalse(
+            entrypoint._native_session_should_auto_resume(
+                "visionproteleop", False, False
+            )
+        )
+        self.assertFalse(
+            entrypoint._native_session_should_auto_resume("vuer", True, False)
+        )
+
+    def test_native_hand_worker_enters_standby_only_for_u(self):
+        entrypoint = load_entrypoint_helpers("_should_pause_hand_worker")
+
+        self.assertTrue(
+            entrypoint._should_pause_hand_worker("visionproteleop", True, True)
+        )
+        self.assertTrue(
+            entrypoint._should_pause_hand_worker("visionproteleop", True, False)
+        )
+        self.assertFalse(
+            entrypoint._should_pause_hand_worker("visionproteleop", False, False)
+        )
+        self.assertFalse(
+            entrypoint._should_pause_hand_worker("visionproteleop", False, True)
+        )
+        self.assertTrue(entrypoint._should_pause_hand_worker("vuer", False, False))
 
     def test_hx5_hold_pauses_worker_without_open_command(self):
         entrypoint = load_entrypoint_helpers(

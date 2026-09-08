@@ -1,0 +1,3 @@
+#!/home/thor/Downloads/xr_tele/.venv/bin/python
+from cmeel.run import cmeel_run
+cmeel_run()

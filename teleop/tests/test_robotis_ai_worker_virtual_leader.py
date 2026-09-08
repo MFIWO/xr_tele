@@ -82,6 +82,34 @@ class AIWorkerVirtualLeaderIKTest(unittest.TestCase):
         )
         np.testing.assert_allclose(q, expected, atol=1e-8, rtol=0.0)
 
+    def test_left_roll_calibration_uses_robot_forward_x_axis(self):
+        ik = AIWorkerArmIK(
+            urdf_path=SG2_URDF,
+            left_wrist_roll_offset_deg=-15.0,
+        )
+        ready_left, ready_right = ik._forward(ik.ready_q)
+        angle = np.deg2rad(-15.0)
+        cosine, sine = np.cos(angle), np.sin(angle)
+        expected_correction = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, cosine, -sine],
+                [0.0, sine, cosine],
+            ],
+            dtype=np.float64,
+        )
+
+        np.testing.assert_allclose(
+            ik._corrected_home_rotations[0],
+            expected_correction @ ready_left.rotation,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            ik._corrected_home_rotations[1],
+            ready_right.rotation,
+            atol=1e-12,
+        )
+
     def test_relative_local_maps_operator_local_axes_to_robot_local_axes(self):
         ik = AIWorkerArmIK(
             urdf_path=SG2_URDF,

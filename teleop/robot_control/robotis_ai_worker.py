@@ -21,6 +21,9 @@ AI_WORKER_ARM_JOINTS = tuple(
 )
 AI_WORKER_LEFT_ARM_JOINTS = AI_WORKER_ARM_JOINTS[:7]
 AI_WORKER_RIGHT_ARM_JOINTS = AI_WORKER_ARM_JOINTS[7:]
+AI_WORKER_2G_GRIPPER_JOINTS = ("gripper_l_joint1", "gripper_r_joint1")
+AI_WORKER_2G_GRIPPER_LOWER = np.zeros(2, dtype=np.float64)
+AI_WORKER_2G_GRIPPER_UPPER = np.full(2, 1.1, dtype=np.float64)
 AI_WORKER_ARM_LOWER = np.array(
     [-3.14, 0.0, -3.14, -2.9361, -3.14, -1.57, -1.8201,
      -3.14, -3.14, -3.14, -2.9361, -3.14, -1.57, -1.5804]
@@ -57,12 +60,58 @@ def ai_worker_ready_q_for_urdf(urdf_path):
     return AI_WORKER_SH5_READY_Q.copy()
 
 
-def default_ai_worker_urdf() -> Path:
+def default_ai_worker_urdf(model="sh5") -> Path:
     env_path = os.environ.get("AI_WORKER_URDF")
     if env_path:
         return Path(env_path).expanduser().resolve()
-    external_repos = Path(__file__).resolve().parents[3]
-    return external_repos / "ai_worker/ffw_description/urdf/ffw_sh5_rev1_follower/ffw_sh5_follower.urdf"
+    checkout_parent = Path(__file__).resolve().parents[2].parent
+    if str(model).lower() == "sg2":
+        relative_path = Path(
+            "ffw_description/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
+        )
+    else:
+        relative_path = Path(
+            "ffw_description/urdf/ffw_sh5_rev1_follower/ffw_sh5_follower.urdf"
+        )
+    candidates = (
+        checkout_parent / "external_repos/ai_worker" / relative_path,
+        checkout_parent / "ai_worker" / relative_path,
+    )
+    return next((path for path in candidates if path.is_file()), candidates[-1])
+
+
+def ai_worker_2g_gripper_position(
+    input_value,
+    *,
+    closed_input,
+    open_input,
+    max_position=1.1,
+):
+    """Map an XR pinch/trigger distance to the SG2 gripper joint position.
+
+    ``xr_tele`` represents a closed pinch/pressed trigger with the smaller
+    value, while the official SG2 VR publisher represents a closed gripper
+    with the larger joint position.  Clamp both the input and the resulting
+    command to the follower URDF's 0.0..1.1 rad limit.
+    """
+    input_value = float(input_value)
+    closed_input = float(closed_input)
+    open_input = float(open_input)
+    max_position = float(max_position)
+    if not all(np.isfinite(value) for value in (input_value, closed_input, open_input, max_position)):
+        raise ValueError("AI Worker 2G gripper mapping values must be finite.")
+    if open_input <= closed_input:
+        raise ValueError("AI Worker 2G open input must be greater than closed input.")
+    if max_position < 0.0:
+        raise ValueError("AI Worker 2G max position must be zero or greater.")
+
+    open_fraction = np.clip(
+        (input_value - closed_input) / (open_input - closed_input),
+        0.0,
+        1.0,
+    )
+    safe_max = min(max_position, float(AI_WORKER_2G_GRIPPER_UPPER[0]))
+    return float((1.0 - open_fraction) * safe_max)
 
 
 class AIWorkerArmIK:
@@ -139,9 +188,11 @@ class AIWorkerArmIK:
         # The virtual target frames have the same semantic orientation as
         # H1_2's wrist-yaw EE, so no HX5 mount rotation belongs in the target.
         self._wrist_mount_rotations = (np.eye(3), np.eye(3))
+        # Calibrate the physical hand roll in the robot/world convention used by
+        # operators: +X points forward and positive rotation is CCW about +X.
         self._wrist_roll_corrections = (
-            self._rotation_z(np.deg2rad(left_wrist_roll_offset_deg)),
-            self._rotation_z(np.deg2rad(right_wrist_roll_offset_deg)),
+            self._rotation_x(np.deg2rad(left_wrist_roll_offset_deg)),
+            self._rotation_x(np.deg2rad(right_wrist_roll_offset_deg)),
         )
         self._has_wrist_roll_correction = (
             not np.isclose(left_wrist_roll_offset_deg, 0.0),
@@ -154,8 +205,8 @@ class AIWorkerArmIK:
         self.ready_q = ai_worker_ready_q_for_urdf(self.urdf_path)
         ready_frames = self._forward(self.ready_q)
         self._corrected_home_rotations = (
-            ready_frames[0].rotation @ self._wrist_roll_corrections[0],
-            ready_frames[1].rotation @ self._wrist_roll_corrections[1],
+            self._wrist_roll_corrections[0] @ ready_frames[0].rotation,
+            self._wrist_roll_corrections[1] @ ready_frames[1].rotation,
         )
         self.translation_scale = float(translation_scale)
         self.max_iterations = int(max_iterations)
@@ -170,6 +221,15 @@ class AIWorkerArmIK:
         if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
             raise ValueError("Wrist target must be a finite 4x4 transform.")
         return pose
+
+    @staticmethod
+    def _rotation_x(angle):
+        cosine = np.cos(angle)
+        sine = np.sin(angle)
+        return np.array(
+            [[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]],
+            dtype=np.float64,
+        )
 
     @staticmethod
     def _rotation_z(angle):
@@ -223,8 +283,8 @@ class AIWorkerArmIK:
             rotation = robot_orientation_anchor @ local_delta
         if self.wrist_orientation_mode == "absolute":
             # Absolute targets have no startup anchor, so apply their static
-            # hand-axis correction directly.
-            rotation = rotation @ wrist_roll_correction
+            # correction directly in the robot/world +X convention.
+            rotation = wrist_roll_correction @ rotation
         translation = robot_anchor.translation + self.translation_scale * (
             input_pose[:3, 3] - input_anchor[:3, 3]
         )
@@ -765,7 +825,7 @@ class AIWorkerVirtualLeaderIK(AIWorkerArmIK):
 
 
 class AIWorkerArmController:
-    """Publish AI Worker arm targets using ROBOTIS CycloneDDS messages."""
+    """Publish AI Worker arm and optional SG2 gripper targets over CycloneDDS."""
 
     command_topic_description = "ROBOTIS DDS JointTrajectory (AI Worker left/right arms)"
 
@@ -775,6 +835,7 @@ class AIWorkerArmController:
         node_name="xr_tele_ai_worker_arms",
         home_q=None,
         ready_q=None,
+        include_2g_gripper=False,
     ):
         del node_name
         from teleop.robot_control.robotis_dds import RobotisJointTrajectoryTransport
@@ -794,6 +855,9 @@ class AIWorkerArmController:
         self._q = self.home_q.copy()
         self._dq = np.zeros(14)
         self._last_command = self.home_q.copy()
+        self.include_2g_gripper = bool(include_2g_gripper)
+        self._gripper_q = np.zeros(2, dtype=np.float64)
+        self._last_gripper_command = np.zeros(2, dtype=np.float64)
         self._last_command_time = time.monotonic()
         self._last_write_ok = False
         self._joint_state_received = threading.Event()
@@ -813,16 +877,28 @@ class AIWorkerArmController:
                 self._q[i] = positions[name]
             if name in velocities:
                 self._dq[i] = velocities[name]
+        for i, name in enumerate(AI_WORKER_2G_GRIPPER_JOINTS):
+            if name in positions:
+                self._gripper_q[i] = positions[name]
+        required_names = AI_WORKER_ARM_JOINTS
+        if getattr(self, "include_2g_gripper", False):
+            required_names += AI_WORKER_2G_GRIPPER_JOINTS
         if (
             not self._joint_state_received.is_set()
-            and all(name in positions for name in AI_WORKER_ARM_JOINTS)
+            and all(name in positions for name in required_names)
         ):
             self._last_command = self._q.copy()
+            if getattr(self, "include_2g_gripper", False):
+                self._last_gripper_command = np.clip(
+                    self._gripper_q,
+                    AI_WORKER_2G_GRIPPER_LOWER,
+                    AI_WORKER_2G_GRIPPER_UPPER,
+                )
             self._last_command_time = time.monotonic()
             self._joint_state_received.set()
 
     def wait_for_joint_state(self, timeout=5.0):
-        """Wait until all 14 measured arm joints have initialized the controller."""
+        """Wait for all required arm and optional 2G gripper joint states."""
         return self._joint_state_received.wait(timeout=max(0.0, float(timeout)))
 
     def sync_arm_command_to_measured(self):
@@ -835,10 +911,23 @@ class AIWorkerArmController:
             AI_WORKER_ARM_LOWER,
             AI_WORKER_ARM_UPPER,
         )
+        if getattr(self, "include_2g_gripper", False):
+            self._last_gripper_command = np.clip(
+                self._gripper_q,
+                AI_WORKER_2G_GRIPPER_LOWER,
+                AI_WORKER_2G_GRIPPER_UPPER,
+            )
         self._last_command_time = time.monotonic()
         return self._last_command.copy()
 
     def _publish_side(self, key, names, positions):
+        if getattr(self, "include_2g_gripper", False):
+            side_index = 0 if key == "left" else 1
+            names = tuple(names) + (AI_WORKER_2G_GRIPPER_JOINTS[side_index],)
+            positions = np.append(
+                np.asarray(positions, dtype=np.float64),
+                self._last_gripper_command[side_index],
+            )
         self.transport.publish(key, names, positions, self.command_duration)
 
     def get_current_dual_arm_q(self):
@@ -850,6 +939,26 @@ class AIWorkerArmController:
     def get_last_commanded_dual_arm_q(self):
         """Return the most recent post-limit arm position command."""
         return self._last_command.copy()
+
+    def set_dual_gripper_command(self, positions):
+        """Update the SG2 gripper target appended to the next arm command."""
+        if not getattr(self, "include_2g_gripper", False):
+            raise RuntimeError("AI Worker 2G gripper output is not enabled.")
+        positions = np.asarray(positions, dtype=np.float64).reshape(2)
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("AI Worker 2G gripper targets must be finite.")
+        self._last_gripper_command = np.clip(
+            positions,
+            AI_WORKER_2G_GRIPPER_LOWER,
+            AI_WORKER_2G_GRIPPER_UPPER,
+        )
+        return self._last_gripper_command.copy()
+
+    def get_current_dual_gripper_q(self):
+        return self._gripper_q.copy()
+
+    def get_last_commanded_dual_gripper_q(self):
+        return self._last_gripper_command.copy()
 
     def get_current_motor_q(self):
         return self.get_current_dual_arm_q()
@@ -895,21 +1004,46 @@ class AIWorkerArmController:
         velocities = velocity_coeff[:, None] * delta[None, :]
         accelerations = acceleration_coeff[:, None] * delta[None, :]
 
+        left_names = AI_WORKER_LEFT_ARM_JOINTS
+        right_names = AI_WORKER_RIGHT_ARM_JOINTS
+        left_positions = positions[:, :7]
+        right_positions = positions[:, 7:]
+        left_velocities = velocities[:, :7]
+        right_velocities = velocities[:, 7:]
+        left_accelerations = accelerations[:, :7]
+        right_accelerations = accelerations[:, 7:]
+        if getattr(self, "include_2g_gripper", False):
+            zeros = np.zeros((num_points, 1), dtype=np.float64)
+            left_names += (AI_WORKER_2G_GRIPPER_JOINTS[0],)
+            right_names += (AI_WORKER_2G_GRIPPER_JOINTS[1],)
+            left_positions = np.column_stack((
+                left_positions,
+                np.full(num_points, self._last_gripper_command[0]),
+            ))
+            right_positions = np.column_stack((
+                right_positions,
+                np.full(num_points, self._last_gripper_command[1]),
+            ))
+            left_velocities = np.column_stack((left_velocities, zeros))
+            right_velocities = np.column_stack((right_velocities, zeros))
+            left_accelerations = np.column_stack((left_accelerations, zeros))
+            right_accelerations = np.column_stack((right_accelerations, zeros))
+
         self.transport.publish_trajectory(
             "left",
-            AI_WORKER_LEFT_ARM_JOINTS,
-            positions[:, :7],
+            left_names,
+            left_positions,
             times,
-            velocities[:, :7],
-            accelerations[:, :7],
+            left_velocities,
+            left_accelerations,
         )
         self.transport.publish_trajectory(
             "right",
-            AI_WORKER_RIGHT_ARM_JOINTS,
-            positions[:, 7:],
+            right_names,
+            right_positions,
             times,
-            velocities[:, 7:],
-            accelerations[:, 7:],
+            right_velocities,
+            right_accelerations,
         )
         self._last_command = target.copy()
         self._last_command_time = time.monotonic()

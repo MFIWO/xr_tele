@@ -1,0 +1,13 @@
+Metadata-Version: 2.1
+Name: cmeel-tinyxml
+Version: 2.6.2.3
+Summary: cmeel distribution for TinyXML, an obsolete thing.
+Requires-Python: >= 3.8
+License-Expression: Zlib
+Home-page: https://github.com/cmake-wheel/cmeel-tinyxml
+Requires-Dist: cmeel
+Description-Content-Type: text/markdown
+
+# CMeel tinyxml
+
+[tinyxml](https://sourceforge.net/projects/tinyxml/) distribution for cmeel packages.

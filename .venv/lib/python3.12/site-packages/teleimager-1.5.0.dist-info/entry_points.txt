@@ -1,0 +1,3 @@
+[console_scripts]
+teleimager-client = teleimager.image_client:main
+teleimager-server = teleimager.image_server:main

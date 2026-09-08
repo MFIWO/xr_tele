@@ -318,10 +318,18 @@ the base and lift stop and the teleop process holds its current arm, hand, and
 neck commands; press `U` again to clear the latch. After the native
 VisionProTeleop session has been enabled once with `R`, clearing `U`
 automatically resumes teleop as soon as fresh tracking has settled. Initial
-startup and recovery from non-`U` tracking faults still require `R`. Vision Pro head height no longer
-controls the lift, and the old `--enable-lift` option is rejected. Base/lift
-motion also fails closed if the tracking heartbeat on UDP port 8766 expires;
-tracking recovery never clears a latched `U` E-stop.
+startup still requires `R`; later non-`U` tracking gaps hold the last command
+briefly and recover automatically without entering arm/HX5 standby. Native
+wrist jump/velocity rejection and the extra arm frame-jump filter are disabled
+by default, while physical URDF joint limits and the downstream arm command
+limit remain active. Arm targets use the legacy translation-only head-relative
+mapping, AI Worker translation gain defaults to `1.0`, and wrist orientation
+uses the startup-anchored `relative` mapping in the shared world basis. The AI
+Worker left wrist has a `-15` degree correction about robot-forward `+X` to
+cancel its measured positive roll bias.
+Vision Pro head height no longer controls the lift, and the old `--enable-lift`
+option is rejected. Base/lift motion also fails closed if the tracking heartbeat
+on UDP port 8766 expires; tracking recovery never clears a latched `U` E-stop.
 
 ```bash
 (tv) $ export ROS_DOMAIN_ID=30
@@ -363,16 +371,125 @@ $ cd teleop
 (tv) $ python -m pip install -e robot_control/dex-retargeting
 ```
 
-The AI Worker path loads the expanded SH5 URDF from the sibling
-`external_repos/ai_worker` checkout. Use `--ai-worker-urdf /path/to/ffw_sh5_follower.urdf`
-when the repositories are laid out differently. Arm and hand commands use the
-standard ROBOTIS DDS left/right `JointTrajectory` topics; `/joint_states` supplies
-feedback. The first valid Vision Pro wrist pair becomes the relative arm-motion
-anchor, preventing a jump caused by different XR and simulator world frames.
+The AI Worker path loads the selected expanded arm URDF from the sibling
+`external_repos/ai_worker` checkout. Use `--ai-worker-urdf /path/to/follower.urdf`
+when the repositories are laid out differently. The HX5 DexPilot retargeter
+derives its left/right hand URDF paths from that same checkout. Arm and hand
+commands use the standard ROBOTIS DDS left/right `JointTrajectory` topics;
+`/joint_states` supplies feedback. The first valid Vision Pro wrist pair becomes
+the relative arm-motion anchor, preventing a jump caused by different XR and
+simulator world frames.
+
+For FFW SG2, select `--ee ai_worker_2g`. Vision Pro thumb-index distance is
+mapped to `0.0..1.1` rad (open..closed) by default, and each arm command contains
+the complete eight-joint leader schema: seven arm joints followed by
+`gripper_l_joint1` or `gripper_r_joint1`. This is the schema consumed by
+Physical AI Tools' `ffw_sg2_rev1_config.yaml`; its existing config does not need
+to be changed. The collector receives the commands on the normal ROS 2/DDS
+leader topics and the measured gripper state from `/joint_states`:
+
+```bash
+(tv) $ python teleop_hand_and_arm.py --xr-backend visionproteleop \
+  --visionpro-ip <vision-pro-ip> --arm AI_WORKER --ee ai_worker_2g \
+  --allow-real-hardware --ai-worker-ros-domain-id 30 \
+  --image-source robotis_dds --no-record
+```
+
+Use `--ai-worker-2g-pinch-closed-cm`, `--ai-worker-2g-pinch-open-cm`, and
+`--ai-worker-2g-gripper-max-position` to tune the grasp. Keep xr_tele, AI Worker,
+and Physical AI Tools on the same ROS domain and mutually compatible ROS
+middleware/discovery setup. Physical AI Tools 1.0 containers default to
+`rmw_zenoh_cpp`, whereas xr_tele publishes with CycloneDDS directly. Run the ROS
+2 participants with a DDS-compatible RMW or provide an explicit DDS/Zenoh bridge;
+matching only `ROS_DOMAIN_ID` is not sufficient across those two transports.
+
+Config Loop is an independent fan-out from the same xr_tele control tick. Add
+`--loop --loop-addr <loop-host>:50051` to the command above after installing
+`loop-sdk`. The `ai_worker.*` payload then contains seven arm joints plus one 2G
+gripper joint per side, while Physical AI Tools records the eight-joint DDS
+leader messages and camera/follower topics in parallel. Do not enable xr_tele's
+local `--record` unless a second local episode copy is wanted.
+
+To record physical leader-master teleoperation from `ffw_sg2_ai` without a VR
+device or Physical AI Tools, use the observer-only mode:
+
+```bash
+# In the AI Worker container; use a DDS RMW because the observer below is CycloneDDS.
+$ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+$ ffw_sg2_ai
+
+# On the recorder host.
+(tv) $ python teleop_hand_and_arm.py --leader-master-loop \
+  --loop-addr <loop-host>:50051 --ai-worker-ros-domain-id 30
+```
+
+`--leader-master-loop` implies `--loop`, `--arm AI_WORKER`,
+`--ee ai_worker_2g`, and `--no-record`. It does not construct XR, IK, keyboard,
+or any robot command publisher. It continuously maps follower `/joint_states`
+to observations and the complete left/right eight-joint leader trajectories to
+actions. Head, lift, `/odom`, `/cmd_vel`, and all three DDS camera topics are
+also exposed, with `source_valid` channels marking missing or stale sources.
+Set the task prompt and start/stop each episode in Config Loop; the Loop SDK
+keeps sources live while its recorder decides which interval belongs to an
+episode.
+
+Because this process is strictly an observer, initial synchronization and the
+final attention pose remain under `ffw_sg2_ai` and the physical leader. It does
+not reproduce Vision teleop's command-based ready/home motion: doing so would
+create a second publisher that competes with the leader master. Stop the Loop
+episode first, return/stop the leader through its normal SG2 procedure, and
+then terminate this observer with `Ctrl+C`.
+
+To record ROBOTIS Meta Quest 3 WebXR teleoperation, use the ROS 2 observer
+variant. The robot-side control stack is different from physical leader mode:
+
+```bash
+# AI Worker container, terminal 1: follower and its normal initial pose only.
+$ ffw_sg2_follower_ai
+
+# AI Worker container, terminal 2: WebXR pose -> SG2 joint trajectory controller.
+$ motion_controller controller_type:=vr
+
+# robotis_applications container, terminal 3: Quest WebXR/Vuer server.
+$ vr model:=sg2
+
+# xr_tele host, terminal 4: read-only Config Loop recorder.
+(tv) $ python teleop_hand_and_arm.py --meta-quest-loop \
+  --loop-addr <loop-host>:50051 --ai-worker-ros-domain-id 30 \
+  --frequency 30
+```
+
+`--robotis-webxr-loop` is an alias for `--meta-quest-loop`. This mode implies
+`--loop`, `--arm AI_WORKER`, `--ee ai_worker_2g`, and `--no-record`. ROBOTIS
+Vuer and Cyclo Control remain the only command producers; xr_tele subscribes to
+the final left/right eight-joint trajectories, follower state, head/lift/base,
+odometry, and all three compressed camera topics. Task prompts and episode
+start/stop remain in Config Loop.
+
+ROBOTIS' current containers use ROS 2 Jazzy and `rmw_zenoh_cpp`, while the
+xr_tele `tv` environment uses Python 3.10. The Meta Quest option therefore
+starts a subscription-only ROS helper with `/usr/bin/python3` after sourcing
+`/opt/ros/jazzy/setup.bash`, then forwards samples locally to the `tv` process.
+Override these paths with `--meta-quest-ros-python` and
+`--meta-quest-ros-setup` if the ROS installation differs. The recorder host must
+have the matching Jazzy RMW installed; verify `ros2 pkg prefix rmw_zenoh_cpp`
+first (the current development host does not have it installed). The helper
+inherits `ZENOH_CONFIG_OVERRIDE`; when the recorder is on a separate PC, point
+it at the robot's Zenoh router before starting xr_tele, for example:
+
+```bash
+$ export ZENOH_CONFIG_OVERRIDE='transport/shared_memory/enabled=true;mode="client";connect/endpoints=["tcp/<robot-ip>:7447"]'
+```
+
+Use follower-only `ffw_sg2_follower_ai` for this path, not `ffw_sg2_ai`, which
+also starts the physical leader. The follower launch owns initial positioning;
+Quest squeeze/X+A activation and the `/reactivate` path own VR pause/resume.
+Stopping this logger never commands a ready or home pose.
 
 When `--loop` is enabled for `--arm AI_WORKER --ee hx5_d20`, the robot-step
 payload uses the explicit `ai_worker.*` root with 7 arm joints and 20 raw HX5
-joints per side. Existing embodiments retain their legacy `g1.*` root. This
+joints per side; `--ee ai_worker_2g` uses one gripper joint per side. Existing
+embodiments retain their legacy `g1.*` root. This
 checkout does not include `loop_sdk`, so the packet schema is unit-tested but a
 live Config Loop consumer was not connected; deployments whose consumer only
 declares `g1.*` must add the corresponding `ai_worker.*` channels.

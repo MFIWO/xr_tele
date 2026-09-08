@@ -20,6 +20,8 @@ from teleop.robot_control.robot_hand_hx5_d20 import (
     HX5D20Retargeter,
 )
 from teleop.robot_control.robotis_ai_worker import (
+    AI_WORKER_2G_GRIPPER_LOWER,
+    AI_WORKER_2G_GRIPPER_UPPER,
     AI_WORKER_ARM_LOWER,
     AI_WORKER_ARM_UPPER,
     AI_WORKER_SH5_HOME_Q,
@@ -116,6 +118,7 @@ class AIWorkerArmCommandSink:
         arm_velocity_limit=3.0,
         report_interval=1.0,
         reporter=None,
+        include_2g_gripper=False,
     ):
         del node_name
         self.command_duration = max(0.02, float(command_duration))
@@ -133,6 +136,9 @@ class AIWorkerArmCommandSink:
         self._q = self.home_q.copy()
         self._dq = np.zeros(14, dtype=np.float64)
         self._last_command = self.home_q.copy()
+        self.include_2g_gripper = bool(include_2g_gripper)
+        self._gripper_q = np.zeros(2, dtype=np.float64)
+        self._last_gripper_command = np.zeros(2, dtype=np.float64)
         self._last_command_time = time.monotonic()
         self._last_write_ok = False
         self._closed = False
@@ -175,6 +181,29 @@ class AIWorkerArmCommandSink:
     def get_last_commanded_dual_arm_q(self):
         with self._lock:
             return self._last_command.copy()
+
+    def set_dual_gripper_command(self, positions):
+        if not self.include_2g_gripper:
+            raise RuntimeError("AI Worker 2G gripper output is not enabled.")
+        positions = np.asarray(positions, dtype=np.float64).reshape(2)
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("AI Worker 2G gripper targets must be finite.")
+        with self._lock:
+            self._last_gripper_command = np.clip(
+                positions,
+                AI_WORKER_2G_GRIPPER_LOWER,
+                AI_WORKER_2G_GRIPPER_UPPER,
+            )
+            self._gripper_q = self._last_gripper_command.copy()
+            return self._last_gripper_command.copy()
+
+    def get_current_dual_gripper_q(self):
+        with self._lock:
+            return self._gripper_q.copy()
+
+    def get_last_commanded_dual_gripper_q(self):
+        with self._lock:
+            return self._last_gripper_command.copy()
 
     def get_current_motor_q(self):
         return self.get_current_dual_arm_q()
@@ -300,6 +329,7 @@ class HX5D20CommandSink:
         report_interval=1.0,
         reporter=None,
         start_thread=True,
+        ai_worker_urdf=None,
     ):
         self.command_duration = max(0.02, float(command_duration))
         self.left_input = left_hand_pos_array
@@ -312,11 +342,13 @@ class HX5D20CommandSink:
                 "left",
                 smoothing_alpha=smoothing_alpha,
                 hand_scale=left_hand_scale,
+                ai_worker_urdf=ai_worker_urdf,
             )
             self.right_retargeter = HX5D20DexPilotRetargeter(
                 "right",
                 smoothing_alpha=smoothing_alpha,
                 hand_scale=right_hand_scale,
+                ai_worker_urdf=ai_worker_urdf,
             )
         elif retarget_mode == "geometric":
             self.left_retargeter = HX5D20Retargeter(

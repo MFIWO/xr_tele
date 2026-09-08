@@ -62,6 +62,7 @@ logger_mp = logging_mp.getLogger(__name__)
 _EE_DIM_PER_HAND = {
     "dex3": 7,
     "dex1": 1,
+    "ai_worker_2g": 1,
     "inspire_dfx": 6,
     "inspire_ftp": 6,
     "brainco": 6,
@@ -112,7 +113,7 @@ class LoopRobotStreamer:
         <embodiment>.action.right_ee.joint_position        [n]
 
     Existing embodiments retain ``g1`` for compatibility; AI Worker uses
-    ``ai_worker`` and HX5 supplies ``n=20`` without altering its joint order.
+    ``ai_worker``; HX5 supplies ``n=20`` and SG2 2G supplies ``n=1`` per side.
     """
 
     def __init__(
@@ -254,6 +255,148 @@ class LoopRobotStreamer:
             with contextlib.suppress(Exception):
                 self._sender.disconnect()
             self._sender = None
+
+
+class AIWorkerLeaderLoopStreamer(LoopRobotStreamer):
+    """Stream an SG2 leader-master/follower snapshot without controlling it.
+
+    The leader trajectories are actions and the follower joint states are
+    observations.  Head, lift, and mobile-base channels stay declared from the
+    first sample, with explicit validity flags for sources that have not arrived
+    yet or have gone stale.
+    """
+
+    _SOURCE_KEYS = (
+        "follower",
+        "leader_left",
+        "leader_right",
+        "leader_head",
+        "leader_lift",
+        "follower_mobile",
+        "leader_mobile",
+    )
+
+    def __init__(
+        self,
+        loop_addr: str,
+        frequency: float,
+        *,
+        source_key: str = "robot-step",
+        connect_timeout_s: float = 5.0,
+    ) -> None:
+        super().__init__(
+            loop_addr,
+            "ai_worker_2g",
+            frequency,
+            arm="AI_WORKER",
+            source_key=source_key,
+            connect_timeout_s=connect_timeout_s,
+        )
+
+    @staticmethod
+    def _vector(snapshot, key: str, size: int) -> list[float]:
+        values = list(snapshot.get(key, ()))
+        if len(values) != size:
+            raise ValueError(
+                f"leader-master snapshot {key!r} must contain {size} values; "
+                f"got {len(values)}"
+            )
+        return _as_float_list(values)
+
+    def _build_snapshot_step(self, snapshot) -> dict:
+        left_state = self._vector(snapshot, "left_state_position", 8)
+        right_state = self._vector(snapshot, "right_state_position", 8)
+        left_velocity = self._vector(snapshot, "left_state_velocity", 8)
+        right_velocity = self._vector(snapshot, "right_state_velocity", 8)
+        left_action = self._vector(snapshot, "left_action_position", 8)
+        right_action = self._vector(snapshot, "right_action_position", 8)
+        valid = snapshot.get("valid", {})
+
+        observation = {
+            "left_arm": {
+                "joint_position": left_state[:7],
+                "joint_velocity": left_velocity[:7],
+            },
+            "right_arm": {
+                "joint_position": right_state[:7],
+                "joint_velocity": right_velocity[:7],
+            },
+            "left_ee": {"joint_position": left_state[7:]},
+            "right_ee": {"joint_position": right_state[7:]},
+            "head": {
+                "joint_position": self._vector(snapshot, "head_state_position", 2),
+                "joint_velocity": self._vector(snapshot, "head_state_velocity", 2),
+            },
+            "lift": {
+                "joint_position": self._vector(snapshot, "lift_state_position", 1),
+                "joint_velocity": self._vector(snapshot, "lift_state_velocity", 1),
+            },
+            "mobile": {
+                "velocity": self._vector(snapshot, "mobile_state_velocity", 3),
+            },
+            "source_valid": {
+                key: bool(valid.get(key, False)) for key in self._SOURCE_KEYS
+            },
+        }
+        action = {
+            "left_arm": {"joint_position": left_action[:7]},
+            "right_arm": {"joint_position": right_action[:7]},
+            "left_ee": {"joint_position": left_action[7:]},
+            "right_ee": {"joint_position": right_action[7:]},
+            "head": {
+                "joint_position": self._vector(snapshot, "head_action_position", 2),
+            },
+            "lift": {
+                "joint_position": self._vector(snapshot, "lift_action_position", 1),
+            },
+            "mobile": {
+                "velocity": self._vector(snapshot, "mobile_action_velocity", 3),
+            },
+        }
+        return {"ai_worker": {"observation": observation, "action": action}}
+
+    @staticmethod
+    def empty_snapshot() -> dict:
+        return {
+            "left_state_position": [0.0] * 8,
+            "right_state_position": [0.0] * 8,
+            "left_state_velocity": [0.0] * 8,
+            "right_state_velocity": [0.0] * 8,
+            "left_action_position": [0.0] * 8,
+            "right_action_position": [0.0] * 8,
+            "head_state_position": [0.0] * 2,
+            "head_state_velocity": [0.0] * 2,
+            "head_action_position": [0.0] * 2,
+            "lift_state_position": [0.0],
+            "lift_state_velocity": [0.0],
+            "lift_action_position": [0.0],
+            "mobile_state_velocity": [0.0] * 3,
+            "mobile_action_velocity": [0.0] * 3,
+            "valid": {},
+        }
+
+    def _channel_layout(self) -> tuple[str, ...]:
+        from loop_sdk import flatten_step
+
+        return tuple(flatten_step(self._build_snapshot_step(self.empty_snapshot())).keys())
+
+    def send_snapshot(self, timestamp_us: int, snapshot) -> None:
+        if self._sender is None:
+            return
+        try:
+            self._sender.send(
+                int(timestamp_us),
+                self._build_snapshot_step(snapshot),
+                sequence=self._sequence,
+            )
+            self._sequence += 1
+        except Exception as exc:
+            if not self._send_failed_once:
+                logger_mp.warning(
+                    "[loop] leader-master robot-state send failed "
+                    f"(will keep trying silently): {exc}"
+                )
+                self._send_failed_once = True
 
 
 # ============================================================================

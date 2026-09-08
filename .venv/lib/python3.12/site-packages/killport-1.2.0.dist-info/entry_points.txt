@@ -1,0 +1,2 @@
+[console_scripts]
+killport = killport:main
