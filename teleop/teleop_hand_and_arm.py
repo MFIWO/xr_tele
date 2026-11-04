@@ -33,6 +33,7 @@ from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from teleop.utils.rh5dg2_tactile import RH5DG2TactileHeatMapper
 from teleop.neck_control import VisionProNeckController
+from teleop.utils.neck_wrist_delta import NeckWristDeltaMapper  # [ADDED] AVP neck mode
 from sshkeyboard import listen_keyboard, stop_listening
 
 logger_mp.info("[teleop imports] televuer=%s", getattr(sys.modules.get("televuer"), "__file__", None))
@@ -52,6 +53,8 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 TACTILE_VR_OVERLAY_VISIBLE = True  # Toggle RH5DG2 tactile overlay visibility in the XR viewer
+NECK_REZERO_REQUEST = False  # [ADDED] keyboard [c] requests an atomic two-wrist re-zero
+NECK_MODE_ENABLED = False
 # waist keyboard control (H1_2 only): [j]/[k] nudge the waist yaw left/right during teleop
 WAIST_YAW_REL     = 0.0     # current relative waist-yaw target (rad, relative to startup home)
 WAIST_KEY_STEP    = 0.05    # rad added/removed per [j]/[k] press; overwritten from args in main
@@ -71,7 +74,7 @@ WAIST_KEY_INVERT  = False   # swap [j]/[k] direction; overwritten from args in m
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, READY, RECORD_RUNNING, RECORD_TOGGLE, TACTILE_VR_OVERLAY_VISIBLE, WAIST_YAW_REL
+    global STOP, START, READY, RECORD_RUNNING, RECORD_TOGGLE, TACTILE_VR_OVERLAY_VISIBLE, WAIST_YAW_REL, NECK_REZERO_REQUEST
     if key == 'r':
         START = True
     elif key == 'q':
@@ -84,6 +87,13 @@ def on_press(key):
             logger_mp.warning("[teleop record] ignored [s] because the previous episode is still saving. Please wait until READY.")
         else:
             logger_mp.warning("[teleop record] ignored [s] because teleop has not started. Press [r] first, then [s] to record.")
+    elif key == 'c':
+        # [ADDED] Calibrate only in the main loop against a fresh pair of wrists.
+        if NECK_MODE_ENABLED:
+            NECK_REZERO_REQUEST = True
+            logger_mp.info("[AVP neck] manual re-zero requested")
+        else:
+            logger_mp.warning("[AVP neck] [c] requires --avp-neck-mode")
     elif key == 't':
         TACTILE_VR_OVERLAY_VISIBLE = not TACTILE_VR_OVERLAY_VISIBLE
         logger_mp.info(
@@ -1020,6 +1030,8 @@ if __name__ == '__main__':
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2'], default='H1_2', help='Select arm controller')
+    parser.add_argument('--avp-neck-mode', action='store_true', help='[ADDED] AVP neck/chest wrist delta mode; press [c] to re-zero')
+    parser.add_argument('--neck-translation-scale', type=float, default=1.0, help='[ADDED] AVP wrist delta translation scale in [0.1,1.5]')
     parser.add_argument('--arm-reference-mode', type=str, choices=['fixed', 'head_yaw_compensated', 'head', 'head_yaw'], default='fixed', help='XR wrist reference mode for arm IK. fixed (default) freezes the reference frame (initial head yaw + position) at tracking start so head motion never affects the arm targets; head subtracts the LIVE head position (head rotation still shifts targets by the device arc); head_yaw_compensated rotates targets WITH the head yaw (broken: raw wrist poses are already world-frame); head_yaw is the legacy live-head-yaw mode (arms rotate opposite to the head).')
     parser.add_argument('--arm-yaw-compensation-sign', type=float, choices=[-1.0, 1.0], default=1.0, help='Yaw compensation direction for --arm-reference-mode head_yaw_compensated.')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'inspire_dg2', 'rh5dg2_ftp', 'rh5dg2_dfx', 'rh56f1', 'brainco'], default='rh5dg2_dfx', help='Select end effector controller')
@@ -1170,6 +1182,18 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    # [ADDED] Keep the existing fixed XR-to-robot conversion and IK unchanged.
+    if args.avp_neck_mode:
+        if args.arm_reference_mode != 'fixed':
+            parser.error("--avp-neck-mode requires --arm-reference-mode fixed")
+        if args.ipc:
+            parser.error("--avp-neck-mode uses [c] keyboard calibration; --ipc is unsupported")
+        if not np.isfinite(args.neck_translation_scale) or not 0.1 <= args.neck_translation_scale <= 1.5:
+            parser.error("--neck-translation-scale must be finite in [0.1,1.5]")
+        logger_mp.warning("[AVP neck] experimental mode: validate with --sim before hardware")
+    NECK_MODE_ENABLED = bool(args.avp_neck_mode)
+    NECK_REZERO_REQUEST = False
+    neck_mapper = NeckWristDeltaMapper(args.neck_translation_scale) if args.avp_neck_mode else None
     if args.viewer_display_fps <= 0:
         raise ValueError("--viewer-display-fps must be greater than zero.")
     if not 1 <= args.viewer_jpeg_quality <= 100:
@@ -2530,6 +2554,24 @@ if __name__ == '__main__':
 
             left_wrist_pose = tele_data.left_wrist_pose
             right_wrist_pose = tele_data.right_wrist_pose
+            # [ADDED] AI Worker-style relative SE(3) motion in the existing
+            # Unitree frame. Head tracking remains required by the arm FSM.
+            if neck_mapper is not None and raw_arm_tracking_ready and arm_fsm == "ACTIVE":
+                try:
+                    neck_inputs = {"left": left_wrist_pose, "right": right_wrist_pose}
+                    if not neck_mapper.calibrated:
+                        neck_mapper.capture(neck_inputs, neck_inputs)
+                        logger_mp.warning("[AVP neck] first valid wrist anchors captured; [c] to re-zero")
+                    elif NECK_REZERO_REQUEST:
+                        neck_mapper.capture(neck_inputs, neck_mapper.last_targets)
+                        logger_mp.warning("[AVP neck] manual re-zero complete")
+                    NECK_REZERO_REQUEST = False
+                    neck_goals = neck_mapper.targets(neck_inputs)
+                    left_wrist_pose = neck_goals["left"]
+                    right_wrist_pose = neck_goals["right"]
+                except ValueError as exc:
+                    arm_tracking_ready = False
+                    logger_mp.warning("[AVP neck] invalid wrist frame; hold arms: %s", exc)
             if (
                 args.arm_max_frame_jump > 0.0
                 and raw_arm_tracking_ready
